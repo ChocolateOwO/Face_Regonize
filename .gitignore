@@ -40,3 +40,7 @@ Thumbs.db
 
 # Verified database snapshots taken before an application update
 backups/
+
+# Patch backups keep source files only - never runtime data
+patch/**/*.db
+patch/**/storage/

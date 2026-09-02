@@ -40,3 +40,35 @@ sample images. Only after it demonstrably works on the dummy does it get applied
 
 This applies to schema migrations, batch/bulk operations, delete or cleanup logic, retention expiry, imports, and
 anything that writes or deletes files. Report the dummy-run result first, then ask before touching the real data.
+
+## 6. Build and test in a sandbox copy, not in the live project
+
+Do not edit the real project files to develop a change. Copy what you need into a sandbox/dummy folder, build and
+test the change there, and report the result. The live files stay untouched until the user has seen the sandbox
+result and explicitly approves applying it.
+
+Sequence for every change:
+
+1. Create a sandbox copy (throwaway; outside the repo or in an ignored folder).
+2. Implement and test the change there. Report what passed and what failed.
+3. **Wait for the user's approval.** No approval, no change to the live files.
+4. Before overwriting any live file, back up its current version (rule 7).
+5. Apply, then re-verify against the live app.
+
+The sandbox is where mistakes are allowed to happen. The live project is not.
+
+## 7. Patch backups before overwriting live files
+
+Before a live file is modified or replaced, save its current version under `patch/`, in a folder named with a
+timestamp and the key thing being changed:
+
+```
+patch/YYYY-MM-DD_HHMM_<key-change>/
+    <original relative path of each file replaced>
+    NOTES.md      what changed and why, plus how to restore
+```
+
+Example: `patch/2026-09-02_1730_sidebar-scroll-fix/frontend/src/components/Layout.tsx`
+
+Keep the original directory structure inside the patch folder so a restore is a straight copy back. Never delete a
+patch folder as part of another task.
