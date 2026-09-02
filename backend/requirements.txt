@@ -1,0 +1,17 @@
+insightface
+onnxruntime
+opencv-python
+numpy
+fastapi
+uvicorn[standard]
+python-multipart
+sqlmodel
+pyjwt
+bcrypt>=4
+pandas
+openpyxl
+python-dotenv
+requests
+pillow-heif
+google-api-python-client
+google-auth

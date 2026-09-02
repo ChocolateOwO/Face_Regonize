@@ -1,0 +1,42 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+backend/server_out.log
+backend/server_err.log
+
+# Database & storage (local data, not source)
+# Both project-root and backend-relative copies: DATABASE_URL/STORAGE_PATH
+# default to relative paths, so a backend/ working directory produces a
+# second set of these directories.
+database/*.db
+backend/database/
+storage/people/*
+storage/events/*
+storage/thumbnails/*
+storage/photo_batches/
+backend/storage/
+!storage/people/.gitkeep
+!storage/events/.gitkeep
+!storage/thumbnails/.gitkeep
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Env
+.env
+service_account.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Local tooling/agent scaffolding, not project source
+.claude/
+.windsurf/
+.agents/
+
+# Verified database snapshots taken before an application update
+backups/
