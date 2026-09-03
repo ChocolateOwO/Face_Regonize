@@ -57,7 +57,12 @@ class RecognitionIndex:
                 self._first_names.append(person.first_name)
                 self._full_names.append(f"{person.first_name} {person.last_name}".strip())
                 self._participant_ids.append(person.participant_id)
-                self._matrix = np.vstack([self._matrix, emb]) if self._matrix.shape[0] else emb
+                # np.frombuffer gives a READ-ONLY view over the immutable bytes,
+                # so adopting it directly as the matrix (the empty-index case)
+                # makes the whole matrix read-only and the in-place update above
+                # fails later. vstack already returns a fresh writable array, so
+                # only this branch needs a copy - one row, only when empty.
+                self._matrix = np.vstack([self._matrix, emb]) if self._matrix.shape[0] else emb.copy()
 
     def remove(self, person_id: str) -> None:
         with self._lock:

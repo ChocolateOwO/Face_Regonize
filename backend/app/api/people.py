@@ -9,6 +9,7 @@ from app.auth.deps import get_current_user
 from app.database.db import get_session
 from app.face_recognition.engine import detect_faces
 from app.face_recognition.index import recognition_index
+from app.services.index_sync import apply_index_change
 from app.models.models import Attendance, ConsentRecord, FaceDetection, Person, User
 from app.services import storage_service
 
@@ -114,7 +115,9 @@ def create_person(
     session.add(person)
     session.commit()
     session.refresh(person)
-    recognition_index.upsert(person)  # keep the in-memory index live, no restart needed
+    # DB is already committed; if the index update fails, rebuild it from the
+    # committed rows so RAM cannot silently disagree with the database.
+    apply_index_change(session, lambda: recognition_index.upsert(person), what="create participant")
     return _person_out(session, person)
 
 
@@ -156,7 +159,7 @@ def update_person(
     session.add(p)
     session.commit()
     session.refresh(p)
-    recognition_index.upsert(p)
+    apply_index_change(session, lambda: recognition_index.upsert(p), what="update participant")
     return _person_out(session, p)
 
 
@@ -181,7 +184,7 @@ def delete_all_people(session: Session = Depends(get_session), user: User = Depe
         session.delete(p)
     session.commit()
 
-    recognition_index.rebuild([])  # empty index — nothing left to match against
+    apply_index_change(session, lambda: recognition_index.rebuild([]), what="delete all participants")
     return {"deleted": count}
 
 
@@ -195,5 +198,5 @@ def delete_person(person_id: str, session: Session = Depends(get_session), user:
         session.delete(a)
     session.delete(p)
     session.commit()
-    recognition_index.remove(person_id)
+    apply_index_change(session, lambda: recognition_index.remove(person_id), what="delete participant")
     return {"deleted": True}

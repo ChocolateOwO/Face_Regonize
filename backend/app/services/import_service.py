@@ -32,6 +32,7 @@ from app.face_recognition.index import recognition_index
 from app.models.models import ImportJob, ImportRow, Person
 from app.services import storage_service
 from app.services.google_drive_service import GoogleDriveError, download_public_file, is_google_drive_url
+from app.services.index_sync import IndexResyncFailed, apply_index_change
 
 NAME_HEADER_KEYWORDS = [
     "name", "full name", "fullname", "participant", "participant name",
@@ -423,7 +424,33 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                 session.add(row)
                 session.add(job)
                 session.commit()
-                recognition_index.upsert(existing or person)  # keep the in-memory index live
+
+                # The participant is committed at this point; the index update
+                # that follows is the derived cache catching up. If it fails,
+                # apply_index_change rebuilds the index from the committed
+                # database state, and the row stays "imported" because the
+                # import genuinely did what it promised. Only if that rebuild
+                # ALSO fails does the row become an error - reported here
+                # rather than by the generic handler below, so the already
+                # counted success is taken back instead of being counted twice.
+                try:
+                    apply_index_change(
+                        session,
+                        lambda: recognition_index.upsert(existing or person),
+                        what=f"import participant {row.participant_id}",
+                    )
+                except IndexResyncFailed:
+                    row.status = "error"
+                    row.error_message = (
+                        "SAVED BUT NOT SEARCHABLE - the participant was saved to the database, "
+                        "but the recognition index could not be updated or rebuilt. "
+                        "Restart the backend to reload the index from the database."
+                    )
+                    job.success_count -= 1
+                    job.failed_count += 1
+                    session.add(row)
+                    session.add(job)
+                    session.commit()
 
             except Exception as e:  # noqa: BLE001 — surface any failure as a row-level error, keep the job alive
                 row.status = "error"
