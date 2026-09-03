@@ -23,6 +23,10 @@ def list_attendees(session: Session = Depends(get_session), user: User = Depends
             "first_name": p.first_name,
             "last_name": p.last_name,
             "image_path": p.image_path,
+            # Lets the UI version the photo url: the file lives at the fixed
+            # path people/{id}/profile.jpg and is overwritten in place, so
+            # without this the browser can show the previous occupant's face.
+            "updated_at": p.updated_at,
             "detection_count": len(detections),
             "first_detected": times[0] if times else None,
             "last_detected": times[-1] if times else None,

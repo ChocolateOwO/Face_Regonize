@@ -9,6 +9,7 @@ interface Attendee {
   first_name: string;
   last_name: string;
   image_path: string;
+  updated_at: string;
   detection_count: number;
   first_detected: string | null;
   last_detected: string | null;
@@ -49,7 +50,7 @@ export default function Attendees() {
                 <tr key={a.id} className="hover:bg-gray-50">
                   <td className="px-4 py-3">
                     <Link to={`/people/${a.id}`} className="flex items-center gap-3">
-                      <img src={fileUrl(a.image_path)} className="w-9 h-9 rounded-full object-cover" />
+                      <img src={fileUrl(a.image_path, a.updated_at)} className="w-9 h-9 rounded-full object-cover" />
                       <div className="font-medium text-gray-900">
                         {a.first_name} {a.last_name}
                         <div className="text-xs text-gray-400">{a.participant_id}</div>

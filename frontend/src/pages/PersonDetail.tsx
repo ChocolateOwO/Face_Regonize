@@ -15,6 +15,7 @@ interface PersonDetailData {
   det_score: number;
   is_demo: boolean;
   created_at: string;
+  updated_at: string;
   detection_count: number;
   first_detected: string | null;
   last_detected: string | null;
@@ -61,7 +62,7 @@ export default function PersonDetail() {
 
       <div className="grid md:grid-cols-3 gap-4">
         <Card>
-          <img src={fileUrl(data.image_path)} className="w-full aspect-square object-cover rounded-lg mb-3" />
+          <img src={fileUrl(data.image_path, data.updated_at)} className="w-full aspect-square object-cover rounded-lg mb-3" />
           {data.is_demo && <Badge>Demo Data</Badge>}
           <div className="text-sm text-gray-600 space-y-1 mt-3">
             <div>

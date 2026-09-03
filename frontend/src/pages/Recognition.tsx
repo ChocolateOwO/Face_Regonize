@@ -273,7 +273,21 @@ export default function Recognition() {
 
   return (
     <div ref={containerRef} className="relative h-full w-full bg-black overflow-hidden">
-      <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-contain" />
+      {/* Mirrored like a mirror/selfie view so a participant standing at the
+          kiosk sees themselves move the way they expect. Display only: the
+          frame sent for recognition is drawn from the video element itself
+          (captureFrame -> drawImage), which reads the source bitmap and is
+          unaffected by this CSS transform, so the stored event image and the
+          embedding stay true-to-life. The overlays are siblings of the video,
+          not children, so none of their text is mirrored. */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        className="w-full h-full object-contain"
+        style={{ transform: "scaleX(-1)" }}
+      />
 
       {/* IDLE — camera off, no recognition API calls. */}
       {kioskState === "idle" && (

@@ -32,6 +32,10 @@ def dashboard(session: Session = Depends(get_session), user: User = Depends(get_
         recent_out.append({
             "person_name": f"{person.first_name} {person.last_name}".strip() if person else "Unknown",
             "person_image": person.image_path if person else None,
+            # Version for person_image only - deliberately not called
+            # updated_at, which in an activity record would read as "when this
+            # detection changed" rather than "when the photo changed".
+            "person_image_version": person.updated_at if person else None,
             "detected_at": d.detected_at,
             "confidence": d.confidence,
             "event_image": upload.image_path if upload else None,

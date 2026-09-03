@@ -87,9 +87,17 @@ export async function apiDelete(path: string) {
   return handle(res);
 }
 
-export function fileUrl(relativePath: string | null | undefined): string {
+// `version` is optional on purpose: only participant profile photos need it.
+// They live at a fixed path (people/{id}/profile.jpg) that is overwritten in
+// place when the photo is replaced, so the URL alone never changes and the
+// browser can keep showing the previous occupant's face - including from its
+// in-memory cache, which no Cache-Control header reaches. Passing the
+// participant's updated_at makes the URL change whenever the photo does.
+// Every other caller stores files under unique names and is unaffected.
+export function fileUrl(relativePath: string | null | undefined, version?: string): string {
   if (!relativePath) return "";
-  return `${API_BASE}/api/files/${relativePath.replace(/\\/g, "/")}`;
+  const url = `${API_BASE}/api/files/${relativePath.replace(/\\/g, "/")}`;
+  return version ? `${url}?v=${encodeURIComponent(version)}` : url;
 }
 
 export async function downloadFile(path: string, filename: string) {

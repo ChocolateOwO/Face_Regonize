@@ -13,6 +13,7 @@ interface DashboardData {
   recent_activity: {
     person_name: string;
     person_image: string | null;
+    person_image_version: string | null;
     detected_at: string;
     confidence: number;
     event_image: string | null;
@@ -52,7 +53,7 @@ export default function Dashboard() {
             {data.recent_activity.map((a, i) => (
               <div key={i} className="flex items-center gap-3 py-3">
                 {a.person_image ? (
-                  <img src={fileUrl(a.person_image)} className="w-10 h-10 rounded-full object-cover" />
+                  <img src={fileUrl(a.person_image, a.person_image_version ?? undefined)} className="w-10 h-10 rounded-full object-cover" />
                 ) : (
                   <div className="w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center text-gray-400">?</div>
                 )}

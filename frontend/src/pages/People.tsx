@@ -12,6 +12,7 @@ interface Person {
   image_path: string;
   is_demo: boolean;
   created_at: string;
+  updated_at: string;
   detection_count: number;
   last_detected: string | null;
 }
@@ -91,7 +92,7 @@ export default function People() {
                 <tr key={p.id} className="hover:bg-gray-50">
                   <td className="px-4 py-3">
                     <Link to={`/people/${p.id}`} className="flex items-center gap-3">
-                      <img src={fileUrl(p.image_path)} className="w-9 h-9 rounded-full object-cover" />
+                      <img src={fileUrl(p.image_path, p.updated_at)} className="w-9 h-9 rounded-full object-cover" />
                       <div>
                         <div className="font-medium text-gray-900">
                           {p.first_name} {p.last_name}
