@@ -32,32 +32,71 @@ this project created (scratchpad files, generated output, temp scripts, batch st
 Still confirm first for: deleting or overwriting `database/app.db` or `storage/people/`, `git reset --hard`,
 `git push --force`, and anything that destroys user data with no copy left.
 
-## 5. Test on dummy data first, never on the real files
+## 5. The permanent development workflow — Dummy first, always
 
-Never verify a change by running it against the real database, the real `storage/people/` photos, or the user's real
-Google Drive folder. Test on dummy/throwaway copies first — a scratch DB, dummy participants, a dummy Drive folder,
-sample images. Only after it demonstrably works on the dummy does it get applied to, or run against, the real data.
+Every code change follows this sequence, in order:
 
-This applies to schema migrations, batch/bulk operations, delete or cleanup logic, retention expiry, imports, and
-anything that writes or deletes files. Report the dummy-run result first, then ask before touching the real data.
+```
+DUMMY
+  → AUTOMATED TEST
+  → USER MANUAL/VISUAL TEST (when applicable)
+  → REPORT
+  → EXPLICIT USER APPROVAL
+  → MAIN
+  → USER VERIFIES MAIN
+```
 
-## 6. Build and test in a sandbox copy, not in the live project
+```
+Main:   E:\งาน\491\Face_Reconize\Reconize
+Dummy:  E:\งาน\491\Face_Reconize\Reconize_Dummy
+```
 
-Do not edit the real project files to develop a change. Copy what you need into a sandbox/dummy folder, build and
-test the change there, and report the result. The live files stay untouched until the user has seen the sandbox
-result and explicitly approves applying it.
+**5.1 — All code changes go to Dummy first.** Never develop a change by editing Main. Copy what you need into the
+Dummy, build and test it there, and report. Main stays untouched until the user has seen the result and explicitly
+approved applying it.
 
-Sequence for every change:
+**5.2 — The Dummy must be isolated from Main** wherever it matters: separate frontend port, separate backend port,
+separate database, separate storage directory, separate test data. Never verify a change by running it against the
+real database, the real `storage/people/` photos, or the user's real Google Drive folder. This applies in particular
+to schema migrations, batch/bulk operations, delete or cleanup logic, retention expiry, imports, and anything that
+writes or deletes files.
 
-1. Create a sandbox copy (throwaway; outside the repo or in an ignored folder).
-2. Implement and test the change there. Report what passed and what failed.
-3. **Wait for the user's approval.** No approval, no change to the live files.
-4. Before overwriting any live file, back up its current version (rule 7).
-5. Apply, then re-verify against the live app.
+**5.3 — Automated test success is NOT permission to modify Main.** Neither is a passing build, an obvious bug, a
+one-line change, a previous approval on a related task, or your own confidence.
 
-The sandbox is where mistakes are allowed to happen. The live project is not.
+**5.4 — For anything visible, clickable or interactive** (UI, photo previews, participant pages, import, kiosk,
+camera, recognition screens, PDPA, Settings, photo processing, navigation, buttons, forms): finish the automated
+tests first, then start the Dummy site, give the user the Dummy URL (and the backend URL when relevant), give exact
+manual test steps, and **STOP**. Wait for the user's manual testing and explicit approval.
 
-## 7. Patch backups before overwriting live files
+**5.5 — Once the Dummy is handed over for manual testing, do not mutate Dummy data** until the user says testing is
+finished. Do not keep running tests against it in the background.
+
+**5.6 — Never run destructive photo replacement/swap tests against participants the user is visually testing.**
+Photo-replacement visual testing is performed manually by the user. If automated destructive testing is genuinely
+required, use dedicated throwaway test participants/data and finish it *before* handing the Dummy over.
+
+**5.7 — Backend-only changes with no visible behavior** may skip the user visual test, but still require:
+`DUMMY → AUTOMATED TEST → REPORT → EXPLICIT USER APPROVAL → MAIN`.
+
+**5.8 — Before applying an approved change to Main, create and verify a patch backup** of every affected Main file
+(rule 6).
+
+**5.9 — After applying a visible change to Main,** make Main available and tell the user exactly what to verify. The
+change is not complete until the user has had that opportunity.
+
+**5.10 — Never commit, push, tag, release, publish or deploy** merely because testing passed. Each of those needs its
+own explicit instruction.
+
+**5.11 — When uncertain whether a change may go directly to Main: it may not.** Use the Dummy and ask for approval.
+
+Only the user can authorize moving a tested change from Dummy to Main — for example "Apply to Main",
+"Approved for Main", "เอาเข้า Main", "ผ่าน เอาเข้าเว็บจริง". A recommendation is not approval, and the user testing
+the Dummy successfully is not approval either unless they explicitly authorize applying it.
+
+The Dummy is where mistakes are allowed to happen. Main is not.
+
+## 6. Patch backups before overwriting live files
 
 Before a live file is modified or replaced, save its current version under `patch/`, in a folder named with a
 timestamp and the key thing being changed:
@@ -70,5 +109,6 @@ patch/YYYY-MM-DD_HHMM_<key-change>/
 
 Example: `patch/2026-09-02_1730_sidebar-scroll-fix/frontend/src/components/Layout.tsx`
 
-Keep the original directory structure inside the patch folder so a restore is a straight copy back. Never delete a
-patch folder as part of another task.
+Keep the original directory structure inside the patch folder so a restore is a straight copy back. Verify the backup
+copies are byte-identical to the originals before editing anything. Never delete a patch folder as part of another
+task.
