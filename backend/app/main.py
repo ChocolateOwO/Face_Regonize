@@ -8,12 +8,13 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlmodel import Session, select
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from app.api import admin, attendees, auth, export, files, history, imports, pdpa, people, photo_batches, recognition, reports, settings_routes, system, update_routes, uploads
+from app.api import activities, admin, attendees, auth, export, files, history, imports, pdpa, people, photo_batches, recognition, reports, settings_routes, system, update_routes, uploads
 from app.auth.security import hash_password
 from app.config import (
     ADMIN_PASSWORD,
@@ -170,6 +171,7 @@ app.include_router(files.router)
 app.include_router(system.router)
 app.include_router(admin.router)
 app.include_router(pdpa.router)
+app.include_router(activities.router)
 app.include_router(photo_batches.router)
 app.include_router(photo_batches.cleanup_router)
 app.include_router(update_routes.router)
@@ -182,6 +184,36 @@ def health():
 
 # Serve the built React frontend (frontend/dist) if present, so the whole app
 # can be run as a single backend process without needing the Vite dev server.
+# That single-origin mode is what makes the app reachable from other machines:
+# one host, one port, no CORS, and no hardcoded API address to get wrong.
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+
+
+class SPAStaticFiles(StaticFiles):
+    """StaticFiles that falls back to index.html for unknown paths.
+
+    The app is a single-page app: only "/" exists as a real file, so opening
+    /activities or a station link like /recognition?activity=... directly - or
+    just pressing refresh on one - would otherwise 404. Those station links are
+    the whole point of running stations on other machines, so the fallback is
+    not optional here.
+
+    Anything under /api is never reached by this: those routes are registered
+    before the mount and win.
+    """
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                # A missing ASSET should still 404 rather than silently return
+                # HTML - that turns a broken build into a confusing blank page.
+                if "." in Path(path).name:
+                    raise
+                return await super().get_response("index.html", scope)
+            raise
+
+
 if FRONTEND_DIST.exists():
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+    app.mount("/", SPAStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")

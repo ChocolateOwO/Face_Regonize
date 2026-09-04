@@ -9,6 +9,7 @@ const NAV = [
   { to: "/people", label: "People", icon: "👥" },
   { to: "/recognition", label: "Face Recognition", icon: "🔍" },
   { to: "/attendees", label: "Attendees", icon: "✅" },
+  { to: "/activities", label: "Activities", icon: "🎪" },
   { to: "/import", label: "Import Participants", icon: "📥" },
   { to: "/uploads", label: "Upload History", icon: "🖼️" },
   { to: "/history", label: "Recognition History", icon: "🕘" },

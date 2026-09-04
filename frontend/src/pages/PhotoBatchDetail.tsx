@@ -6,7 +6,10 @@ import { Badge, Button, Card, EmptyState, PageHeader, Spinner } from "../compone
 interface Batch {
   id: string;
   label: string;
-  status: "pending" | "processing" | "completed" | "failed";
+  // "syncing_drive" = local processing has finished and the results below are
+  // already complete and previewable; only the Google Drive mirror is still
+  // running. It is NOT a kind of "processing".
+  status: "pending" | "processing" | "syncing_drive" | "completed" | "failed";
   current_stage: string;
   total_photos: number;
   processed_photos: number;
@@ -107,11 +110,30 @@ export default function PhotoBatchDetail() {
 
   const progressPct = batch.total_photos > 0 ? Math.round((batch.processed_photos / batch.total_photos) * 100) : 0;
 
+  // Local results are finished and safe to show from the moment phase 1 ends,
+  // whether or not the Drive mirror has run, failed, or been skipped.
+  const localDone = batch.status === "syncing_drive" || batch.status === "completed";
+
+  // Say what actually happened to the Drive half, using only fields the
+  // backend already records. "Processing complete" alone would read as an
+  // unconditional success even when nothing reached Drive.
+  const driveSummary: { text: string; tone: "good" | "warn" | "bad" } =
+    batch.status === "syncing_drive"
+      ? { text: "Google Drive sync in progress…", tone: "warn" }
+      : batch.drive_failed_photos > 0
+        ? { text: `Google Drive sync completed with errors — ${batch.drive_failed_photos} photo(s) not uploaded`, tone: "bad" }
+        : batch.processed_folder_url
+          ? { text: "Google Drive sync complete", tone: "good" }
+          : { text: batch.drive_error || "Google Drive sync skipped — photos are saved locally only", tone: "warn" };
+
+  const statusLabel =
+    batch.status === "syncing_drive" ? "local processing done, syncing to Google Drive" : batch.status;
+
   return (
     <div>
       <PageHeader
         title={batch.label}
-        subtitle={`Batch status: ${batch.status}`}
+        subtitle={`Batch status: ${statusLabel}`}
         action={
           <Link to="/photo-batches">
             <Button variant="secondary">Back to Event Photos</Button>
@@ -163,10 +185,38 @@ export default function PhotoBatchDetail() {
         </Card>
       )}
 
-      {batch.status === "completed" && (
+      {localDone && (
         <>
+          {batch.status === "syncing_drive" && (
+            <Card className="mb-4 border-indigo-200 bg-indigo-50">
+              <div className="flex items-center gap-3">
+                <Spinner />
+                <div>
+                  <div className="font-semibold text-indigo-900">Uploading to Google Drive…</div>
+                  <div className="text-sm text-gray-700">
+                    Face processing has finished — all results below are final and can be viewed now.
+                    Only the Google Drive copy is still being uploaded.
+                  </div>
+                  {batch.current_stage && <div className="text-xs text-gray-500 mt-1">{batch.current_stage}</div>}
+                </div>
+              </div>
+            </Card>
+          )}
+
           <Card className="mb-4">
-            <h2 className="font-semibold text-gray-900 mb-3 text-lg">Processing Complete ✓</h2>
+            <h2 className="font-semibold text-gray-900 mb-1 text-lg">Local Processing Complete ✓</h2>
+            <p
+              className={
+                "text-sm mb-3 " +
+                (driveSummary.tone === "good"
+                  ? "text-green-700"
+                  : driveSummary.tone === "bad"
+                    ? "text-red-700"
+                    : "text-amber-700")
+              }
+            >
+              {driveSummary.text}
+            </p>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <Stat label="Total Photos" value={batch.total_photos} />
               <Stat label="Recognized Photos" value={batch.recognized_photos} tone="good" />
@@ -197,9 +247,13 @@ export default function PhotoBatchDetail() {
                 <DriveLinkButton label="📁 Ambience" url={batch.ambience_folder_url} />
                 <DriveLinkButton label="📁 Review" url={batch.review_folder_url} />
               </div>
+            ) : batch.status === "syncing_drive" ? (
+              <div className="text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+                Creating the Google Drive folders… links appear here once they exist.
+              </div>
             ) : (
               <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                No Google Drive output for this batch — processing completed and the photos are available in the preview below.
+                No Google Drive output for this batch — local processing completed and the photos are available in the preview below.
               </div>
             )}
             {batch.drive_failed_photos > 0 && (

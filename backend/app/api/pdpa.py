@@ -60,6 +60,11 @@ def list_status(session: Session = Depends(get_session), user: User = Depends(ge
             "last_name": p.last_name,
             "status": record.choice if record else "pending",
             "last_updated": record.recorded_at if record else None,
+            # Where the current answer came from: "registration" (their sign-up
+            # form), "kiosk" (they tapped it themselves) or "admin". Without
+            # this the page cannot distinguish a form answer from a tap, which
+            # matters for a record kept as compliance evidence.
+            "source": record.source if record else None,
         })
     return out
 

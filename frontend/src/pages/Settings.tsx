@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { apiGet, apiPostJson, apiPutJson } from "../api/client";
+import { listCamerasWithPermission, type CameraDevice } from "../api/cameras";
 import { Button, Card, Input, PageHeader } from "../components/ui";
 import UpdatePanel from "../components/UpdatePanel";
 
@@ -18,11 +19,29 @@ export default function Settings() {
   const [confirmStep, setConfirmStep] = useState<{ action: ClearAction; step: 1 | 2 } | null>(null);
   const [clearing, setClearing] = useState(false);
   const [clearMessage, setClearMessage] = useState("");
+  const [cameras, setCameras] = useState<CameraDevice[] | null>(null);
+  const [cameraError, setCameraError] = useState("");
+  const [detecting, setDetecting] = useState(false);
 
   useEffect(() => {
     apiGet("/api/settings").then(setValues);
     refreshCounts();
   }, []);
+
+  // Camera labels are hidden by the browser until permission is granted, so
+  // this is a button rather than something that runs on page load — opening
+  // Settings should not make the camera light come on unprompted.
+  async function detectCameras() {
+    setDetecting(true);
+    setCameraError("");
+    try {
+      setCameras(await listCamerasWithPermission());
+    } catch (err) {
+      setCameraError(err instanceof Error ? err.message : "Could not access the camera.");
+    } finally {
+      setDetecting(false);
+    }
+  }
 
   function refreshCounts() {
     apiGet("/api/admin/data-counts").then(setCounts).catch(() => {});
@@ -90,6 +109,53 @@ export default function Settings() {
             <div>
               <label className="block text-sm text-gray-600 mb-1">Minimum Detection Confidence</label>
               <Input value={values.face_detection_confidence} onChange={(e) => set("face_detection_confidence", e.target.value)} />
+            </div>
+            <div>
+              <label className="block text-sm text-gray-600 mb-1">Kiosk mode</label>
+              <select
+                value={values.kiosk_mode}
+                onChange={(e) => set("kiosk_mode", e.target.value)}
+                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm"
+              >
+                <option value="tap">Tap to scan — ask PDPA consent first</option>
+                <option value="always">Always on — camera runs, no prompt</option>
+              </select>
+              <p className="text-xs text-gray-400 mt-1">
+                Always-on never asks at the kiosk, so consent must come from your registration
+                form. A kiosk can override this locally on the Face Recognition page.
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm text-gray-600 mb-1">Camera</label>
+              {cameras === null ? (
+                <div className="flex items-center gap-2">
+                  <Input value={values.camera_label || "Browser default"} readOnly className="flex-1" />
+                  <Button variant="secondary" onClick={detectCameras} disabled={detecting}>
+                    {detecting ? "Detecting..." : "Detect cameras"}
+                  </Button>
+                </div>
+              ) : (
+                <select
+                  value={values.camera_label}
+                  onChange={(e) => set("camera_label", e.target.value)}
+                  className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm"
+                >
+                  <option value="">Browser default</option>
+                  {cameras.map((c) => (
+                    <option key={c.deviceId} value={c.label}>
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <p className="text-xs text-gray-400 mt-1">
+                The camera the kiosk opens by default, saved by name so it works on any machine.
+                A kiosk can still override it locally on the Face Recognition page.
+              </p>
+              {cameraError && <p className="text-xs text-red-600 mt-1">{cameraError}</p>}
+              {cameras !== null && cameras.length === 1 && (
+                <p className="text-xs text-gray-400 mt-1">Only one camera is connected.</p>
+              )}
             </div>
             <label className="flex items-center gap-2 text-sm text-gray-700 pt-1">
               <input

@@ -7,6 +7,7 @@ import Dashboard from "./pages/Dashboard";
 import People from "./pages/People";
 import PersonDetail from "./pages/PersonDetail";
 import Recognition from "./pages/Recognition";
+import Activities from "./pages/Activities";
 import Attendees from "./pages/Attendees";
 import Import from "./pages/Import";
 import Uploads from "./pages/Uploads";
@@ -43,6 +44,7 @@ function AppRoutes() {
                 <Route path="/people/:id" element={<PersonDetail />} />
                 <Route path="/recognition" element={<Recognition />} />
                 <Route path="/attendees" element={<Attendees />} />
+                <Route path="/activities" element={<Activities />} />
                 <Route path="/import" element={<Import />} />
                 <Route path="/uploads" element={<Uploads />} />
                 <Route path="/uploads/:id" element={<UploadDetail />} />

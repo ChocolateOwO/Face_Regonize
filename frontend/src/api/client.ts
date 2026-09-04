@@ -1,4 +1,12 @@
-export const API_BASE = "http://127.0.0.1:8000";
+// Same-origin on purpose. A hardcoded host works only on the machine running
+// the server: a browser on another PC would resolve 127.0.0.1 to ITSELF and
+// find nothing. Empty means every call goes to whatever host served the page,
+// so http://192.168.1.3:8000 just works from any machine on the network - and
+// same-origin means no CORS is involved at all.
+//
+// In dev the Vite server proxies /api to the backend (see vite.config.ts), so
+// this is correct in both modes.
+export const API_BASE = "";
 
 function authHeaders(): Record<string, string> {
   const token = localStorage.getItem("token");

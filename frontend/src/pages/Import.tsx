@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { apiGet, apiPostForm, ApiError, downloadFile } from "../api/client";
-import { Badge, Button, Card, PageHeader, Spinner } from "../components/ui";
+import { apiGet, apiPostForm, apiPostJson, ApiError, downloadFile } from "../api/client";
+import { Badge, Button, Card, Input, PageHeader, Spinner } from "../components/ui";
 
 interface ColumnCandidate {
   column: string | null;
@@ -27,6 +27,10 @@ interface PreviewRow {
   has_photo: boolean;
   status: "ready" | "missing_photo" | "duplicate" | "duplicate_in_file" | "invalid";
   message: string;
+  // What the registration form said about PDPA consent.
+  //   null      no consent column, or the cell was blank -> stays PENDING
+  //   "unknown" the cell had text that could not be interpreted -> no record
+  consent: "consented" | "declined" | "unknown" | null;
 }
 
 interface PreviewOkResponse {
@@ -34,6 +38,10 @@ interface PreviewOkResponse {
   import_id: string;
   name_column: string;
   photo_column: string | null;
+  consent_column: string | null;
+  consented_count: number;
+  declined_count: number;
+  unknown_consent_count: number;
   total_rows: number;
   ready_count: number;
   missing_photo_count: number;
@@ -75,11 +83,59 @@ export default function Import() {
   const [preview, setPreview] = useState<PreviewOkResponse | null>(null);
   const [duplicateStrategy, setDuplicateStrategy] = useState("skip");
   const [job, setJob] = useState<ImportJobStatus | null>(null);
+  // How many people's PDPA answer this sync actually changed, and how many
+  // form answers could not be understood. Computed by the backend.
+  const [pdpaUpdated, setPdpaUpdated] = useState(0);
+  const [pdpaWarnings, setPdpaWarnings] = useState(0);
   const [rows, setRows] = useState<ImportRowStatus[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const pollRef = useRef<number | null>(null);
   const fileRef = useRef<File | null>(null); // kept so we can resend it once the user resolves an ambiguous column
+
+  // Source mode. "file" is the original upload flow, unchanged. "sheet" reads
+  // a shared Google Sheet on demand — there is no background polling, so a
+  // sync only ever happens because someone pressed the button.
+  const [source, setSource] = useState<"file" | "sheet">("file");
+  const [sheetUrl, setSheetUrl] = useState("");
+  const sheetUrlRef = useRef("");   // the url the current preview came from
+
+  useEffect(() => {
+    // Offer back the sheet synced last time, so "Sync now" is one click.
+    apiGet("/api/import/sheet/url").then((d) => setSheetUrl(d.url ?? "")).catch(() => {});
+  }, []);
+
+  async function submitSheetPreview(nameColumn?: string, photoColumn?: string | null) {
+    const url = sheetUrlRef.current || sheetUrl;
+    if (!url.trim()) return;
+    sheetUrlRef.current = url;
+    setError("");
+    setLoading(true);
+    try {
+      const body: Record<string, unknown> = { url };
+      if (nameColumn) body.name_column = nameColumn;
+      if (photoColumn === null) body.photo_column_none = true;
+      else if (photoColumn) body.photo_column = photoColumn;
+      const data: PreviewResponse = await apiPostJson("/api/import/sheet/preview", body);
+      if (data.status === "needs_column_selection") {
+        setNeedsSelection(data);
+        setChosenName(data.resolved_name_column);
+        setChosenPhoto(data.resolved_photo_column);
+        setStage("columns");
+      } else {
+        setPreview(data);
+        // Sheet sync updates people whose photo changed, so the import must
+        // run with the "update" strategy rather than skipping duplicates.
+        setDuplicateStrategy("update");
+        setStage("preview");
+      }
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not read that Google Sheet.");
+      setStage("upload");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   async function submitPreview(nameColumn?: string, photoColumn?: string | null) {
     if (!fileRef.current) return;
@@ -123,7 +179,8 @@ export default function Import() {
     const needPhoto = needsSelection.needs.includes("photo");
     if (needName && !chosenName) return;
     if (needPhoto && chosenPhoto === undefined) return;
-    submitPreview(chosenName ?? undefined, needPhoto ? chosenPhoto : undefined);
+    if (source === "sheet") submitSheetPreview(chosenName ?? undefined, needPhoto ? chosenPhoto : undefined);
+    else submitPreview(chosenName ?? undefined, needPhoto ? chosenPhoto : undefined);
   }
 
   async function startImport() {
@@ -140,6 +197,8 @@ export default function Import() {
       const data = await apiGet(`/api/imports/${preview!.import_id}`);
       setJob(data.job);
       setRows(data.rows);
+      setPdpaUpdated(data.pdpa_updated ?? 0);
+      setPdpaWarnings(data.pdpa_warnings ?? 0);
       if (data.job.status === "completed" || data.job.status === "failed") {
         setStage("done");
         if (pollRef.current) window.clearInterval(pollRef.current);
@@ -163,6 +222,7 @@ export default function Import() {
     setRows([]);
     setError("");
     fileRef.current = null;
+    sheetUrlRef.current = "";
   }
 
   const progressPct = job ? Math.round(((job.success_count + job.failed_count + job.skipped_count) / job.total_rows) * 100) : 0;
@@ -171,7 +231,7 @@ export default function Import() {
     <div>
       <PageHeader
         title="Import Participants"
-        subtitle="Upload any CSV or Excel file — the system finds the Name and Photo columns itself. No fixed template required."
+        subtitle="Import from a CSV/Excel file, or sync from a shared Google Sheet. The system finds the Name and Photo columns itself — no fixed template required."
         action={
           <Button variant="secondary" onClick={() => downloadFile("/api/import/template", "participant_import_example.xlsx")}>
             Download Example
@@ -181,6 +241,43 @@ export default function Import() {
 
       {stage === "upload" && (
         <Card>
+          <div className="flex gap-2 mb-4">
+            <button
+              onClick={() => { setSource("file"); setError(""); }}
+              className={`px-4 py-2 rounded-lg text-sm font-medium ${source === "file" ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+            >
+              Upload file
+            </button>
+            <button
+              onClick={() => { setSource("sheet"); setError(""); }}
+              className={`px-4 py-2 rounded-lg text-sm font-medium ${source === "sheet" ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+            >
+              Google Sheet
+            </button>
+          </div>
+
+          {source === "sheet" ? (
+            <div>
+              <label className="block text-sm text-gray-600 mb-1">Google Sheet link</label>
+              <div className="flex gap-2">
+                <Input
+                  value={sheetUrl}
+                  onChange={(e) => setSheetUrl(e.target.value)}
+                  placeholder="https://docs.google.com/spreadsheets/d/..."
+                  className="flex-1"
+                />
+                <Button onClick={() => { sheetUrlRef.current = sheetUrl; submitSheetPreview(); }} disabled={loading || !sheetUrl.trim()}>
+                  {loading ? "Reading sheet..." : "Sync now"}
+                </Button>
+              </div>
+              <p className="text-xs text-gray-400 mt-3">
+                The sheet must be shared: open it in Google Sheets, then Share → General access → “Anyone with the link” → Viewer.
+                Press Sync now whenever the sheet changes — new people are added, and anyone whose photo link changed is updated.
+                Removing a row from the sheet never deletes a participant.
+              </p>
+            </div>
+          ) : (
+          <>
           <div
             onClick={() => document.getElementById("import-file")?.click()}
             className="border-2 border-dashed border-gray-300 rounded-lg p-16 text-center cursor-pointer hover:border-indigo-400 text-gray-500"
@@ -198,6 +295,8 @@ export default function Import() {
             Any column layout works — the system looks for a column that contains participant names and a column that contains
             photos (URLs, Google Drive links, or image filenames). Every other column is ignored.
           </p>
+          </>
+          )}
           {error && <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mt-3">{error}</div>}
         </Card>
       )}
@@ -309,8 +408,26 @@ export default function Import() {
                   · Photo = <span className="font-medium text-gray-700">{preview.photo_column}</span>
                 </>
               )}
+              {preview.consent_column && (
+                <>
+                  {" "}
+                  · Consent = <span className="font-medium text-gray-700">{preview.consent_column}</span>
+                </>
+              )}
               {" "}
               — every other column was ignored.
+              {preview.consent_column && (
+                <div className="mt-1">
+                  Consent read from the form: {preview.consented_count} consented ·{" "}
+                  {preview.declined_count} not consented
+                  {preview.unknown_consent_count > 0 && (
+                    <span className="text-amber-600">
+                      {" "}· {preview.unknown_consent_count} unreadable answer(s), imported as pending
+                    </span>
+                  )}
+                  . Everyone can still change this at the kiosk.
+                </div>
+              )}
             </div>
             <div className="max-h-96 overflow-y-auto">
               <table className="w-full text-sm">
@@ -319,6 +436,7 @@ export default function Import() {
                     <th className="text-left px-4 py-2">ID</th>
                     <th className="text-left px-4 py-2">Name</th>
                     <th className="text-left px-4 py-2">Photo</th>
+                    <th className="text-left px-4 py-2">Consent</th>
                     <th className="text-left px-4 py-2">Status</th>
                   </tr>
                 </thead>
@@ -328,6 +446,12 @@ export default function Import() {
                       <td className="px-4 py-2 font-mono text-gray-500">{r.participant_id ?? "—"}</td>
                       <td className="px-4 py-2">{r.name || <span className="text-gray-400 italic">(blank)</span>}</td>
                       <td className="px-4 py-2">{r.has_photo ? "✓" : "✕"}</td>
+                      <td className="px-4 py-2">
+                        {r.consent === "consented" && <Badge tone="good">CONSENTED</Badge>}
+                        {r.consent === "declined" && <Badge tone="bad">NOT CONSENTED</Badge>}
+                        {r.consent === "unknown" && <Badge tone="warn">UNKNOWN</Badge>}
+                        {r.consent == null && <span className="text-gray-400">PENDING</span>}
+                      </td>
                       <td className="px-4 py-2">
                         {r.status === "ready" && <Badge tone="good">NEW - READY</Badge>}
                         {r.status === "missing_photo" && <Badge tone="warn">Missing Photo</Badge>}
@@ -405,11 +529,32 @@ export default function Import() {
               <div className="text-2xl font-bold text-red-600">{job.failed_count}</div>
               <div className="text-xs text-gray-500">Failed</div>
             </div>
+            <div>
+              <div className="text-2xl font-bold text-indigo-600">{pdpaUpdated}</div>
+              <div className="text-xs text-gray-500">PDPA Updated</div>
+            </div>
           </div>
+
+          {(pdpaUpdated > 0 || pdpaWarnings > 0) && (
+            <div className="mb-4 text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+              {pdpaUpdated > 0 && (
+                <>
+                  {pdpaUpdated} participant{pdpaUpdated === 1 ? "'s" : "s'"} consent status was
+                  updated from the registration form — see the PDPA page.
+                </>
+              )}
+              {pdpaWarnings > 0 && (
+                <div className="text-amber-700 mt-1">
+                  {pdpaWarnings} form answer{pdpaWarnings === 1 ? "" : "s"} could not be understood;
+                  those participants' consent was left unchanged.
+                </div>
+              )}
+            </div>
+          )}
 
           {rows.some((r) => r.status === "error" || r.status === "skipped") && (
             <div className="mb-4">
-              <h3 className="font-medium text-sm mb-2">Issues</h3>
+              <h3 className="font-medium text-sm mb-2">Row details</h3>
               <div className="divide-y divide-gray-100 max-h-64 overflow-y-auto border border-gray-100 rounded-lg">
                 {rows
                   .filter((r) => r.status === "error" || r.status === "skipped")

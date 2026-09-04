@@ -6,7 +6,7 @@ import { Badge, Button, Card, EmptyState, Input, PageHeader, Spinner } from "../
 interface Batch {
   id: string;
   label: string;
-  status: "pending" | "processing" | "completed" | "failed";
+  status: "pending" | "processing" | "syncing_drive" | "completed" | "failed";
   current_stage: string;
   total_photos: number;
   processed_photos: number;
@@ -21,6 +21,9 @@ function StatusBadge({ status }: { status: string }) {
   if (status === "completed") return <Badge tone="good">Completed</Badge>;
   if (status === "failed") return <Badge tone="bad">Failed</Badge>;
   if (status === "processing") return <Badge tone="warn">Processing</Badge>;
+  // Photos are already processed and previewable here — only the Drive mirror
+  // is outstanding, so this must not read as "still processing".
+  if (status === "syncing_drive") return <Badge tone="warn">Syncing to Drive</Badge>;
   return <Badge>Pending</Badge>;
 }
 

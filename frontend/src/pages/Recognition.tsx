@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { apiGet, apiPostForm, apiPostJson, ApiError } from "../api/client";
+import {
+  listCameras,
+  getKioskOverride,
+  setKioskOverride,
+  resolveCameraDeviceId,
+  videoConstraints,
+  type CameraDevice,
+} from "../api/cameras";
 
 interface RecognitionResult {
   bbox: number[]; // [x1, y1, x2, y2] — not displayed anywhere in this UI, kept for /api/uploads parity
@@ -68,6 +76,29 @@ interface SystemInfo {
 }
 
 type KioskState = "idle" | "consent" | "scanning" | "result";
+type KioskMode = "tap" | "always";
+
+const MODE_KEY = "reconize_kiosk_mode";
+const FLASH_MS = 2200;          // how long a recognised name stays on screen
+const REFLASH_SUPPRESS_MS = 8000; // don't re-announce the same person for this long
+
+function getKioskModeOverride(): KioskMode | null {
+  try {
+    const v = localStorage.getItem(MODE_KEY);
+    return v === "tap" || v === "always" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function setKioskModeOverride(mode: KioskMode | null): void {
+  try {
+    if (mode) localStorage.setItem(MODE_KEY, mode);
+    else localStorage.removeItem(MODE_KEY);
+  } catch {
+    /* storage disabled - fall back to the app-wide setting */
+  }
+}
 type ConsentChoice = "consent" | "decline";
 interface PersonResult {
   person_id: string;
@@ -88,6 +119,39 @@ function sleep(ms: number): Promise<void> {
 export default function Recognition() {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [cameras, setCameras] = useState<CameraDevice[]>([]);
+  const [cameraLabelSetting, setCameraLabelSetting] = useState("");
+  const [cameraOverride, setCameraOverrideState] = useState<string | null>(getKioskOverride());
+  // "tap" = TAP TO SCAN + PDPA prompt (original). "always" = camera runs
+  // continuously, no prompt, people are checked in as they are seen.
+  const [kioskMode, setKioskMode] = useState<KioskMode>(
+    (new URLSearchParams(window.location.search).get("mode") as KioskMode | null) ??
+      getKioskModeOverride() ??
+      "tap",
+  );
+  const [modeFromSettings, setModeFromSettings] = useState<KioskMode>("tap");
+  const [modeOverridden, setModeOverridden] = useState(getKioskModeOverride() !== null);
+  const [activityName, setActivityName] = useState("");
+  // A "station" is this window pinned to one activity and one camera by its
+  // URL: /recognition?activity=<id>&camera=<deviceId>&mode=<tap|always>.
+  // Several windows can therefore run at once against different activities,
+  // or against the SAME activity with different cameras. URL wins over the
+  // per-machine override, which wins over the app-wide Settings default -
+  // and because it lives in the URL rather than localStorage, two windows on
+  // the same machine cannot overwrite each other's choice.
+  const [searchParams] = useSearchParams();
+  const pinnedActivity = searchParams.get("activity") ?? "";
+  const pinnedCamera = searchParams.get("camera") ?? "";
+  const pinnedModeParam = searchParams.get("mode");
+  const pinnedMode: KioskMode | null =
+    pinnedModeParam === "tap" || pinnedModeParam === "always" ? pinnedModeParam : null;
+  const isStation = Boolean(pinnedActivity || pinnedCamera || pinnedMode);
+  // Transient "recognised" banner in always-on mode; the loop keeps running.
+  const [flash, setFlash] = useState<PersonResult[] | null>(null);
+  const flashTimeoutRef = useRef<number | null>(null);
+  // person_id -> timestamp, so somebody standing in frame is not announced on
+  // every single tick. Purely cosmetic; the backend still decides check-in.
+  const recentlyFlashedRef = useRef<Map<string, number>>(new Map());
   const streamRef = useRef<MediaStream | null>(null);
   const activeRef = useRef(false); // true while the scan loop should keep running
   const consentRef = useRef<ConsentChoice | null>(null); // session-scoped only — no backend field for this
@@ -103,7 +167,29 @@ export default function Recognition() {
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
 
   useEffect(() => {
-    apiGet("/api/settings").then((s) => setDebugMode(s.debug_mode === "true"));
+    apiGet("/api/settings").then((s) => {
+      setDebugMode(s.debug_mode === "true");
+      setCameraLabelSetting(s.camera_label ?? "");
+      const fromSettings: KioskMode = s.kiosk_mode === "always" ? "always" : "tap";
+      setModeFromSettings(fromSettings);
+      // A pinned mode is fixed; otherwise a local override wins; otherwise
+      // follow the app-wide setting.
+      if (!pinnedMode && getKioskModeOverride() === null) setKioskMode(fromSettings);
+    });
+    apiGet("/api/activities")
+      .then((d) => {
+        const wanted = pinnedActivity || d.current_activity_id;
+        const match = d.activities.find((a: { id: string }) => a.id === wanted);
+        setActivityName(match ? match.name : "");
+        if (pinnedActivity && !match) {
+          setError("This station is pinned to an activity that no longer exists. Reopen it from the Activities page.");
+        }
+      })
+      .catch(() => {});
+    // Populate the switcher up front when the browser already has permission
+    // from an earlier visit; without it the list is unlabelled until scanning
+    // starts. Never prompts on its own.
+    listCameras().then(setCameras).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -131,6 +217,12 @@ export default function Recognition() {
 
   function tapToScan() {
     setError("");
+    if (kioskMode === "always") {
+      // No prompt in this mode - consent comes from the registration form,
+      // recorded against the participant at import time.
+      startScanning();
+      return;
+    }
     setKioskState("consent");
   }
 
@@ -139,10 +231,58 @@ export default function Recognition() {
     await startScanning();
   }
 
+  // In always-on mode the kiosk is meant to need no interaction at all, so
+  // the camera starts by itself once we know that is the active mode. Guarded
+  // on kioskState so a running scan is never restarted underneath itself.
+  useEffect(() => {
+    if (kioskMode === "always" && kioskState === "idle" && !activeRef.current) {
+      startScanning();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kioskMode, kioskState]);
+
+  useEffect(() => {
+    return () => {
+      if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
+    };
+  }, []);
+
+  function chooseMode(mode: KioskMode | null) {
+    setKioskModeOverride(mode);
+    setModeOverridden(mode !== null);
+    const effective = mode ?? modeFromSettings;
+    setKioskMode(effective);
+    // Leaving always-on must actually release the camera, not just repaint.
+    if (effective === "tap") {
+      activeRef.current = false;
+      stopCamera();
+      setFlash(null);
+      setKioskState("idle");
+    }
+  }
+
+  function chooseCamera(deviceId: string) {
+    // "" means fall back to the app-wide default from Settings.
+    setKioskOverride(deviceId || null);
+    setCameraOverrideState(deviceId || null);
+  }
+
   async function startScanning() {
     setError("");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+      // Which camera: this kiosk's local override, else the app-wide default
+      // from Settings (matched by label), else whatever the browser picks.
+      const available = await listCameras();
+      // A pinned camera is used as-is. It is NOT silently swapped for another
+      // if it has been unplugged: two stations sharing one machine would
+      // otherwise quietly collapse onto the same camera.
+      const deviceId = pinnedCamera || resolveCameraDeviceId(available, cameraLabelSetting);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: videoConstraints(deviceId),
+      });
+      // Labels are only readable once permission is granted, so refresh the
+      // list now that the stream is open - this is what fills the switcher.
+      listCameras().then(setCameras).catch(() => {});
       streamRef.current = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
     } catch (err) {
@@ -164,15 +304,37 @@ export default function Recognition() {
     while (activeRef.current) {
       const people = await scanFrame();
       if (people.length > 0) {
-        activeRef.current = false;
-        stopCamera();
-        recordConsent(people.map((p) => p.person_id)); // fire-and-forget — never blocks showing the result
-        showResult(people);
-        return;
+        if (kioskMode === "always") {
+          // Stay on the camera: announce whoever is newly recognised and keep
+          // scanning, so a queue can walk past without anyone touching it.
+          announce(people);
+        } else {
+          activeRef.current = false;
+          stopCamera();
+          recordConsent(people.map((p) => p.person_id)); // fire-and-forget — never blocks showing the result
+          showResult(people);
+          return;
+        }
       }
       if (!activeRef.current) return;
       await sleep(SCAN_DELAY_MS);
     }
+  }
+
+  // Show a recognised person briefly without interrupting the loop. Somebody
+  // lingering in frame is only announced once per REFLASH_SUPPRESS_MS.
+  function announce(people: PersonResult[]) {
+    const now = Date.now();
+    const fresh = people.filter((p) => {
+      const last = recentlyFlashedRef.current.get(p.person_id);
+      return last === undefined || now - last > REFLASH_SUPPRESS_MS;
+    });
+    if (fresh.length === 0) return;
+    for (const p of fresh) recentlyFlashedRef.current.set(p.person_id, now);
+
+    setFlash(fresh);
+    if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
+    flashTimeoutRef.current = window.setTimeout(() => setFlash(null), FLASH_MS);
   }
 
   // PDPA: the consent choice picked before this scan session started is
@@ -238,6 +400,9 @@ export default function Recognition() {
 
       const form = new FormData();
       form.append("photo", blob, "scan.jpg");
+      // The backend can no longer infer this: with stations running side by
+      // side there is no single "current" activity to read server-side.
+      if (pinnedActivity) form.append("activity_id", pinnedActivity);
 
       const tFetchStart = performance.now();
       const data: RecognitionResponse = await apiPostForm(`/api/recognition/upload${debugMode ? "?debug=true" : ""}`, form);
@@ -292,13 +457,64 @@ export default function Recognition() {
       {/* IDLE — camera off, no recognition API calls. */}
       {kioskState === "idle" && (
         <div className="absolute inset-0 bg-black flex flex-col items-center justify-center gap-8">
+          {isStation && (
+            <div className="absolute top-6 left-6 text-xs font-medium text-white/60 bg-white/10 px-3 py-1.5 rounded-full backdrop-blur">
+              STATION{activityName ? ` · ${activityName}` : ""}
+            </div>
+          )}
           <div className="text-white text-5xl sm:text-6xl font-extrabold tracking-wide">EVENT CHECK-IN</div>
-          <button
-            onClick={tapToScan}
-            className="px-14 py-7 rounded-2xl bg-indigo-600 hover:bg-indigo-700 text-white text-3xl sm:text-4xl font-bold shadow-2xl"
-          >
-            TAP TO SCAN
-          </button>
+          {activityName && (
+            <div className="text-indigo-300 text-2xl font-semibold -mt-4">{activityName}</div>
+          )}
+          {kioskMode === "always" ? (
+            <div className="text-white/60 text-xl">Starting camera...</div>
+          ) : (
+            <button
+              onClick={tapToScan}
+              className="px-14 py-7 rounded-2xl bg-indigo-600 hover:bg-indigo-700 text-white text-3xl sm:text-4xl font-bold shadow-2xl"
+            >
+              TAP TO SCAN
+            </button>
+          )}
+          {/* Mode switch for THIS machine. The app-wide default is in Settings.
+              Hidden on a pinned station: its mode comes from the URL, and a
+              dropdown that silently disagreed with it would be a trap. */}
+          <div className={`absolute top-6 left-1/2 -translate-x-1/2 items-center gap-2 ${isStation ? "hidden" : "flex"}`}>
+            <span className="text-white/40 text-xs">Mode</span>
+            <select
+              value={modeOverridden ? kioskMode : ""}
+              onChange={(e) => chooseMode((e.target.value || null) as KioskMode | null)}
+              className="rounded-lg bg-white/10 text-white text-sm px-3 py-2 backdrop-blur border border-white/20"
+            >
+              <option value="" className="text-black">
+                Default ({modeFromSettings === "always" ? "Always on" : "Tap to scan"})
+              </option>
+              <option value="tap" className="text-black">Tap to scan (ask consent)</option>
+              <option value="always" className="text-black">Always on (no prompt)</option>
+            </select>
+          </div>
+          {/* Local override for this machine only. The app-wide default lives
+              in Settings; this is for swapping camera at the kiosk itself. Only
+              shown when there is actually more than one camera to choose. */}
+          {cameras.length > 1 && !isStation && (
+            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-2">
+              <span className="text-white/50 text-xs">Camera</span>
+              <select
+                value={cameraOverride ?? ""}
+                onChange={(e) => chooseCamera(e.target.value)}
+                className="rounded-lg bg-white/10 text-white text-sm px-3 py-2 backdrop-blur border border-white/20"
+              >
+                <option value="" className="text-black">
+                  {cameraLabelSetting ? `Default (${cameraLabelSetting})` : "Default"}
+                </option>
+                {cameras.map((c) => (
+                  <option key={c.deviceId} value={c.deviceId} className="text-black">
+                    {c.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <button
             onClick={toggleFullscreen}
             className="absolute bottom-6 right-6 px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm font-medium backdrop-blur"
@@ -312,6 +528,46 @@ export default function Recognition() {
             ← Dashboard
           </Link>
         </div>
+      )}
+
+      {/* ALWAYS-ON: the camera stays live. A recognised person is announced
+          for a couple of seconds over the video while scanning continues. */}
+      {kioskMode === "always" && kioskState === "scanning" && (
+        <>
+          <div className="absolute top-6 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 pointer-events-none">
+            <div className="text-white/70 text-sm bg-black/40 rounded-full px-4 py-1 backdrop-blur">
+              {activityName ? `Checking in to ${activityName}` : "Check-in running"}
+            </div>
+          </div>
+          {flash && (
+            <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2 pointer-events-none">
+              {flash.map((p) => (
+                <div
+                  key={p.person_id}
+                  className={`px-8 py-4 rounded-2xl text-white text-3xl font-bold shadow-2xl backdrop-blur ${
+                    p.checkin === "new" ? "bg-green-600/90" : "bg-blue-600/90"
+                  }`}
+                >
+                  {p.checkin === "new" ? "✓ " : "• "}
+                  {p.name}
+                  <span className="block text-base font-medium opacity-80">
+                    {p.checkin === "new"
+                      ? activityName
+                        ? `Checked in to ${activityName}`
+                        : "Checked in"
+                      : "Already checked in"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          <button
+            onClick={() => chooseMode("tap")}
+            className="absolute bottom-6 right-6 px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm font-medium backdrop-blur"
+          >
+            Stop always-on
+          </button>
+        </>
       )}
 
       {/* CONSENT — still camera off. Either choice proceeds to scanning; the

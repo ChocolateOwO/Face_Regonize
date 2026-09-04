@@ -44,3 +44,6 @@ backups/
 # Patch backups keep source files only - never runtime data
 patch/**/*.db
 patch/**/storage/
+
+# Camera/ffmpeg runtime logs written while stations are running
+recordings/

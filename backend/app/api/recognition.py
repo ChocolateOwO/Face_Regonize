@@ -5,14 +5,15 @@ import time
 from datetime import date, datetime
 
 import numpy as np
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from app.auth.deps import get_current_user
 from app.database.db import engine, get_session
 from app.face_recognition.engine import bbox_to_str, detect_faces, get_active_provider, resize_for_detection, MODEL_NAME
 from app.face_recognition.index import recognition_index
-from app.models.models import Attendance, FaceDetection, Upload, User
+from app.api.activities import get_current_activity_id
+from app.models.models import Activity, Attendance, FaceDetection, Upload, User
 from app.services import settings_cache, storage_service
 
 logger = logging.getLogger(__name__)
@@ -23,19 +24,46 @@ def _start_of_today() -> datetime:
     return datetime.combine(date.today(), datetime.min.time())
 
 
-def _checked_in_today(session: Session, person_id: str) -> bool:
-    """Already-checked-in is scoped to the current calendar day — one
-    Attendance row per person per day counts as checked in, so the kiosk can
-    be reused on a later date without needing the DB wiped. Attendance.person_id
-    is indexed, so this is a cheap point lookup."""
+def _checked_in_today(session: Session, person_id: str, activity_id: str = "") -> bool:
+    """Already-checked-in is scoped to the current calendar day AND to the
+    activity being checked into - one Attendance row per person per activity
+    per day. That is what lets the same person collect food and then collect a
+    gadget without the second scan being dismissed as a duplicate, while still
+    letting the kiosk be reused on a later date without wiping the DB.
+
+    With no activity selected the activity clause drops out and the behaviour
+    is exactly the original one check-in per person per day.
+
+    Attendance.person_id and .activity_id are both indexed, so this stays a
+    cheap point lookup."""
     stmt = select(Attendance.id).where(
         Attendance.person_id == person_id,
         Attendance.detected_at >= _start_of_today(),
-    ).limit(1)
-    return session.exec(stmt).first() is not None
+    )
+    if activity_id:
+        stmt = stmt.where(Attendance.activity_id == activity_id)
+    return session.exec(stmt.limit(1)).first() is not None
 
 
-def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, threshold: float, faces, matches, scaled_bboxes, new_person_ids: set[str]) -> None:
+def _resolve_activity(session: Session, requested: str | None) -> str:
+    """A station-supplied activity wins over the app-wide current one.
+
+    An id that does not exist is rejected rather than silently ignored: a
+    station pinned to a deleted activity must not quietly start recording
+    against whatever the global setting happens to be, because the operator
+    would have no way of noticing.
+    """
+    if requested:
+        activity = session.get(Activity, requested)
+        if not activity:
+            raise HTTPException(404, "That activity no longer exists. Reopen this station from the Activities page.")
+        if activity.archived:
+            raise HTTPException(400, f"'{activity.name}' is archived and cannot take check-ins.")
+        return activity.id
+    return get_current_activity_id(session)
+
+
+def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, threshold: float, faces, matches, scaled_bboxes, new_person_ids: set[str], activity_id: str = "") -> None:
     """Runs AFTER the recognition response has already been sent to the
     client — image storage, thumbnailing, and every DB write happen here so
     none of it adds latency to the identity result. Opens its own session
@@ -87,12 +115,13 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
                 # theoretically race it. Re-checking here (instead of trusting
                 # the earlier decision blindly) is what actually guarantees no
                 # duplicate Attendance row, not just the happy-path timing.
-                if not _checked_in_today(session, person_id):
+                if not _checked_in_today(session, person_id, activity_id):
                     session.add(Attendance(
                         person_id=person_id,
                         upload_id=upload.id,
                         face_detection_id=detection.id,
                         confidence=score,
+                        activity_id=activity_id or None,
                     ))
                     session.commit()
     t_db = time.perf_counter()
@@ -108,6 +137,7 @@ def recognize(
     background_tasks: BackgroundTasks,
     photo: UploadFile = File(...),
     debug: bool | None = None,
+    activity_id: str | None = Form(None),
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
@@ -146,11 +176,20 @@ def recognize(
     # matched person is looked up once even if they appear twice in one frame.
     # This is the one intentional DB read on the hot path — a single indexed
     # point lookup per unique matched person (usually 0-3 per frame).
+    # Which activity this scan checks people into. Resolved once per request
+    # so the synchronous decision and the background write cannot disagree if
+    # an admin switches activity mid-scan.
+    # Which activity this scan checks people into. A station pins its own
+    # activity in its URL and sends it here, so several stations can run at
+    # once against different activities; the app-wide current activity is the
+    # fallback for a kiosk that pins nothing. Resolved once per request so the
+    # synchronous decision and the background write cannot disagree.
+    activity_id = _resolve_activity(session, activity_id)
     checkin_status: dict[str, str] = {}
     new_person_ids: set[str] = set()
     for person_id, *_ in matches:
         if person_id and person_id not in checkin_status:
-            already = _checked_in_today(session, person_id)
+            already = _checked_in_today(session, person_id, activity_id)
             checkin_status[person_id] = "already_checked_in" if already else "new"
             if not already:
                 new_person_ids.add(person_id)
@@ -213,6 +252,6 @@ def recognize(
             "registered_faces_indexed": recognition_index.size(),
         }
 
-    background_tasks.add_task(_persist_recognition, file_bytes, filename, user.id, threshold, faces, matches, scaled_bboxes, new_person_ids)
+    background_tasks.add_task(_persist_recognition, file_bytes, filename, user.id, threshold, faces, matches, scaled_bboxes, new_person_ids, activity_id)
 
     return response

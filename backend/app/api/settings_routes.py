@@ -25,6 +25,16 @@ DEFAULTS = {
     "app_name": "Reconize",
     "timezone": "UTC",
     "debug_mode": "false",
+    # App-wide default camera, stored as the device LABEL rather than the
+    # browser deviceId: a deviceId is scoped to one browser profile and
+    # origin, so it would be meaningless on any other machine. Empty means
+    # "let the browser choose", which is the original behaviour.
+    "camera_label": "",
+    # "tap"    - show TAP TO SCAN, ask PDPA consent, then scan (original behaviour)
+    # "always" - camera runs continuously, no prompt, recognised people are
+    #            checked in as they are seen. Consent for this mode comes from
+    #            the registration form, not the kiosk.
+    "kiosk_mode": "tap",
 }
 
 

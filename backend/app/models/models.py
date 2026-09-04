@@ -65,6 +65,22 @@ class FaceDetection(SQLModel, table=True):
     status: str = Field(default="unknown")  # matched | unknown
 
 
+class Activity(SQLModel, table=True):
+    """Something a participant can be checked in to during an event - "Food",
+    "Gadget", "Registration". Which one the kiosk is currently checking people
+    into is NOT stored here: it lives in the `current_activity_id` Setting, so
+    exactly one can be current by construction rather than by keeping a bool
+    mutually exclusive across rows.
+
+    Archiving hides an activity from the kiosk picker but keeps its
+    attendance history intact and still reportable."""
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    name: str
+    archived: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
 class Attendance(SQLModel, table=True):
     """One attendance record created whenever a face_detection matches a known person."""
 
@@ -75,6 +91,10 @@ class Attendance(SQLModel, table=True):
     confidence: float
     detected_at: datetime = Field(default_factory=datetime.now)
     status: str = Field(default="detected")
+    # Which activity this check-in belongs to. Nullable on purpose: rows
+    # written before activities existed keep NULL, and a kiosk running with no
+    # activity selected still records plain attendance exactly as before.
+    activity_id: Optional[str] = Field(default=None, foreign_key="activity.id", index=True)
 
 
 class ImportJob(SQLModel, table=True):
@@ -103,6 +123,10 @@ class ImportRow(SQLModel, table=True):
     image_url: Optional[str] = None
     status: str = Field(default="pending")  # ready | warning | error | imported | skipped
     error_message: Optional[str] = None
+    # PDPA answer carried from the sheet, "consented" / "declined" / None.
+    # None means the sheet had no usable answer, and no consent record is
+    # invented for that person.
+    consent: Optional[str] = None
 
 
 class ConsentRecord(SQLModel, table=True):
@@ -121,7 +145,7 @@ class ConsentRecord(SQLModel, table=True):
     id: str = Field(default_factory=new_id, primary_key=True)
     person_id: str = Field(foreign_key="person.id", index=True)
     choice: str  # "consented" | "declined"
-    source: str = Field(default="kiosk")  # "kiosk" | "admin"
+    source: str = Field(default="kiosk")  # "kiosk" | "admin" | "registration"
     recorded_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -149,7 +173,9 @@ class PhotoBatch(SQLModel, table=True):
     media_folder_id: str = Field(default="")
     ambience_folder_id: str = Field(default="")
     review_folder_id: str = Field(default="")
-    status: str = Field(default="pending")  # pending | processing | completed | failed
+    # syncing_drive = local processing finished and every local result is
+    # final and previewable; only the Google Drive mirror is still running.
+    status: str = Field(default="pending")  # pending | processing | syncing_drive | completed | failed
     current_stage: str = Field(default="")
 
     total_photos: int = 0

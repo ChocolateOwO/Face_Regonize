@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 from app.auth.deps import get_current_user
 from app.database.db import get_session
 from app.face_recognition.engine import detect_faces
+from app.face_recognition.enrollment import EnrollmentFaceError, select_primary_enrollment_face
 from app.face_recognition.index import recognition_index
 from app.services.index_sync import apply_index_change
 from app.models.models import Attendance, ConsentRecord, FaceDetection, Person, User
@@ -93,14 +94,17 @@ def create_person(
     if img is None:
         raise HTTPException(400, "Could not decode the uploaded image.")
 
-    faces = detect_faces(img)
-    if not faces:
-        raise HTTPException(422, "No face detected. Please upload a clear face image.")
-    if len(faces) > 1:
-        raise HTTPException(422, "Multiple faces detected. Please upload an image containing only one person.")
-    face = faces[0]
+    # Detection itself is unchanged and still returns every face; only the
+    # choice of which one owns this enrollment photo happens here.
+    try:
+        face = select_primary_enrollment_face(detect_faces(img))
+    except EnrollmentFaceError as e:
+        raise HTTPException(422, e.message) from e
 
-    image_path = storage_service.save_person_image(participant_id, file_bytes)
+    # Re-encoded only if the upload was HEIC, so the photo is displayable in a
+    # browser. The embedding above came from the original bytes either way.
+    display_bytes, ext = storage_service.to_displayable_bytes(file_bytes)
+    image_path = storage_service.save_person_image(participant_id, display_bytes, ext)
 
     person = Person(
         participant_id=participant_id,
@@ -145,13 +149,12 @@ def update_person(
         img = storage_service.decode_image(file_bytes)
         if img is None:
             raise HTTPException(400, "Could not decode the uploaded image.")
-        faces = detect_faces(img)
-        if not faces:
-            raise HTTPException(422, "No face detected. Please upload a clear face image.")
-        if len(faces) > 1:
-            raise HTTPException(422, "Multiple faces detected. Please upload an image containing only one person.")
-        face = faces[0]
-        p.image_path = storage_service.save_person_image(p.participant_id, file_bytes)
+        try:
+            face = select_primary_enrollment_face(detect_faces(img))
+        except EnrollmentFaceError as e:
+            raise HTTPException(422, e.message) from e
+        display_bytes, ext = storage_service.to_displayable_bytes(file_bytes)
+        p.image_path = storage_service.save_person_image(p.participant_id, display_bytes, ext)
         p.embedding = face.embedding.tobytes()
         p.det_score = face.det_score
         p.image_source = "manual"

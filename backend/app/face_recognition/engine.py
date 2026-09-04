@@ -20,8 +20,17 @@ import time
 
 import cv2
 import numpy as np
-from insightface.app import FaceAnalysis
-from insightface.app.common import Face
+
+# MUST run before insightface (and therefore onnxruntime) is imported: it makes
+# the bundled CUDA/cuDNN DLLs loadable, which is what decides whether the GPU
+# provider can start at all. Purely a loader fix — see cuda_dlls for why, and
+# it is best-effort, so a machine without CUDA still falls through to CPU below.
+from app.face_recognition import cuda_dlls
+
+cuda_dlls.enable()
+
+from insightface.app import FaceAnalysis  # noqa: E402 — must follow cuda_dlls.enable()
+from insightface.app.common import Face  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

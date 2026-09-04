@@ -34,6 +34,7 @@ ever re-reads live consent for an already-processed photo again, matching
 from __future__ import annotations
 
 import logging
+import mimetypes
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -228,7 +229,7 @@ def run_photo_batch(batch_id: str) -> None:
         if not batch:
             return
         batch.status = "processing"
-        batch.current_stage = "Preparing Drive output folders..."
+        batch.current_stage = "Listing Drive folder..."
         session.add(batch)
         session.commit()
 
@@ -236,35 +237,17 @@ def run_photo_batch(batch_id: str) -> None:
         for sub in ("ORIGINAL", "SORTED", "AMBIENCE", "REVIEW", "MEDIA"):
             (batch_dir / sub).mkdir(parents=True, exist_ok=True)
 
-        # Drive output is OPTIONAL. If it isn't connected or the folder tree
-        # can't be created, processing still runs and the web preview still
-        # gets populated — only the Drive mirror is skipped.
-        processed_id = media_id = ambience_id = review_id = ""
+        # Whether Drive output is possible at all. is_connected() only reads a
+        # stored refresh token out of the local database, so this costs no
+        # network and can be answered before any photo is processed — the
+        # common failure ("not connected") is reported immediately instead of
+        # after a long local run. Creating the output FOLDERS is a Drive write
+        # and therefore belongs to phase 2, not here.
         drive_enabled = is_connected()
-        if drive_enabled:
-            try:
-                # drive.file scope: this app may only touch what it created,
-                # so the output tree is rooted in the connected admin's own
-                # Drive rather than inside the photographer's folder.
-                root_id = create_root_folder(f"Reconize — {batch.label} — {datetime.now():%Y-%m-%d %H%M}")
-                processed_id = get_or_create_subfolder(root_id, "PROCESSED")
-                media_id = get_or_create_subfolder(processed_id, "MEDIA")
-                ambience_id = get_or_create_subfolder(processed_id, "AMBIENCE")
-                review_id = get_or_create_subfolder(processed_id, "REVIEW")
-                batch.processed_folder_id = processed_id
-                batch.media_folder_id = media_id
-                batch.ambience_folder_id = ambience_id
-                batch.review_folder_id = review_id
-            except (DriveFolderError, DriveOAuthError) as e:
-                logger.exception("Photo batch %s: Drive output folders unavailable", batch.id)
-                drive_enabled = False
-                batch.drive_error = f"Drive output unavailable: {e}"
-        else:
+        if not drive_enabled:
             batch.drive_error = "Google Drive is not connected — processed photos were saved locally only."
-
-        batch.current_stage = "Listing Drive folder..."
-        session.add(batch)
-        session.commit()
+            session.add(batch)
+            session.commit()
 
         threshold = settings_cache.get_threshold()
 
@@ -281,10 +264,13 @@ def run_photo_batch(batch_id: str) -> None:
         session.add(batch)
         session.commit()
 
-        participant_folder_ids: dict[str, str] = {}  # person_id -> Drive folder id, cached for this run
-
-        for f in files:
-            batch.current_stage = f"Processing {f.name}..."
+        # ---- PHASE 1: local processing -------------------------------------
+        # Drive READS (list_image_files above, download_file below) are the
+        # batch's input and stay. Drive WRITES do not happen here at all: an
+        # upload used to sit between one photo's recognition and the next, so
+        # network latency delayed face detection that needed nothing from it.
+        for index, f in enumerate(files, start=1):
+            batch.current_stage = f"Processing photos — {index} of {len(files)}: {f.name}"
             session.add(batch)
             session.commit()
 
@@ -293,8 +279,6 @@ def run_photo_batch(batch_id: str) -> None:
                 img = storage_service.decode_image(file_bytes)
                 if img is None:
                     raise RuntimeError("not a readable image")
-
-                mime_type = f.mime_type or "image/jpeg"
 
                 # STAGE 1a — the untouched original always lands locally first.
                 original_rel = f"{batch.storage_dir}/ORIGINAL/{f.name}"
@@ -324,13 +308,8 @@ def run_photo_batch(batch_id: str) -> None:
                     session.commit()
                     session.refresh(photo)
 
-                    if drive_enabled:
-                        _drive_upload_photo(
-                            session, batch, photo,
-                            file_bytes=file_bytes, media_bytes=file_bytes, mime_type=mime_type,
-                            media_folder_id=media_id, extra_folder_ids=[ambience_id],
-                        )
-
+                    # No Drive write here — phase 2 syncs this photo later,
+                    # reading the bytes back from AMBIENCE/ and MEDIA/.
                     batch.processed_photos += 1
                     session.add(batch)
                     session.commit()
@@ -381,12 +360,10 @@ def run_photo_batch(batch_id: str) -> None:
                 else:
                     batch.recognized_photos += 1
 
-                sorted_person_ids: list[str] = []
                 for person_id in matched_person_ids:
                     person = session.get(Person, person_id)
                     if not person:
                         continue
-                    sorted_person_ids.append(person_id)
                     folder_name = _safe_folder_name(person.participant_id, person.first_name, person.last_name)
                     dest_dir = batch_dir / "SORTED" / folder_name
                     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -424,46 +401,11 @@ def run_photo_batch(batch_id: str) -> None:
                 session.add(photo)
                 session.commit()
 
-                # STAGE 2 — Drive mirror, best-effort and fully isolated from
-                # everything above.
-                if drive_enabled:
-                    participant_targets: list[str] = []
-                    try:
-                        for person_id in sorted_person_ids:
-                            folder_id = participant_folder_ids.get(person_id)
-                            if not folder_id:
-                                person = session.get(Person, person_id)
-                                if not person:
-                                    continue
-                                folder_id = get_or_create_subfolder(
-                                    processed_id,
-                                    _safe_folder_name(person.participant_id, person.first_name, person.last_name),
-                                )
-                                participant_folder_ids[person_id] = folder_id
-                                pf = session.exec(
-                                    select(PhotoBatchParticipantFolder).where(
-                                        PhotoBatchParticipantFolder.batch_id == batch.id,
-                                        PhotoBatchParticipantFolder.person_id == person_id,
-                                    )
-                                ).first()
-                                if pf:
-                                    pf.folder_id = folder_id
-                                    session.add(pf)
-                            participant_targets.append(folder_id)
-                        session.commit()
-                    except (DriveFolderError, DriveOAuthError) as e:
-                        logger.exception("Photo batch %s: participant folder creation failed for %s", batch.id, f.name)
-                        participant_targets = []
-                        batch.drive_error = f"{f.name}: {e}"
-
-                    extra = list(participant_targets)
-                    if has_unknown:
-                        extra.append(review_id)
-                    _drive_upload_photo(
-                        session, batch, photo,
-                        file_bytes=file_bytes, media_bytes=media_bytes, mime_type=mime_type,
-                        media_folder_id=media_id, extra_folder_ids=extra,
-                    )
+                # No Drive write here either. Everything phase 2 needs to mirror
+                # this photo is now on disk or in the database: the bytes under
+                # ORIGINAL/ and MEDIA/, which participants it belongs to via its
+                # PhotoBatchFace rows, and whether it is a review photo via
+                # photo.classification.
 
                 batch.faces_detected += len(faces)
                 batch.faces_recognized += len(matched_person_ids)
@@ -485,8 +427,204 @@ def run_photo_batch(batch_id: str) -> None:
                 session.add(batch)
                 session.commit()
 
+        # Phase 1 is done: every local output exists and the web preview is
+        # fully usable from here on, whatever Drive does next.
+        local_note = "" if batch.failed_photos == 0 else f"{batch.failed_photos} photo(s) failed — see last error below."
+        batch.current_stage = local_note
+        session.add(batch)
+        session.commit()
+
+    # ---- PHASE 2: Drive sync -----------------------------------------------
+    # Deliberately outside the session above: this opens its own session, and a
+    # failure inside it must not be able to roll back any phase 1 work.
+    try:
+        if drive_enabled:
+            _sync_batch_to_drive(batch_id)
+    except Exception:  # noqa: BLE001 — never strand the batch mid-sync
+        logger.exception("Photo batch %s: Drive sync raised unexpectedly", batch_id)
+    finally:
+        # Whatever happened above, the batch is finished as far as local
+        # processing is concerned and must never be left showing "syncing".
+        _finish_batch(batch_id)
+
+
+def _finish_batch(batch_id: str) -> None:
+    """Mark the batch completed and leave a stage message that tells the truth.
+
+    Local processing having succeeded does NOT mean the whole batch succeeded:
+    the message distinguishes a clean run from one where Drive was skipped or
+    partly failed, using only fields that already exist.
+    """
+    with Session(engine) as session:
+        batch = session.get(PhotoBatch, batch_id)
+        if not batch:
+            return
+        notes: list[str] = []
+        if batch.failed_photos:
+            notes.append(f"{batch.failed_photos} photo(s) failed locally — see last error below.")
+        if batch.drive_failed_photos:
+            notes.append(f"Google Drive sync completed with errors — {batch.drive_failed_photos} photo(s) not uploaded.")
         batch.status = "completed"
-        batch.current_stage = "" if batch.failed_photos == 0 else f"{batch.failed_photos} photo(s) failed — see last error below."
+        batch.current_stage = " ".join(notes)
+        session.add(batch)
+        session.commit()
+
+
+def _sync_batch_to_drive(batch_id: str) -> None:
+    """PHASE 2 — mirror an already locally-processed batch into Google Drive.
+
+    File sync ONLY. No detection, embedding, matching or consent evaluation
+    happens here; every one of those decisions was made in phase 1 and is read
+    back from the database. Re-running any of it would be both wasteful and a
+    way for two runs to disagree.
+
+    Nothing local is ever deleted, rewritten or re-classified by this function.
+    A batch whose Drive sync fails entirely still has all of its local output
+    and still previews correctly — that is the whole point of the split.
+    """
+    with Session(engine) as session:
+        batch = session.get(PhotoBatch, batch_id)
+        if not batch:
+            return
+
+        batch.status = "syncing_drive"
+        batch.current_stage = "Preparing Drive output folders..."
+        session.add(batch)
+        session.commit()
+
+        # Output folders are created HERE, not at batch start: creating them is
+        # a Drive write, and phase 1 must contain none.
+        try:
+            # drive.file scope: this app may only touch what it created, so the
+            # output tree is rooted in the connected admin's own Drive rather
+            # than inside the photographer's folder.
+            root_id = create_root_folder(f"Reconize — {batch.label} — {datetime.now():%Y-%m-%d %H%M}")
+            processed_id = get_or_create_subfolder(root_id, "PROCESSED")
+            media_id = get_or_create_subfolder(processed_id, "MEDIA")
+            ambience_id = get_or_create_subfolder(processed_id, "AMBIENCE")
+            review_id = get_or_create_subfolder(processed_id, "REVIEW")
+            batch.processed_folder_id = processed_id
+            batch.media_folder_id = media_id
+            batch.ambience_folder_id = ambience_id
+            batch.review_folder_id = review_id
+            session.add(batch)
+            session.commit()
+        except DriveOAuthError as e:
+            # Connected at batch start but not usable now — an expired or
+            # revoked authorisation is the usual cause, and saying so is more
+            # useful than the raw API error.
+            logger.warning("Photo batch %s: Drive authorisation unusable: %s", batch_id, e)
+            batch.drive_error = (
+                f"Google Drive authorisation failed ({e}) — processed photos were saved locally only. "
+                "Reconnect Google Drive in Settings."
+            )
+            batch.status = "completed"
+            batch.current_stage = ""
+            session.add(batch)
+            session.commit()
+            return
+        except Exception as e:  # noqa: BLE001 — Drive must never cost local results
+            logger.exception("Photo batch %s: Drive output folders unavailable", batch_id)
+            batch.drive_error = f"Drive output unavailable: {e}"
+            batch.status = "completed"
+            batch.current_stage = ""
+            session.add(batch)
+            session.commit()
+            return
+
+        # Only photos not yet mirrored. A row already marked "failed" is left
+        # alone rather than silently retried, so its error stays visible.
+        photos = session.exec(
+            select(PhotoBatchPhoto).where(
+                PhotoBatchPhoto.batch_id == batch_id,
+                PhotoBatchPhoto.drive_upload_status == "pending",
+            ).order_by(PhotoBatchPhoto.id)
+        ).all()
+
+        participant_folder_ids: dict[str, str] = {}  # person_id -> Drive folder id
+
+        for index, photo in enumerate(photos, start=1):
+            batch.current_stage = f"Syncing to Google Drive — {index} of {len(photos)}: {photo.filename}"
+            session.add(batch)
+            session.commit()
+
+            try:
+                # Read the bytes back off disk rather than carrying every photo
+                # of the batch in memory — a large batch would be gigabytes.
+                original_abs = STORAGE_PATH / photo.original_path if photo.original_path else None
+                media_abs = STORAGE_PATH / photo.media_path if photo.media_path else None
+                if not original_abs or not original_abs.exists():
+                    raise RuntimeError("local original is missing — nothing to sync")
+                file_bytes = original_abs.read_bytes()
+                media_bytes = media_abs.read_bytes() if media_abs and media_abs.exists() else file_bytes
+
+                # Phase 1 knew the Drive-reported mime type, but storing it
+                # would need a schema change; the extension is what Drive
+                # itself derives it from anyway.
+                mime_type = mimetypes.guess_type(photo.filename)[0] or "image/jpeg"
+
+                # Rebuild the destination list from what phase 1 recorded.
+                extra: list[str] = []
+                if photo.classification == "ambience":
+                    extra.append(ambience_id)
+                else:
+                    person_ids = [
+                        r.person_id
+                        for r in session.exec(
+                            select(PhotoBatchFace).where(
+                                PhotoBatchFace.photo_id == photo.id,
+                                PhotoBatchFace.person_id.is_not(None),
+                            )
+                        ).all()
+                    ]
+                    seen: set[str] = set()
+                    for person_id in person_ids:
+                        if person_id in seen:
+                            continue
+                        seen.add(person_id)
+                        folder_id = participant_folder_ids.get(person_id)
+                        if not folder_id:
+                            person = session.get(Person, person_id)
+                            if not person:
+                                continue
+                            folder_id = get_or_create_subfolder(
+                                processed_id,
+                                _safe_folder_name(person.participant_id, person.first_name, person.last_name),
+                            )
+                            participant_folder_ids[person_id] = folder_id
+                            pf = session.exec(
+                                select(PhotoBatchParticipantFolder).where(
+                                    PhotoBatchParticipantFolder.batch_id == batch.id,
+                                    PhotoBatchParticipantFolder.person_id == person_id,
+                                )
+                            ).first()
+                            if pf:
+                                pf.folder_id = folder_id
+                                session.add(pf)
+                        extra.append(folder_id)
+                    if photo.classification == "review":
+                        extra.append(review_id)
+                    session.commit()
+
+                # Unchanged: uploads the source bytes once, then server-side
+                # copies into the remaining folders.
+                _drive_upload_photo(
+                    session, batch, photo,
+                    file_bytes=file_bytes, media_bytes=media_bytes, mime_type=mime_type,
+                    media_folder_id=media_id, extra_folder_ids=extra,
+                )
+            except Exception as e:  # noqa: BLE001 — one photo must not stop the sync
+                logger.exception("Photo batch %s: Drive sync failed for %s", batch_id, photo.filename)
+                photo.drive_upload_status = "failed"
+                photo.drive_error = str(e)
+                batch.drive_failed_photos += 1
+                batch.drive_error = f"{photo.filename}: {e}"
+                session.add(photo)
+                session.add(batch)
+                session.commit()
+
+        batch.status = "completed"
+        batch.current_stage = ""
         session.add(batch)
         session.commit()
 

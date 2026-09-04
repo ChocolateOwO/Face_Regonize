@@ -1,7 +1,7 @@
 # patch/
 
 Backups of live files taken immediately before they were modified or replaced,
-per rule 7 in CLAUDE.md.
+per rule 6 in CLAUDE.md.
 
 One folder per change:
 

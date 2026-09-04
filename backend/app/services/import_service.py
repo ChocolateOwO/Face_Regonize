@@ -28,8 +28,9 @@ from sqlmodel import Session, select
 
 from app.database.db import engine
 from app.face_recognition.engine import detect_faces
+from app.face_recognition.enrollment import EnrollmentFaceError, select_primary_enrollment_face
 from app.face_recognition.index import recognition_index
-from app.models.models import ImportJob, ImportRow, Person
+from app.models.models import ConsentRecord, ImportJob, ImportRow, Person
 from app.services import storage_service
 from app.services.google_drive_service import GoogleDriveError, download_public_file, is_google_drive_url
 from app.services.index_sync import IndexResyncFailed, apply_index_change
@@ -45,6 +46,111 @@ PHOTO_HEADER_KEYWORDS = [
     "photo url", "image url", "picture url", "img", "avatar", "pic",
     "รูป", "รูปภาพ", "รูปผู้เข้าร่วม", "รูปถ่าย", "รูปประจำตัว",
 ]
+
+CONSENT_HEADER_KEYWORDS = [
+    "consent", "pdpa", "agree", "agreement", "permission", "authorise", "authorize",
+    "ยินยอม", "ความยินยอม", "อนุญาต", "ข้อมูลส่วนบุคคล",
+]
+
+# Consent answers are matched as WHOLE normalised values, never as substrings.
+#
+# Substring matching is unsafe in both languages. In Thai the refusal is the
+# acceptance with a negation glued on the front - "ไม่ให้ความยินยอม" literally
+# CONTAINS "ให้ความยินยอม". In English "unknown" contains "no", so a substring
+# test turned "unknown" into a recorded refusal - an uncertain answer becoming
+# legal evidence of one. Exact lookup removes both failure modes at once, and
+# anything not in these tables is reported as unrecognised rather than guessed.
+#
+# _normalize() collapses case, punctuation and spacing, so "Do not consent",
+# "do-not-consent" and "DO NOT CONSENT" all arrive here as one key.
+_CONSENT_YES = {
+    "ยินยอม", "ให้ความยินยอม", "ยินยอมให้ใช้ข้อมูล", "ยินยอมให้ใช้ข้อมูลส่วนบุคคล",
+    "อนุญาต", "ยอมรับ", "ตกลง",
+    "consent", "consented", "i consent", "give consent", "agree", "agreed",
+    "i agree", "accept", "accepted", "allow", "allowed", "permitted",
+    "yes", "y", "true", "1",
+}
+_CONSENT_NO = {
+    "ไม่ยินยอม", "ไม่ให้ความยินยอม", "ไม่อนุญาต", "ไม่ประสงค์", "ไม่ตกลง", "ปฏิเสธ",
+    "do not consent", "does not consent", "not consent", "not consented",
+    "no consent", "decline", "declined", "disagree", "disagreed", "reject",
+    "rejected", "deny", "denied", "not allowed", "disallow", "refuse", "refused",
+    "no", "n", "false", "0",
+}
+
+# Returned by parse_consent_value() when the cell HAD content but none of the
+# tables recognised it. Distinct from None (blank) so the preview can warn the
+# admin instead of quietly treating "maybe" like an unanswered question.
+CONSENT_UNKNOWN = "unknown"
+
+# Written onto the ImportRow so the sync result can say what happened to each
+# person's PDPA answer. Exported as constants because get_import() counts them.
+CONSENT_NOTE_RECORDED = "PDPA imported from the form"
+CONSENT_NOTE_UPDATED = "PDPA updated from the form"
+CONSENT_NOTE_UNKNOWN = "PDPA answer not understood - consent left unchanged"
+CONSENT_NOTE_ADMIN_OVERRIDE = "PDPA protected by admin override - form answer not applied"
+# Deliberately excludes the admin-override note: nothing changed, so it must
+# not inflate the "PDPA Updated" count.
+CONSENT_CHANGED_NOTES = (CONSENT_NOTE_RECORDED, CONSENT_NOTE_UPDATED)
+
+
+def _consent_note(outcome: str, consent: str | None) -> str | None:
+    """Result text for one row, or None when there is nothing worth saying."""
+    if outcome == "recorded":
+        return CONSENT_NOTE_RECORDED
+    if outcome == "updated":
+        return CONSENT_NOTE_UPDATED
+    if outcome == "admin_override":
+        return CONSENT_NOTE_ADMIN_OVERRIDE
+    if consent == CONSENT_UNKNOWN:
+        return CONSENT_NOTE_UNKNOWN
+    return None
+
+
+def detect_consent_column(df: pd.DataFrame) -> str | None:
+    """Find the registration form column holding the PDPA answer.
+
+    Header match only. Unlike name and photo there is deliberately no content
+    scoring: a yes/no column looks exactly like any other yes/no column, and
+    guessing wrong would attach a consent record to the answer to a completely
+    different question. If no header matches, consent is simply not imported.
+    """
+    for column in df.columns:
+        norm = _normalize(column)
+        if any(_normalize(kw) in norm for kw in CONSENT_HEADER_KEYWORDS):
+            return str(column)
+    return None
+
+
+def parse_consent_value(value) -> str | None:
+    """Map one consent cell to "consented" / "declined" / CONSENT_UNKNOWN / None.
+
+    Three outcomes that must not be confused with each other:
+
+      None             the cell was blank. Silence is not an answer, so no
+                       consent record is created and the person stays pending.
+      CONSENT_UNKNOWN  the cell had text nobody can interpret ("maybe", "-",
+                       "ไม่แน่ใจ"). Also creates no record, but the preview says
+                       so, because this is a form that needs fixing rather than
+                       a person who did not reply.
+      consented        an explicit yes.
+      declined         an explicit no.
+
+    Matching is exact on the normalised value, never a substring - see the
+    tables above for why.
+    """
+    raw = _cell_str(value).strip()
+    if not raw:
+        return None
+    key = _normalize(raw)
+    if not key:
+        return CONSENT_UNKNOWN      # punctuation only, e.g. "-" or "N/A"
+    if key in _CONSENT_NO:          # refusal checked first, as a safety habit
+        return "declined"
+    if key in _CONSENT_YES:
+        return "consented"
+    return CONSENT_UNKNOWN
+
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _IMAGE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|gif|bmp|webp)(\?.*)?$", re.IGNORECASE)
@@ -243,15 +349,135 @@ def existing_normalized_names(session: Session) -> set[str]:
     return names
 
 
+def existing_people_by_name(session: Session) -> dict:
+    """Normalized full name -> the participant already registered under it.
+
+    The file importer only needs to know *whether* a name exists, so it uses
+    existing_normalized_names(). Sheet sync additionally needs to know WHICH
+    participant a name belongs to, so a re-synced row updates that exact
+    person instead of creating a second record under a new id.
+    """
+    out: dict[str, dict] = {}
+    for p in session.exec(select(Person)).all():
+        full = f"{p.first_name} {p.last_name}".strip() if p.last_name else (p.first_name or "")
+        if full:
+            out[normalize_name(full)] = {
+                "participant_id": p.participant_id,
+                "original_image_url": p.original_image_url or "",
+            }
+    return out
+
+
+def build_sheet_sync_preview(
+    df: pd.DataFrame,
+    name_column: str,
+    photo_column: str | None,
+    start_id: int,
+    existing_people: dict,
+    consent_column: str | None = None,
+) -> list[dict]:
+    """Preview for Google Sheet sync: add new people, update changed ones.
+
+    New rows follow exactly the same rules as build_preview - Name and Photo
+    only, ids assigned in sheet order, ids never consumed by a row that will
+    not be processed. The difference is that a row whose name already belongs
+    to a participant is matched to that participant instead of being skipped:
+
+      photo link changed  -> reuse their participant_id, status "ready", so
+                             run_import_job's "update" strategy refreshes the
+                             photo and re-runs face detection for that person
+      photo link the same -> status "duplicate", which run_import_job already
+                             skips before any download or face work happens
+
+    Removing a row from the sheet does nothing here, deliberately: the sheet
+    adds and corrects people, it never removes them, so an accidental deletion
+    in the sheet cannot destroy a participant or their attendance history.
+
+    build_preview itself is untouched - file upload behaviour is unchanged.
+    """
+    rows = []
+    seen_in_file: set[str] = set()
+    next_id = start_id
+
+    for i, row in df.iterrows():
+        row_number = int(i) + 2  # 1-indexed, +1 for the header row
+        raw_name = _cell_str(row[name_column]) if name_column in df.columns else ""
+        photo = _cell_str(row[photo_column]) if photo_column and photo_column in df.columns else ""
+        # The registration form is where PDPA consent was actually given, so it
+        # travels with the row and becomes a ConsentRecord once the person
+        # exists. None means the sheet said nothing usable (see
+        # parse_consent_value) and no record is invented in that case.
+        consent = parse_consent_value(row[consent_column]) if consent_column and consent_column in df.columns else None
+
+        if not raw_name:
+            rows.append({
+                "consent": consent,
+                "row_number": row_number, "participant_id": None, "name": "",
+                "image_url": photo, "status": "invalid", "message": "Missing name",
+            })
+            continue
+
+        normalized = normalize_name(raw_name)
+
+        if normalized in seen_in_file:
+            rows.append({
+                "consent": consent,
+                "row_number": row_number, "participant_id": None, "name": raw_name,
+                "image_url": photo, "status": "duplicate_in_file", "message": "DUPLICATE IN FILE - SKIP",
+            })
+            continue
+        seen_in_file.add(normalized)
+
+        existing = existing_people.get(normalized)
+        if existing:
+            if photo and photo != existing["original_image_url"]:
+                rows.append({
+                    "consent": consent,
+                    "row_number": row_number,
+                    "participant_id": existing["participant_id"],
+                    "name": raw_name,
+                    "image_url": photo,
+                    "status": "ready",
+                    "message": "UPDATE - photo changed in the sheet",
+                })
+            else:
+                rows.append({
+                    "consent": consent,
+                    "row_number": row_number,
+                    "participant_id": existing["participant_id"],
+                    "name": raw_name,
+                    "image_url": photo,
+                    "status": "duplicate",
+                    "message": "Already up to date",
+                })
+            continue
+
+        participant_id = f"{next_id:04d}"
+        next_id += 1
+        rows.append({
+            "consent": consent,
+            "row_number": row_number,
+            "participant_id": participant_id,
+            "name": raw_name,
+            "image_url": photo,
+            "status": "ready" if photo else "missing_photo",
+            "message": "" if photo else "Missing Photo",
+        })
+    return rows
+
+
 def build_preview(
     df: pd.DataFrame,
     name_column: str,
     photo_column: str | None,
     start_id: int,
     existing_names: set[str],
+    consent_column: str | None = None,
 ) -> list[dict]:
-    """Only Name and Photo are extracted — every other column in the sheet is
-    ignored. IDs are assigned strictly in file row order, never sorted,
+    """Only Name, Photo and (optionally) Consent are extracted — every other
+    column in the sheet is ignored. consent_column defaults to None, so
+    Name/Photo behaviour is byte-for-byte what it was when no consent column
+    is supplied. IDs are assigned strictly in file row order, never sorted,
     starting from start_id — but ONLY for rows that turn out to be new;
     duplicates (whether against an existing participant or an earlier row in
     this same file) and rows with no name never consume an ID number and are
@@ -268,6 +494,10 @@ def build_preview(
         row_number = int(i) + 2  # 1-indexed, +1 for the header row
         raw_name = _cell_str(row[name_column]) if name_column in df.columns else ""
         photo = _cell_str(row[photo_column]) if photo_column and photo_column in df.columns else ""
+        # None when there is no consent column at all - the ordinary case for a
+        # spreadsheet that never asked the question.
+        consent = (parse_consent_value(row[consent_column])
+                   if consent_column and consent_column in df.columns else None)
 
         if not raw_name:
             rows.append({
@@ -303,6 +533,7 @@ def build_preview(
             "image_url": photo,
             "status": "ready" if photo else "missing_photo",
             "message": "" if photo else "Missing Photo",
+            "consent": consent,
         })
     return rows
 
@@ -324,6 +555,84 @@ def _download_image_bytes(url: str) -> bytes:
     return resp.content
 
 
+def _record_registration_consent(session: Session, person_id: str, consent: str | None) -> str:
+    """Turn a registration form answer into a ConsentRecord. Returns what it did.
+
+    source="registration" is deliberately distinct from "kiosk": it says the
+    person answered on the sign-up form, NOT that they tapped anything at the
+    kiosk. A compliance record that blurred those two would misrepresent where
+    the consent actually came from.
+
+    Nothing is written unless the answer was explicit. A blank cell (None) and
+    an uninterpretable one (CONSENT_UNKNOWN) both mean "no evidence"; inventing
+    a record for either would fabricate exactly what this table exists to prove.
+
+    Precedence, highest first:
+
+      1. an admin decision that is currently the latest record - never
+         overwritten by a sync, whatever the form says
+      2. otherwise, whether the form answer differs from the last one imported
+
+    The comparison in step 2 is against this person's most recent record whose
+    source is "registration" - NOT against their current overall status. That
+    distinction is the whole design:
+
+      A spreadsheet carries no per-row timestamp, so re-reading the same sheet
+      tomorrow yields rows indistinguishable from today's. Comparing against
+      the last registration value is what separates "the form actually changed"
+      from "the same form is being read again". Comparing against the overall
+      latest instead would make a routine re-sync keep re-appending the form
+      answer on top of whatever the person did at the kiosk.
+
+      no registration record yet        -> write it
+      same as the last registration     -> write nothing. The form has not
+                                           changed, so a re-sync is a no-op and
+                                           any newer kiosk choice stands
+                                           untouched.
+      differs from the last registration -> the form answer genuinely changed
+                                           since the last sync. Record it now,
+                                           at sync time, so it becomes the
+                                           current status.
+
+    The last case can override a newer kiosk choice, and that is deliberate: an
+    admin pressing Sync after the form changed is an explicit act, and the new
+    form answer is newer information than the sync that came before it.
+    """
+    if consent not in ("consented", "declined"):
+        return "no_answer"
+
+    # An admin decision that is currently in force outranks the form entirely.
+    # Someone looked at this participant and set their status by hand; a later
+    # sheet sync is not evidence that they changed their mind, so registration
+    # never writes over it - not even when the form answer itself has changed.
+    # The override is only "in force" while it is the LATEST record: if the
+    # participant afterwards taps the kiosk themselves, that is their own newer
+    # decision and the ordinary registration rules resume.
+    latest_overall = session.exec(
+        select(ConsentRecord)
+        .where(ConsentRecord.person_id == person_id)
+        .order_by(ConsentRecord.recorded_at.desc())
+        .limit(1)
+    ).first()
+    if latest_overall is not None and latest_overall.source == "admin":
+        return "admin_override"
+
+    # Only registration rows - a kiosk or admin record is never the baseline.
+    latest_registration = session.exec(
+        select(ConsentRecord)
+        .where(ConsentRecord.person_id == person_id, ConsentRecord.source == "registration")
+        .order_by(ConsentRecord.recorded_at.desc())
+        .limit(1)
+    ).first()
+
+    if latest_registration is not None and latest_registration.choice == consent:
+        return "unchanged"
+
+    session.add(ConsentRecord(person_id=person_id, choice=consent, source="registration"))
+    session.commit()
+    return "recorded" if latest_registration is None else "updated"
+
+
 def run_import_job(import_id: str, duplicate_strategy: str) -> None:
     with Session(engine) as session:
         job = session.get(ImportJob, import_id)
@@ -342,6 +651,28 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                 # Already fully resolved at preview time — never downloads,
                 # detects, embeds, or touches the recognition index or the
                 # existing participant's data for these.
+                #
+                # Their PDPA answer is the one exception. A sheet sync marks an
+                # unchanged participant "duplicate", so skipping outright meant
+                # consent only ever reached people who were BRAND NEW: pressing
+                # "Sync now" for an existing participant who had since answered
+                # the form changed nothing, and the PDPA page kept showing
+                # PENDING. Applying it here writes no photo, no embedding and
+                # no index change — only the consent record, and only when the
+                # row identifies exactly one existing participant.
+                if row.status == "duplicate" and row.participant_id:
+                    person = session.exec(
+                        select(Person).where(Person.participant_id == row.participant_id)
+                    ).first()
+                    if person:
+                        outcome = _record_registration_consent(session, person.id, row.consent)
+                        # Say so in the results, otherwise a sync that DID change
+                        # someone's consent looks identical to one that skipped
+                        # them entirely.
+                        note = _consent_note(outcome, row.consent)
+                        if note:
+                            row.error_message = note
+                            session.add(row)
                 job.skipped_count += 1
                 session.add(job)
                 session.commit()
@@ -369,20 +700,26 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                 if img is None:
                     raise RuntimeError("PHOTO NOT ACCESSIBLE — the file is not a readable image")
 
-                faces = detect_faces(img)
-                if not faces:
-                    raise RuntimeError("PHOTO NOT ACCESSIBLE — no face detected in the photo")
-                if len(faces) > 1:
-                    raise RuntimeError(f"PHOTO NOT ACCESSIBLE — {len(faces)} faces detected, expected exactly one")
-                face = faces[0]
+                # Same enrollment rule as Add Person and photo replacement, so
+                # a photo accepted in one place is accepted in all of them.
+                try:
+                    face = select_primary_enrollment_face(detect_faces(img))
+                except EnrollmentFaceError as e:
+                    raise RuntimeError(f"PHOTO NOT ACCESSIBLE — {e.message}") from e
 
                 existing = session.exec(
                     select(Person).where(Person.participant_id == row.participant_id)
                 ).first()
 
                 if existing and duplicate_strategy == "skip":
+                    # The participant is skipped, but their PDPA answer is not:
+                    # this branch also used to drop consent on the floor, so an
+                    # existing person whose form answer changed kept their old
+                    # status whenever the admin chose "Skip".
+                    outcome = _record_registration_consent(session, existing.id, row.consent)
+                    note = _consent_note(outcome, row.consent)
                     row.status = "skipped"
-                    row.error_message = "Participant ID already exists (skipped)"
+                    row.error_message = note or "Participant ID already exists (skipped)"
                     job.skipped_count += 1
                     session.add(row)
                     session.add(job)
@@ -393,7 +730,10 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                 session.add(job)
                 session.commit()
 
-                image_path = storage_service.save_person_image(row.participant_id, image_bytes)
+                # HEIC downloads are re-encoded so the profile photo displays in a
+                # browser; the embedding above used the original bytes.
+                display_bytes, ext = storage_service.to_displayable_bytes(image_bytes)
+                image_path = storage_service.save_person_image(row.participant_id, display_bytes, ext)
 
                 if existing:
                     existing.first_name = row.first_name
@@ -433,6 +773,8 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                 # ALSO fails does the row become an error - reported here
                 # rather than by the generic handler below, so the already
                 # counted success is taken back instead of being counted twice.
+                _record_registration_consent(session, (existing or person).id, row.consent)
+
                 try:
                     apply_index_change(
                         session,
