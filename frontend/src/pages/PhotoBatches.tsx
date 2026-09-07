@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { apiDelete, apiGet, apiPostJson, ApiError } from "../api/client";
 import { Badge, Button, Card, EmptyState, Input, PageHeader, Spinner } from "../components/ui";
+import PhotoBatchDownload from "../components/PhotoBatchDownload";
 
 interface Batch {
   id: string;
   label: string;
   status: "pending" | "processing" | "syncing_drive" | "completed" | "failed";
+  download_ready?: boolean;
   current_stage: string;
   total_photos: number;
   processed_photos: number;
@@ -57,6 +59,13 @@ export default function PhotoBatches() {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
+
+  // Reflect the local/Drive boundary without requiring a page reload.
+  useEffect(() => {
+    if (!batches?.some((b) => ["pending", "processing", "syncing_drive"].includes(b.status))) return;
+    const timer = window.setInterval(load, 2000);
+    return () => window.clearInterval(timer);
+  }, [batches]);
 
   async function connectDrive() {
     setConnectError("");
@@ -148,7 +157,10 @@ export default function PhotoBatches() {
                     {b.recognized_photos} / {b.ambience_photos} / {b.review_photos}
                   </td>
                   <td className="px-4 py-3 text-gray-500">{new Date(b.created_at).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right"><Button variant="danger" disabled={deleting === b.id} onClick={() => deleteBatch(b.id)}>{deleting === b.id ? "Stopping..." : "Delete"}</Button></td>
+                  <td className="px-4 py-3 text-right"><div className="flex justify-end items-start gap-2">
+                    <PhotoBatchDownload id={b.id} ready={b.download_ready} status={b.status} stopping={deleting === b.id} />
+                    <Button variant="danger" disabled={deleting === b.id} onClick={() => deleteBatch(b.id)}>{deleting === b.id ? "Stopping..." : "Delete"}</Button>
+                  </div></td>
                 </tr>
               ))}
             </tbody>

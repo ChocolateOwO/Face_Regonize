@@ -403,6 +403,17 @@ Do not change existing semantics without explicit instruction.
 
 ## 20. Google Drive
 
+Main source now includes authenticated local Event Photo ZIP download at
+`GET /api/photo-batches/{batch_id}/download` (2026-09-07; automated-tested,
+pending safe backend reload and user Main verification). Eligibility follows
+local completion, not Drive completion: syncing_drive and completed output can
+be exported, including Drive failures with complete local records/files.
+Export validates batch ownership and includes SORTED, optional REVIEW and MEDIA
+without reprocessing them. It reads concurrently with Drive Phase 2 and does not
+change status/cancellation or Drive behavior. Temporary ZIPs are outside batch
+storage and cleaned after delivery/failure. Historical Gallery and future manual
+Drive upload are not part of this feature. See CURRENT_TASK.md for activation.
+
 Reconize integrates with Google Drive for event-photo workflows.
 
 Drive links may be shown in the application.

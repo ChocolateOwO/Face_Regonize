@@ -9,7 +9,7 @@ from sqlmodel import Session, select
 
 from app.auth.deps import get_current_user
 from app.auth.security import verify_password
-from app.config import FRONTEND_URL
+from app.config import FRONTEND_URL, STORAGE_PATH
 from app.database.db import get_session
 from app.models.models import CleanupLog, Person, PhotoBatch, PhotoBatchFace, PhotoBatchParticipantFolder, PhotoBatchPhoto, User
 from app.services.google_drive_folder_service import DriveFolderError, extract_folder_id, folder_link, service_account_email
@@ -22,7 +22,10 @@ from app.services.google_drive_oauth_service import (
     is_connected,
     verify_and_clear_pending_state,
 )
-from app.services.photo_processing_service import cancel_and_delete_batch, change_retention, create_batch, run_photo_batch
+from app.services.photo_processing_service import _cancelled, cancel_and_delete_batch, change_retention, create_batch, run_photo_batch
+from app.services.photo_batch_download_service import (
+    TemporaryZipResponse, build_output_zip, local_output_ready, output_manifest,
+)
 
 router = APIRouter(prefix="/api/photo-batches", tags=["photo-batches"])
 
@@ -49,6 +52,7 @@ def _batch_out(b: PhotoBatch) -> dict:
         "id": b.id,
         "label": b.label,
         "status": b.status,
+        "download_ready": not _cancelled(b.id) and local_output_ready(b, STORAGE_PATH),
         "current_stage": b.current_stage,
         "total_photos": b.total_photos,
         "processed_photos": b.processed_photos,
@@ -175,6 +179,25 @@ def delete_photo_batch(batch_id: str, session: Session = Depends(get_session), u
         raise HTTPException(404, "Photo batch not found")
     if not cancel_and_delete_batch(batch_id):
         raise HTTPException(409, "Batch is still stopping; try Delete again shortly.")
+
+
+@router.get("/{batch_id}/download")
+def download_photo_batch(batch_id: str, session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    batch = session.get(PhotoBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Photo batch not found")
+    if _cancelled(batch_id):
+        raise HTTPException(409, "Batch is stopping or deleting.")
+    try:
+        photos = session.exec(select(PhotoBatchPhoto).where(PhotoBatchPhoto.batch_id == batch_id)).all()
+        root, files = output_manifest(batch, photos, STORAGE_PATH)
+        # End the read transaction before potentially large ZIP work. No DB
+        # writes, cancellation lock or Drive calls while preparing/sending it.
+        session.close()
+        archive = build_output_zip(root, files)
+    except (OSError, ValueError) as e:
+        raise HTTPException(409, "Local output is not ready or changed during download. Refresh and retry.") from e
+    return TemporaryZipResponse(archive, media_type="application/zip", filename=f"event-photos-{batch_id}.zip")
 
 
 @router.get("/{batch_id}/participants")

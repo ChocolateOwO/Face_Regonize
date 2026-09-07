@@ -1,5 +1,56 @@
 # Reconize Current Task
 
+## Event Photo Download During Drive — 2026-09-07
+
+Current task supersedes older active-task labels. User explicitly authorized
+direct Main implementation of Download after local Phase 1, including existing
+syncing_drive batches. Prior logo/explicit-deny/delete work was manually approved
+and published as e4dbf60a68c3fb8b6cfd7705d1ef4f70cff2d559.
+
+Implementation: authenticated GET /api/photo-batches/{batch_id}/download;
+local completion status/counters plus batch-owned photo/file manifest checks;
+SORTED, optional REVIEW, MEDIA only. No ORIGINAL/AMBIENCE/LOGO, arbitrary files,
+secrets or other batches. Temporary ZIP uses bounded server memory, lives outside
+batch storage and is removed after send/failure/disconnect. Supported Chromium
+localhost/HTTPS browsers stream the response to the chosen disk file; other
+browsers use the existing Blob-download pattern (large ZIPs need more resources).
+Batch list/detail expose Download; processing/stopping/deleting stay disabled.
+
+Drive Phase 2 was audited: final local image bytes are read, not rewritten or
+deleted. Download holds no processing lock and closes its DB read transaction
+before packaging. Processing/Drive functions, blur/logo, cancellation, schema,
+GPU and all unrelated features are unchanged. Historical Gallery stays PAUSED;
+future manual Drive upload remains out of scope.
+
+Backup: patch/2026-09-07_1436_event-photo-download-during-drive/.
+Five existing source/docs originals verified SHA-256 equal before edits.
+Changed: backend/app/api/photo_batches.py, frontend/src/pages/PhotoBatches.tsx,
+frontend/src/pages/PhotoBatchDetail.tsx, CURRENT_TASK.md, PROJECT_CONTEXT.md.
+Added: backend/app/services/photo_batch_download_service.py,
+backend/tests/test_photo_batch_download.py,
+frontend/src/components/PhotoBatchDownload.tsx,
+frontend/tests/photo-batch-download.test.mjs. Patch NOTES.md records the backup.
+
+Isolated verification: 13 backend tests (10 download plus 3 existing MEDIA policy
+checks), 5 frontend behavior tests, production build/TypeScript and lint (same
+three unrelated warnings). Real Phase 2 functions ran against temporary SQLite
+and fake Drive: ZIP completed while upload was blocked; upload then continued to
+the next image and completed. No production test records or output writes.
+
+Read-only Main eligibility audit: batch 36a03b2808dd4700bd929ba7c90d6e39 was
+syncing_drive, 79/79 processed, no local failures. Full manifest validated:
+207 SORTED, 48 REVIEW, 79 MEDIA files (1,423,478,361 bytes). No reprocessing needed.
+
+Status: IMPLEMENTED / TESTED; WAITING FOR SAFE BACKEND RESTART, THEN MAIN
+VERIFICATION. Current backend was deliberately NOT restarted: its active Drive
+upload must not be interrupted. Health 200; running OpenAPI still lacks Download.
+On-disk implementation is not yet a live endpoint. Do not claim otherwise.
+After upload finishes, safely reload Main backend, refresh /photo-batches, and
+verify Download ZIP, folder contents, current blur/logo and unchanged Drive
+behavior. Concurrent syncing behavior is automated-tested; user verification
+remains required after activation. Do not restart an active upload to test it.
+No commit/push/version/tag/release for this task.
+
 ## Event Photo explicit-deny MEDIA blur — 2026-09-07
 
 Current task: user-authorized direct Main policy change. Status: WAITING FOR

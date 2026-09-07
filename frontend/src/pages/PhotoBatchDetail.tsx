@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { apiGet, apiPutJson, fileUrl, ApiError } from "../api/client";
 import { Badge, Button, Card, EmptyState, PageHeader, Spinner } from "../components/ui";
+import PhotoBatchDownload from "../components/PhotoBatchDownload";
 
 interface Batch {
   id: string;
@@ -10,6 +11,7 @@ interface Batch {
   // already complete and previewable; only the Google Drive mirror is still
   // running. It is NOT a kind of "processing".
   status: "pending" | "processing" | "syncing_drive" | "completed" | "failed";
+  download_ready?: boolean;
   current_stage: string;
   total_photos: number;
   processed_photos: number;
@@ -135,9 +137,12 @@ export default function PhotoBatchDetail() {
         title={batch.label}
         subtitle={`Batch status: ${statusLabel}`}
         action={
+          <div className="flex items-start gap-2">
+          <PhotoBatchDownload id={batch.id} ready={batch.download_ready} status={batch.status} />
           <Link to="/photo-batches">
             <Button variant="secondary">Back to Event Photos</Button>
           </Link>
+          </div>
         }
       />
 
