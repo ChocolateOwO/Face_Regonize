@@ -1,5 +1,38 @@
 # Reconize Current Task
 
+## Event Photo explicit-deny MEDIA blur — 2026-09-07
+
+Current task: user-authorized direct Main policy change. Status: WAITING FOR
+MAIN VERIFICATION. This section supersedes older active-task labels below.
+
+New MEDIA rule: use the existing reliable match and consent snapshot; blur a
+face only when person_id exists and consent_status_at_processing is declined.
+Consented, pending, missing-consent and unknown/unmatched faces remain visible.
+Decisions remain per face. Existing outputs are not reprocessed by this change.
+
+Only the MEDIA predicate and its comments changed in photo_processing_service.py.
+Existing matching, consent storage, ORIGINAL/SORTED/REVIEW, logo ordering,
+cancellation/delete and Drive phase logic are preserved. Historical Gallery
+remains PAUSED / DUMMY EXPERIMENT ONLY. Manual Drive upload is out of scope.
+
+Backup: patch/2026-09-07_1400_event-photo-explicit-deny-blur/; current logo/delete
+baseline and this document were SHA-256 verified before edits.
+Verification: modified-file py_compile, backend compileall, three isolated tests
+(nine decision cases, mixed-face pixels, logo-after-blur and empty face list)
+passed. AST comparison confirms the predicate is the only executable production
+change. Cancellation behavior was preserved by comparison, not revalidated as
+a complete delete integration test. No production DB/storage was used in tests.
+No frontend changes or tests. Main backend must load the changed module before
+manual verification; it has not been restarted as part of this task.
+
+Files: backend/app/services/photo_processing_service.py,
+backend/tests/test_event_photo_explicit_deny.py, CURRENT_TASK.md, patch NOTES.md.
+User verification on a newly processed batch is still required.
+
+## Event Photo MEDIA Logo Overlay — 2026-09-07
+
+Active task: Main implementation and verification. Historical Face Gallery is PAUSED / DUMMY EXPERIMENT ONLY. Event Photo now stores an optional per-batch PNG and JSON configuration under that batch's local storage; logo compositing is MEDIA-only after existing PDPA blur. No schema, recognition, PDPA, or Drive Phase 1/Phase 2 change. Status: WAITING FOR MAIN VERIFICATION after automated checks.
+
 ## Reproducible Windows Installation — 2026-09-07
 
 Active task: make current Main reproducibly installable on a new Windows PC.

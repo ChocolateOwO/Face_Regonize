@@ -9,8 +9,8 @@ embedding, matching, or the threshold is reimplemented here:
 
 Flow per photo: download -> decode -> detect_faces() -> recognition_index
 .match_batch() -> classify (ambience / sorted+review / review) -> look up
-each matched participant's CURRENT consent status -> blur non-consented/
-unrecognized faces.
+each matched participant's CURRENT consent status -> blur only matched faces
+with explicit declined consent. Unknown and pending faces remain visible.
 
 There are then TWO INDEPENDENT OUTPUTS, in this order:
 
@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import json
 import shutil
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -77,6 +79,37 @@ from app.services.google_drive_oauth_service import (
 logger = logging.getLogger(__name__)
 
 _INVALID_FS_CHARS = '<>:"/\\|?*'
+_LOGO_POSITIONS = {"top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"}
+_batch_lock = threading.Condition()
+_active_batches: set[str] = set()
+_cancelled_batches: set[str] = set()
+
+
+def _cancelled(batch_id: str) -> bool:
+    with _batch_lock:
+        return batch_id in _cancelled_batches
+
+
+def cancel_and_delete_batch(batch_id: str, timeout_seconds: float = 30) -> bool:
+    """Cancel at the next safe boundary, then remove only owned local state."""
+    with _batch_lock:
+        _cancelled_batches.add(batch_id)
+        _batch_lock.wait_for(lambda: batch_id not in _active_batches, timeout=timeout_seconds)
+        if batch_id in _active_batches:
+            return False
+    with Session(engine) as session:
+        batch = session.get(PhotoBatch, batch_id)
+        if not batch:
+            return True
+        batch_dir = STORAGE_PATH / batch.storage_dir
+        if batch_dir.exists():
+            shutil.rmtree(batch_dir)
+        for photo in session.exec(select(PhotoBatchPhoto).where(PhotoBatchPhoto.batch_id == batch_id)).all():
+            for face in session.exec(select(PhotoBatchFace).where(PhotoBatchFace.photo_id == photo.id)).all(): session.delete(face)
+            session.delete(photo)
+        for folder in session.exec(select(PhotoBatchParticipantFolder).where(PhotoBatchParticipantFolder.batch_id == batch_id)).all(): session.delete(folder)
+        session.delete(batch); session.commit()
+    return True
 
 
 def _safe_folder_name(participant_id: str, first_name: str, last_name: str) -> str:
@@ -95,7 +128,7 @@ def _consent_status(session: Session, person_id: str) -> str:
     return record.choice if record else "pending"
 
 
-def create_batch(session: Session, folder_url_or_id: str, retention_days: int, user_id: str) -> PhotoBatch:
+def create_batch(session: Session, folder_url_or_id: str, retention_days: int, user_id: str, logo_png: bytes | None = None, logo_position: str = "bottom-right", logo_size: float = 0.15) -> PhotoBatch:
     if not (1 <= retention_days <= 7):
         raise ValueError("retention_days must be between 1 and 7")
     folder_id = extract_folder_id(folder_url_or_id)
@@ -121,6 +154,11 @@ def create_batch(session: Session, folder_url_or_id: str, retention_days: int, u
     batch_dir = PHOTO_BATCHES_DIR / batch.id
     for sub in ("ORIGINAL", "SORTED", "AMBIENCE", "REVIEW", "MEDIA"):
         (batch_dir / sub).mkdir(parents=True, exist_ok=True)
+    if logo_png:
+        logo_dir = batch_dir / "LOGO"
+        logo_dir.mkdir(exist_ok=True)
+        _write_bytes(logo_dir / "logo.png", logo_png)
+        (logo_dir / "config.json").write_text(json.dumps({"position": logo_position, "size": logo_size}), encoding="utf-8")
 
     return batch
 
@@ -163,6 +201,37 @@ def _blur_region(img: np.ndarray, bbox: tuple[float, float, float, float]) -> No
     blurred = cv2.GaussianBlur(region, (k, k), 0)
     blurred = cv2.GaussianBlur(blurred, (k, k), 0)  # two passes — stronger, harder to reverse
     img[ey1:ey2, ex1:ex2] = blurred
+
+
+def _load_logo_config(batch_dir: Path) -> tuple[np.ndarray, str, float] | None:
+    try:
+        config = json.loads((batch_dir / "LOGO" / "config.json").read_text(encoding="utf-8"))
+        position, size = config["position"], float(config["size"])
+        logo = cv2.imdecode(np.frombuffer((batch_dir / "LOGO" / "logo.png").read_bytes(), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if position not in _LOGO_POSITIONS or not 0.02 <= size <= 0.5 or logo is None or logo.ndim != 3 or logo.shape[2] not in (3, 4):
+            return None
+        return logo, position, size
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def _apply_logo(media: np.ndarray, logo_config: tuple[np.ndarray, str, float] | None) -> None:
+    if not logo_config:
+        return
+    logo, position, relative_size = logo_config
+    height, width = media.shape[:2]
+    target_width = max(1, int(width * relative_size))
+    target_height = max(1, int(logo.shape[0] * target_width / logo.shape[1]))
+    if target_width > width or target_height > height:
+        return
+    logo = cv2.resize(logo, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    pad = max(4, int(min(width, height) * 0.02))
+    x = pad if position.endswith("left") else width - target_width - pad if position.endswith("right") else (width - target_width) // 2
+    y = pad if position.startswith("top") else height - target_height - pad
+    overlay = logo[:, :, :3].astype(np.float32)
+    alpha = (logo[:, :, 3:4].astype(np.float32) / 255.0) if logo.shape[2] == 4 else np.ones((target_height, target_width, 1), dtype=np.float32)
+    region = media[y:y + target_height, x:x + target_width].astype(np.float32)
+    media[y:y + target_height, x:x + target_width] = (overlay * alpha + region * (1 - alpha)).astype(np.uint8)
 
 
 def _drive_upload_photo(
@@ -215,6 +284,15 @@ def _drive_upload_photo(
 
 
 def run_photo_batch(batch_id: str) -> None:
+    with _batch_lock: _active_batches.add(batch_id)
+    try:
+        _run_photo_batch(batch_id)
+    finally:
+        with _batch_lock:
+            _active_batches.discard(batch_id); _batch_lock.notify_all()
+
+
+def _run_photo_batch(batch_id: str) -> None:
     # An application update is mid-flight; its database backup has already
     # been taken, so anything written now could be silently discarded by a
     # rollback. The batch stays pending and can be started again afterwards.
@@ -225,6 +303,7 @@ def run_photo_batch(batch_id: str) -> None:
         return
 
     with Session(engine) as session:
+        if _cancelled(batch_id): return
         batch = session.get(PhotoBatch, batch_id)
         if not batch:
             return
@@ -236,6 +315,7 @@ def run_photo_batch(batch_id: str) -> None:
         batch_dir = PHOTO_BATCHES_DIR / batch.id
         for sub in ("ORIGINAL", "SORTED", "AMBIENCE", "REVIEW", "MEDIA"):
             (batch_dir / sub).mkdir(parents=True, exist_ok=True)
+        logo_config = _load_logo_config(batch_dir)
 
         # Whether Drive output is possible at all. is_connected() only reads a
         # stored refresh token out of the local database, so this costs no
@@ -270,6 +350,7 @@ def run_photo_batch(batch_id: str) -> None:
         # upload used to sit between one photo's recognition and the next, so
         # network latency delayed face detection that needed nothing from it.
         for index, f in enumerate(files, start=1):
+            if _cancelled(batch_id): return
             batch.current_stage = f"Processing photos — {index} of {len(files)}: {f.name}"
             session.add(batch)
             session.commit()
@@ -300,7 +381,9 @@ def run_photo_batch(batch_id: str) -> None:
                     ambience_rel = f"{batch.storage_dir}/AMBIENCE/{f.name}"
                     media_rel = f"{batch.storage_dir}/MEDIA/{f.name}"
                     _write_bytes(STORAGE_PATH / ambience_rel, file_bytes)
-                    _write_bytes(STORAGE_PATH / media_rel, file_bytes)
+                    media_img = img.copy()
+                    _apply_logo(media_img, logo_config)
+                    _write_bytes(STORAGE_PATH / media_rel, _encode(media_img, f.name) if logo_config else file_bytes)
                     photo.media_path = media_rel
                     batch.ambience_photos += 1
                     session.add(photo)
@@ -381,18 +464,20 @@ def run_photo_batch(batch_id: str) -> None:
                     session.add(pf)
                 session.commit()
 
-                # STAGE 1c — MEDIA: blur every face that is not explicitly
-                # consented (declined, pending, or unrecognized). Consented
-                # faces stay visible; the photo is never blurred as a whole.
+                # STAGE 1c — MEDIA: blur only a matched participant's explicit
+                # denial. Consented, pending and unmatched faces stay visible.
+                # Apply the decision independently to each face.
                 media_img = img.copy()
                 blurred_count = 0
                 for row in face_rows:
-                    if row.consent_status_at_processing != "consented":
+                    if row.person_id and row.consent_status_at_processing == "declined":
                         bbox = tuple(float(v) for v in row.bbox.split(","))
                         _blur_region(media_img, bbox)
                         row.blurred = True
                         blurred_count += 1
                         session.add(row)
+
+                _apply_logo(media_img, logo_config)
 
                 media_bytes = _encode(media_img, f.name)
                 media_rel = f"{batch.storage_dir}/MEDIA/{f.name}"
@@ -438,7 +523,7 @@ def run_photo_batch(batch_id: str) -> None:
     # Deliberately outside the session above: this opens its own session, and a
     # failure inside it must not be able to roll back any phase 1 work.
     try:
-        if drive_enabled:
+        if drive_enabled and not _cancelled(batch_id):
             _sync_batch_to_drive(batch_id)
     except Exception:  # noqa: BLE001 — never strand the batch mid-sync
         logger.exception("Photo batch %s: Drive sync raised unexpectedly", batch_id)
@@ -456,6 +541,7 @@ def _finish_batch(batch_id: str) -> None:
     partly failed, using only fields that already exist.
     """
     with Session(engine) as session:
+        if _cancelled(batch_id): return
         batch = session.get(PhotoBatch, batch_id)
         if not batch:
             return
@@ -483,6 +569,7 @@ def _sync_batch_to_drive(batch_id: str) -> None:
     and still previews correctly — that is the whole point of the split.
     """
     with Session(engine) as session:
+        if _cancelled(batch_id): return
         batch = session.get(PhotoBatch, batch_id)
         if not batch:
             return
@@ -544,6 +631,7 @@ def _sync_batch_to_drive(batch_id: str) -> None:
         participant_folder_ids: dict[str, str] = {}  # person_id -> Drive folder id
 
         for index, photo in enumerate(photos, start=1):
+            if _cancelled(batch_id): return
             batch.current_stage = f"Syncing to Google Drive — {index} of {len(photos)}: {photo.filename}"
             session.add(batch)
             session.commit()

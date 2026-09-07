@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { apiGet, apiPostJson, ApiError } from "../api/client";
+import { apiDelete, apiGet, apiPostJson, ApiError } from "../api/client";
 import { Badge, Button, Card, EmptyState, Input, PageHeader, Spinner } from "../components/ui";
 
 interface Batch {
@@ -33,6 +33,7 @@ export default function PhotoBatches() {
   const [oauth, setOauth] = useState<{ connected: boolean; email: string | null } | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [connectError, setConnectError] = useState("");
+  const [deleting, setDeleting] = useState<string | null>(null);
 
   function load() {
     apiGet("/api/photo-batches").then(setBatches);
@@ -65,6 +66,13 @@ export default function PhotoBatches() {
     } catch (err) {
       setConnectError(err instanceof ApiError ? err.message : "Could not start Google Drive connection.");
     }
+  }
+  async function deleteBatch(id: string) {
+    if (!window.confirm("Delete this photo processing batch? If it is running, processing will stop first. Local batch outputs will be removed; Google Drive source photos are not deleted.")) return;
+    setDeleting(id);
+    try { await apiDelete(`/api/photo-batches/${id}`); load(); }
+    catch (err) { setConnectError(err instanceof ApiError ? err.message : "Could not delete batch."); }
+    finally { setDeleting(null); }
   }
 
   return (
@@ -119,6 +127,7 @@ export default function PhotoBatches() {
                 <th className="text-left px-4 py-3">Photos</th>
                 <th className="text-left px-4 py-3">Recognized / Ambience / Review</th>
                 <th className="text-left px-4 py-3">Created</th>
+                <th className="px-4 py-3" />
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
@@ -139,6 +148,7 @@ export default function PhotoBatches() {
                     {b.recognized_photos} / {b.ambience_photos} / {b.review_photos}
                   </td>
                   <td className="px-4 py-3 text-gray-500">{new Date(b.created_at).toLocaleString()}</td>
+                  <td className="px-4 py-3 text-right"><Button variant="danger" disabled={deleting === b.id} onClick={() => deleteBatch(b.id)}>{deleting === b.id ? "Stopping..." : "Delete"}</Button></td>
                 </tr>
               ))}
             </tbody>
@@ -164,13 +174,16 @@ function NewBatchModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const [retentionDays, setRetentionDays] = useState(7);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [logo, setLogo] = useState<string | null>(null);
+  const [logoSize, setLogoSize] = useState(15);
+  const [logoPosition, setLogoPosition] = useState("bottom-right");
 
   async function submit() {
     setError("");
     if (!url.trim()) return setError("Paste the Drive folder link or ID.");
     setLoading(true);
     try {
-      await apiPostJson("/api/photo-batches", { drive_folder_url: url.trim(), retention_days: retentionDays });
+      await apiPostJson("/api/photo-batches", { drive_folder_url: url.trim(), retention_days: retentionDays, logo_data_url: logo, logo_size: logoSize / 100, logo_position: logoPosition });
       onCreated();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not create the batch.");
@@ -187,6 +200,17 @@ function NewBatchModal({ onClose, onCreated }: { onClose: () => void; onCreated:
           <div>
             <label className="block text-sm text-gray-600 mb-1">Google Drive folder link or ID</label>
             <Input placeholder="https://drive.google.com/drive/folders/..." value={url} onChange={(e) => setUrl(e.target.value)} />
+          </div>
+          <div>
+            <label className="block text-sm text-gray-600 mb-1">MEDIA logo (optional PNG)</label>
+            <Input type="file" accept="image/png" onChange={(e) => { const file = e.target.files?.[0]; if (!file) return setLogo(null); const reader = new FileReader(); reader.onload = () => setLogo(typeof reader.result === "string" ? reader.result : null); reader.readAsDataURL(file); }} />
+            {logo && <>
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <label className="text-xs text-gray-600">Size: {logoSize}%<input className="w-full" type="range" min="2" max="50" value={logoSize} onChange={(e) => setLogoSize(Number(e.target.value))} /></label>
+                <label className="text-xs text-gray-600">Position<select className="w-full border rounded px-2 py-1" value={logoPosition} onChange={(e) => setLogoPosition(e.target.value)}>{["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"].map((position) => <option key={position}>{position}</option>)}</select></label>
+              </div>
+              <div className="relative mt-2 h-36 bg-gray-100 border rounded overflow-hidden" aria-label="Logo placement preview"><img src={logo} alt="Logo preview" className="absolute object-contain" style={{ width: `${logoSize}%`, left: logoPosition.endsWith("left") ? "2%" : logoPosition.endsWith("right") ? `${98 - logoSize}%` : `${(100 - logoSize) / 2}%`, top: logoPosition.startsWith("top") ? "2%" : `${98 - logoSize}%` }} /></div>
+            </>}
           </div>
           <div>
             <label className="block text-sm text-gray-600 mb-1">Data retention period</label>

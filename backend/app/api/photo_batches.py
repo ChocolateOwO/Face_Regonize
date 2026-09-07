@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -20,7 +22,7 @@ from app.services.google_drive_oauth_service import (
     is_connected,
     verify_and_clear_pending_state,
 )
-from app.services.photo_processing_service import change_retention, create_batch, run_photo_batch
+from app.services.photo_processing_service import cancel_and_delete_batch, change_retention, create_batch, run_photo_batch
 
 router = APIRouter(prefix="/api/photo-batches", tags=["photo-batches"])
 
@@ -28,6 +30,9 @@ router = APIRouter(prefix="/api/photo-batches", tags=["photo-batches"])
 class CreateBatchBody(BaseModel):
     drive_folder_url: str
     retention_days: int = 7
+    logo_data_url: str | None = None
+    logo_position: str = "bottom-right"
+    logo_size: float = 0.15
 
 
 class RetentionChangeBody(BaseModel):
@@ -130,7 +135,22 @@ def create_photo_batch(
     except DriveFolderError as e:
         raise HTTPException(400, str(e))
 
-    batch = create_batch(session, body.drive_folder_url, body.retention_days, user.id)
+    logo_png = None
+    if body.logo_data_url:
+        prefix = "data:image/png;base64,"
+        if not body.logo_data_url.startswith(prefix):
+            raise HTTPException(400, "Logo must be a PNG image.")
+        try:
+            logo_png = base64.b64decode(body.logo_data_url[len(prefix):], validate=True)
+        except ValueError as e:
+            raise HTTPException(400, "Logo PNG data is invalid.") from e
+        if not logo_png or len(logo_png) > 5 * 1024 * 1024:
+            raise HTTPException(400, "Logo PNG must be between 1 byte and 5 MB.")
+    if body.logo_position not in {"top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"}:
+        raise HTTPException(400, "Logo position is invalid.")
+    if not 0.02 <= body.logo_size <= 0.5:
+        raise HTTPException(400, "Logo size must be between 2% and 50%.")
+    batch = create_batch(session, body.drive_folder_url, body.retention_days, user.id, logo_png, body.logo_position, body.logo_size)
     background_tasks.add_task(run_photo_batch, batch.id)
     return _batch_out(batch)
 
@@ -147,6 +167,14 @@ def get_photo_batch(batch_id: str, session: Session = Depends(get_session), user
     if not b:
         raise HTTPException(404, "Photo batch not found")
     return _batch_out(b)
+
+
+@router.delete("/{batch_id}", status_code=204)
+def delete_photo_batch(batch_id: str, session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    if not session.get(PhotoBatch, batch_id):
+        raise HTTPException(404, "Photo batch not found")
+    if not cancel_and_delete_batch(batch_id):
+        raise HTTPException(409, "Batch is still stopping; try Delete again shortly.")
 
 
 @router.get("/{batch_id}/participants")
