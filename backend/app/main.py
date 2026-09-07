@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from app.api import activities, admin, attendees, auth, export, files, history, imports, pdpa, people, photo_batches, recognition, reports, settings_routes, system, update_routes, uploads
+from app.api import activities, admin, network as network_api, nodes as nodes_api, attendees, auth, export, files, history, imports, pdpa, people, photo_batches, recognition, reports, settings_routes, system, update_routes, uploads
 from app.auth.security import hash_password
 from app.config import (
     ADMIN_PASSWORD,
@@ -172,6 +172,8 @@ app.include_router(system.router)
 app.include_router(admin.router)
 app.include_router(pdpa.router)
 app.include_router(activities.router)
+app.include_router(network_api.router)
+app.include_router(nodes_api.router)
 app.include_router(photo_batches.router)
 app.include_router(photo_batches.cleanup_router)
 app.include_router(update_routes.router)

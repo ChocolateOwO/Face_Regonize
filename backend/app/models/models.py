@@ -302,3 +302,52 @@ class CleanupLog(SQLModel, table=True):
     records_deleted: int = 0
     status: str = Field(default="success")  # success | partial | failed
     note: Optional[str] = None
+
+
+class CameraNode(SQLModel, table=True):
+    """A distributed browser-camera station's durable identity/config.
+
+    This is NOT the same thing as CameraConfig: that table is one physical USB
+    camera ffmpeg opens directly on THIS machine. A CameraNode is a browser
+    tab, on any device, that owns its OWN camera via getUserMedia and sends
+    recognition frames to a Local Agent (Windows) or here (mobile) - this
+    machine never opens that camera at all.
+
+    Presence (online/offline, last_seen, recording-right-now) is deliberately
+    NOT stored here - that changes every few seconds and belongs in memory
+    (services/node_registry.py), the same reasoning that keeps the ffmpeg
+    preview stills out of the database. This table only holds what should
+    survive a page refresh: what the station is called and configured to do.
+    """
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    node_id: str = Field(unique=True, index=True)  # operator-chosen, e.g. "CAM-02", "MOBILE-01"
+    display_name: str = Field(default="")
+    activity_id: Optional[str] = Field(default=None, index=True)
+    camera_label: str = Field(default="")
+    mode: str = Field(default="always")           # tap | always — same meaning as the kiosk's KioskMode
+    inference_mode: str = Field(default="local")  # local (Windows Local Agent) | central (mobile)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+
+class NodeRecording(SQLModel, table=True):
+    """One distributed node's browser-recorded clip, from START to STOP.
+
+    Mirrors RecordingSession's shape on purpose (same reporting story: which
+    camera, which activity, when), but is a separate table rather than reusing
+    RecordingSession - that table's camera_id is a real foreign key into
+    CameraConfig (the ffmpeg-attached-camera registry), which a browser node
+    was never entered into and must not be forced to pretend to be."""
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    node_id: str = Field(index=True)
+    node_name: str = Field(default="")
+    activity_id: Optional[str] = Field(default=None, index=True)
+    activity_name: str = Field(default="")
+    file_path: str = Field(default="")   # relative, under storage/node_recordings/{node_id}/
+    started_at: datetime = Field(default_factory=datetime.now)
+    ended_at: Optional[datetime] = None
+    status: str = Field(default="recording")  # recording | completed | failed
+    error: Optional[str] = None
+    size_bytes: int = 0

@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
-import { apiGet, fileUrl } from "../api/client";
+import { useRef } from "react";
+import { fileUrl } from "../api/client";
 import { Badge, Card, EmptyState, PageHeader, Spinner, StatCard } from "../components/ui";
+import { useLiveEvents } from "../hooks/useLiveEvents";
+import { useCachedGet } from "../hooks/useCachedGet";
 
 interface DashboardData {
   registered_total: number;
@@ -22,11 +24,20 @@ interface DashboardData {
 }
 
 export default function Dashboard() {
-  const [data, setData] = useState<DashboardData | null>(null);
+  const { data, refresh: load } = useCachedGet<DashboardData>("/api/reports/dashboard");
 
-  useEffect(() => {
-    apiGet("/api/reports/dashboard").then(setData);
-  }, []);
+  // "Live overview" means live — refetch on every recognized detection
+  // (kiosk, CCTV, mobile) instead of only on page load. Debounced against
+  // event bursts from multiple cameras reporting near-simultaneously. Note:
+  // this feed only carries MATCHED detections (same as the rest of the
+  // app), so an unknown-only upload does not trigger a refresh here — the
+  // stats it would change (Unknown Faces, Recognition Attempts) still
+  // update on the next page visit, same as before this change.
+  const refreshTimerRef = useRef<number | null>(null);
+  useLiveEvents(() => {
+    if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = window.setTimeout(load, 400);
+  });
 
   if (!data) return <Spinner label="Loading dashboard..." />;
 

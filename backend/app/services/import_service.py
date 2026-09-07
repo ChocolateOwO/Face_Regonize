@@ -393,11 +393,26 @@ def build_sheet_sync_preview(
     adds and corrects people, it never removes them, so an accidental deletion
     in the sheet cannot destroy a participant or their attendance history.
 
+    When the SAME person appears more than once, the LAST row wins. A form
+    response sheet is append-only: someone who re-submits to correct their photo
+    produces a second row further down, and that newer row is the one they mean.
+    Keeping the first occurrence instead - which is what this used to do - threw
+    the new photo away as an in-file duplicate and then compared the OLD row's
+    unchanged link against the database, so the update never happened and the
+    person could never replace their photo.
+
     build_preview itself is untouched - file upload behaviour is unchanged.
     """
     rows = []
-    seen_in_file: set[str] = set()
     next_id = start_id
+
+    # Which row is each name's final appearance. Computed up front because the
+    # decision needs to be known while looking at the earlier rows, not after.
+    last_row_for_name: dict[str, int] = {}
+    for i, row in df.iterrows():
+        raw = _cell_str(row[name_column]) if name_column in df.columns else ""
+        if raw:
+            last_row_for_name[normalize_name(raw)] = int(i)
 
     for i, row in df.iterrows():
         row_number = int(i) + 2  # 1-indexed, +1 for the header row
@@ -419,14 +434,16 @@ def build_sheet_sync_preview(
 
         normalized = normalize_name(raw_name)
 
-        if normalized in seen_in_file:
+        # Skip every appearance except the person's last one, so a re-submission
+        # replaces the earlier answer instead of being discarded by it.
+        if int(i) != last_row_for_name.get(normalized, int(i)):
             rows.append({
                 "consent": consent,
                 "row_number": row_number, "participant_id": None, "name": raw_name,
-                "image_url": photo, "status": "duplicate_in_file", "message": "DUPLICATE IN FILE - SKIP",
+                "image_url": photo, "status": "duplicate_in_file",
+                "message": "SUPERSEDED - a later row for this person is used instead",
             })
             continue
-        seen_in_file.add(normalized)
 
         existing = existing_people.get(normalized)
         if existing:

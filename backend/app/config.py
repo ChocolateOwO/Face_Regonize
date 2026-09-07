@@ -21,8 +21,13 @@ PEOPLE_DIR = STORAGE_PATH / "people"
 EVENTS_DIR = STORAGE_PATH / "events"
 THUMBNAILS_DIR = STORAGE_PATH / "thumbnails"
 PHOTO_BATCHES_DIR = STORAGE_PATH / "photo_batches"  # isolated from EVENTS_DIR — kiosk uploads never mix with photographer batches
+# Browser-recorded clips from distributed camera nodes (MediaRecorder output).
+# Isolated from EVENTS_DIR (kiosk scan stills) and from the ffmpeg cameras'
+# own recordings/ directory (that one lives outside STORAGE_PATH entirely) —
+# three different recording mechanisms, three different homes.
+NODE_RECORDINGS_DIR = STORAGE_PATH / "node_recordings"
 
-for d in (DATABASE_PATH.parent, PEOPLE_DIR, EVENTS_DIR, THUMBNAILS_DIR, PHOTO_BATCHES_DIR):
+for d in (DATABASE_PATH.parent, PEOPLE_DIR, EVENTS_DIR, THUMBNAILS_DIR, PHOTO_BATCHES_DIR, NODE_RECORDINGS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 # Service-account credentials for reading a photographer's shared Google

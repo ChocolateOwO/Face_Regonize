@@ -8,6 +8,8 @@ import People from "./pages/People";
 import PersonDetail from "./pages/PersonDetail";
 import Recognition from "./pages/Recognition";
 import Activities from "./pages/Activities";
+import CameraNode from "./pages/CameraNode";
+import Connect from "./pages/Connect";
 import Attendees from "./pages/Attendees";
 import Import from "./pages/Import";
 import Uploads from "./pages/Uploads";
@@ -45,6 +47,15 @@ function AppRoutes() {
                 <Route path="/recognition" element={<Recognition />} />
                 <Route path="/attendees" element={<Attendees />} />
                 <Route path="/activities" element={<Activities />} />
+                {/* The one user-facing camera-monitoring feature: local
+                    multi-camera CCTV live view with recognition, per-camera
+                    recording, and Activity-gated detection. /camera-node is
+                    kept as a compatibility alias for QR deep links
+                    (network.py's camera_node_url / mobile_recognition_url) —
+                    both render the same page. */}
+                <Route path="/cctv" element={<CameraNode />} />
+                <Route path="/camera-node" element={<CameraNode />} />
+                <Route path="/connect" element={<Connect />} />
                 <Route path="/import" element={<Import />} />
                 <Route path="/uploads" element={<Uploads />} />
                 <Route path="/uploads/:id" element={<UploadDetail />} />

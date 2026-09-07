@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { apiDelete, apiGet, fileUrl } from "../api/client";
 import { Badge, Button, Card, EmptyState, PageHeader, Spinner } from "../components/ui";
+import { useLiveEvents } from "../hooks/useLiveEvents";
 
 interface PersonDetailData {
   id: string;
@@ -27,9 +28,24 @@ export default function PersonDetail() {
   const navigate = useNavigate();
   const [data, setData] = useState<PersonDetailData | null>(null);
 
-  useEffect(() => {
+  function load() {
     if (id) apiGet(`/api/people/${id}`).then(setData);
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  // Refetch when THIS specific person is detected again anywhere (kiosk,
+  // CCTV, mobile) — their Attendance Summary/history changes live, without
+  // reloading the page. Other people's events are ignored: they cannot
+  // change what this page shows.
+  const dataRef = useRef(data);
+  dataRef.current = data;
+  useLiveEvents((event) => {
+    if (dataRef.current && event.participant_id === dataRef.current.participant_id) load();
+  });
 
   async function handleDelete() {
     if (

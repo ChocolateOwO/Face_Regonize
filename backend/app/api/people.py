@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from app.auth.deps import get_current_user
@@ -17,9 +18,12 @@ from app.services import storage_service
 router = APIRouter(prefix="/api/people", tags=["people"])
 
 
-def _person_out(session: Session, p: Person) -> dict:
-    detections = session.exec(select(Attendance).where(Attendance.person_id == p.id)).all()
-    times = sorted(d.detected_at for d in detections)
+def _person_out(session: Session, p: Person, summary: tuple[int, datetime | None, datetime | None] | None = None) -> dict:
+    if summary is None:
+        detections = session.exec(select(Attendance).where(Attendance.person_id == p.id)).all()
+        times = sorted(d.detected_at for d in detections)
+        summary = (len(detections), times[0] if times else None, times[-1] if times else None)
+    detection_count, first_detected, last_detected = summary
     return {
         "id": p.id,
         "participant_id": p.participant_id,
@@ -33,9 +37,9 @@ def _person_out(session: Session, p: Person) -> dict:
         "is_demo": p.is_demo,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
-        "detection_count": len(detections),
-        "first_detected": times[0] if times else None,
-        "last_detected": times[-1] if times else None,
+        "detection_count": detection_count,
+        "first_detected": first_detected,
+        "last_detected": last_detected,
     }
 
 
@@ -50,7 +54,9 @@ def list_people(q: str | None = None, session: Session = Depends(get_session), u
             if ql in p.first_name.lower() or ql in p.last_name.lower()
             or ql in p.participant_id.lower() or (p.email and ql in p.email.lower())
         ]
-    return [_person_out(session, p) for p in people]
+    summary_rows = session.exec(select(Attendance.person_id, func.count(Attendance.id), func.min(Attendance.detected_at), func.max(Attendance.detected_at)).group_by(Attendance.person_id)).all()
+    summaries = {person_id: (count, first, last) for person_id, count, first, last in summary_rows}
+    return [_person_out(session, p, summaries.get(p.id, (0, None, None))) for p in people]
 
 
 @router.get("/{person_id}")

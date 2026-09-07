@@ -23,8 +23,40 @@ export interface CameraDevice {
 
 const OVERRIDE_KEY = "reconize_kiosk_camera_device_id";
 
+/**
+ * Why cameras cannot be used here, or null when they can.
+ *
+ * Browsers expose `navigator.mediaDevices` ONLY in a secure context: https,
+ * or http on localhost. Reaching this server from another machine over plain
+ * http therefore leaves mediaDevices undefined, and every camera call dies
+ * with "Cannot read properties of undefined (reading 'enumerateDevices')".
+ *
+ * That is a browser rule, not a setting we can change, so the only honest
+ * thing to do is say so plainly - and say what to do about it - instead of
+ * letting a raw TypeError reach whoever is standing at the kiosk.
+ */
+export function cameraUnavailableReason(): string | null {
+  // TypeScript types navigator.mediaDevices as always present. At runtime it
+  // is NOT: browsers omit it entirely outside a secure context, which is
+  // exactly the case being detected here - hence the cast.
+  const media = navigator.mediaDevices as MediaDevices | undefined;
+  if (typeof media?.enumerateDevices === "function") return null;
+  if (!window.isSecureContext) {
+    return (
+      "Cameras are blocked because this page was opened over an insecure connection (" +
+      window.location.origin +
+      "). Browsers only allow camera access over https, or on the computer running " +
+      "the server itself. Open this page as https://" + window.location.host +
+      " and accept the certificate warning once, or run stations on the server machine."
+    );
+  }
+  return "This browser does not support camera access.";
+}
+
 /** Browsers hide camera labels until permission has been granted once. */
 export async function listCameras(): Promise<CameraDevice[]> {
+  const reason = cameraUnavailableReason();
+  if (reason) throw new Error(reason);
   const devices = await navigator.mediaDevices.enumerateDevices();
   return devices
     .filter((d) => d.kind === "videoinput")
@@ -40,6 +72,8 @@ export async function listCameras(): Promise<CameraDevice[]> {
  * release it immediately — this must never leave a camera light on.
  */
 export async function listCamerasWithPermission(): Promise<CameraDevice[]> {
+  const reason = cameraUnavailableReason();
+  if (reason) throw new Error(reason);
   let stream: MediaStream | null = null;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: true });

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { apiGet } from "../api/client";
 import { Badge, Card, EmptyState, Input, PageHeader, Spinner } from "../components/ui";
+import { useCachedGet } from "../hooks/useCachedGet";
 
 interface StatusRow {
   person_id: string;
@@ -32,17 +32,9 @@ function SourceLabel({ source }: { source: string | null }) {
 }
 
 export default function Pdpa() {
-  const [rows, setRows] = useState<StatusRow[] | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
   const [query, setQuery] = useState("");
-
-  function load() {
-    apiGet("/api/pdpa/status").then(setRows);
-  }
-
-  useEffect(() => {
-    load();
-  }, []);
+  const { data: rows, refresh: load } = useCachedGet<StatusRow[]>("/api/pdpa/status");
 
   const counts = useMemo(() => {
     const c = { all: 0, consented: 0, declined: 0, pending: 0 };

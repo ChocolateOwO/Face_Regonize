@@ -57,7 +57,9 @@ export async function apiPostJson(path: string, body: unknown) {
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
-  return handle(res);
+  const data = await handle(res);
+  clearCachedGets();
+  return data;
 }
 
 export async function apiPutJson(path: string, body: unknown) {
@@ -66,7 +68,9 @@ export async function apiPutJson(path: string, body: unknown) {
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
-  return handle(res);
+  const data = await handle(res);
+  clearCachedGets();
+  return data;
 }
 
 export async function apiPostForm(path: string, form: FormData) {
@@ -75,7 +79,9 @@ export async function apiPostForm(path: string, form: FormData) {
     headers: { ...authHeaders() },
     body: form,
   });
-  return handle(res);
+  const data = await handle(res);
+  clearCachedGets();
+  return data;
 }
 
 export async function apiPutForm(path: string, form: FormData) {
@@ -84,7 +90,9 @@ export async function apiPutForm(path: string, form: FormData) {
     headers: { ...authHeaders() },
     body: form,
   });
-  return handle(res);
+  const data = await handle(res);
+  clearCachedGets();
+  return data;
 }
 
 export async function apiDelete(path: string) {
@@ -92,7 +100,9 @@ export async function apiDelete(path: string) {
     method: "DELETE",
     headers: { ...authHeaders() },
   });
-  return handle(res);
+  const data = await handle(res);
+  clearCachedGets();
+  return data;
 }
 
 // `version` is optional on purpose: only participant profile photos need it.
@@ -121,3 +131,4 @@ export async function downloadFile(path: string, filename: string) {
   a.remove();
   URL.revokeObjectURL(url);
 }
+import { clearCachedGets } from "../hooks/cachedGetStore";

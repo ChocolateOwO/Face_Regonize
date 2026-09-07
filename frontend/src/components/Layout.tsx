@@ -10,6 +10,8 @@ const NAV = [
   { to: "/recognition", label: "Face Recognition", icon: "🔍" },
   { to: "/attendees", label: "Attendees", icon: "✅" },
   { to: "/activities", label: "Activities", icon: "🎪" },
+  { to: "/cctv", label: "CCTV", icon: "📡" },
+  { to: "/connect", label: "Connect", icon: "📱" },
   { to: "/import", label: "Import Participants", icon: "📥" },
   { to: "/uploads", label: "Upload History", icon: "🖼️" },
   { to: "/history", label: "Recognition History", icon: "🕘" },

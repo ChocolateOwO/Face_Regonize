@@ -94,3 +94,70 @@ export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
     />
   );
 }
+
+const DEFAULT_PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500, 1000];
+
+/** Shared list-pagination bar — page-size selector + Prev/Next — for any
+ *  page backed by a server-paginated `{items, total, page, page_size}`
+ *  endpoint (Recognition History, Upload History). Page-size options match
+ *  what the backend accepts; passing a size it does not recognize falls
+ *  back to the backend's own default, so this never silently disagrees. */
+export function Pagination({
+  page,
+  pageSize,
+  total,
+  onPageChange,
+  onPageSizeChange,
+  pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS,
+}: {
+  page: number;
+  pageSize: number;
+  total: number;
+  onPageChange: (page: number) => void;
+  onPageSizeChange: (size: number) => void;
+  pageSizeOptions?: number[];
+}) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const start = total === 0 ? 0 : (page - 1) * pageSize + 1;
+  const end = Math.min(page * pageSize, total);
+  return (
+    <div className="flex items-center justify-between flex-wrap gap-3 px-4 py-3 border-t border-gray-100 text-sm">
+      <div className="text-gray-500">{total === 0 ? "No results" : `Showing ${start}–${end} of ${total}`}</div>
+      <div className="flex items-center gap-3">
+        <label className="flex items-center gap-2 text-gray-600">
+          Per page
+          <select
+            value={pageSize}
+            onChange={(e) => onPageSizeChange(Number(e.target.value))}
+            className="px-2 py-1.5 border border-gray-300 rounded-lg text-sm"
+          >
+            {pageSizeOptions.map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => onPageChange(page - 1)}
+            disabled={page <= 1}
+            className="px-3 py-1.5 border border-gray-300 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-50"
+          >
+            Prev
+          </button>
+          <span className="text-gray-500 px-2">
+            Page {page} of {totalPages}
+          </span>
+          <button
+            onClick={() => onPageChange(page + 1)}
+            disabled={page >= totalPages}
+            className="px-3 py-1.5 border border-gray-300 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-50"
+          >
+            Next
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

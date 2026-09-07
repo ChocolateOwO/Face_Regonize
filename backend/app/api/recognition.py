@@ -14,7 +14,7 @@ from app.face_recognition.engine import bbox_to_str, detect_faces, get_active_pr
 from app.face_recognition.index import recognition_index
 from app.api.activities import get_current_activity_id
 from app.models.models import Activity, Attendance, FaceDetection, Upload, User
-from app.services import settings_cache, storage_service
+from app.services import events_feed, settings_cache, storage_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/recognition", tags=["recognition"])
@@ -95,7 +95,7 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
         session.commit()
         session.refresh(upload)
 
-        for face, (person_id, _first, _full, _pid, score), bbox in zip(faces, matches, scaled_bboxes):
+        for face, (person_id, _first, full_name, participant_id, score), bbox in zip(faces, matches, scaled_bboxes):
             status = "matched" if person_id else "unknown"
             detection = FaceDetection(
                 upload_id=upload.id,
@@ -108,6 +108,7 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
             session.commit()
             session.refresh(detection)
 
+            checkin = "already"
             if person_id and person_id in new_person_ids:
                 # Defense-in-depth re-check: the synchronous handler decided
                 # this person was "new" before this background task ran, but
@@ -124,6 +125,25 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
                         activity_id=activity_id or None,
                     ))
                     session.commit()
+                    checkin = "new"
+
+            if person_id:
+                # Same live-events feed the CCTV/mobile nodes already publish
+                # to (api/nodes.py) — the kiosk was the one recognition path
+                # that never fed it, so a person scanning at the kiosk never
+                # showed up on anything watching this feed (People's
+                # last_detected, Attendees, Dashboard). node_id is a constant
+                # "kiosk" tag rather than a real station id: the kiosk never
+                # registers itself as a node, and consumers of this feed only
+                # care THAT a detection happened, not which kiosk.
+                events_feed.publish({
+                    "node_id": "kiosk",
+                    "participant_id": participant_id,
+                    "name": full_name,
+                    "activity_id": activity_id or None,
+                    "checkin": checkin,
+                    "at": datetime.now().isoformat(),
+                })
     t_db = time.perf_counter()
     logger.info(
         "background persist: image_save=%.0fms db_write=%.0fms (both async — did not add to response latency)",
@@ -132,23 +152,27 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
     )
 
 
-@router.post("/upload")
-def recognize(
+def run_recognition(
+    file_bytes: bytes,
+    filename: str,
+    *,
     background_tasks: BackgroundTasks,
-    photo: UploadFile = File(...),
-    debug: bool | None = None,
-    activity_id: str | None = Form(None),
-    session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
-):
-    """Recognize-first, persist-second: everything up to `return` here is
-    in-memory only (no DB query, no DB write, no disk write) so the identity
-    result comes back as fast as detection + embedding + comparison allow.
-    Storage and history bookkeeping happen in a background task afterward.
+    session: Session,
+    user_id: str,
+    activity_id: str | None,
+    debug: bool | None,
+) -> dict:
+    """The recognize-and-checkin core, shared by every entry point that hands
+    Central a frame to identify: the kiosk's own /upload route below, AND
+    the distributed-node mobile/central-inference endpoint (api/nodes.py).
+
+    Extracted rather than duplicated so there is exactly one place that
+    decides "who is this and have they already checked in" - a second,
+    independently-maintained copy is exactly how the two paths would
+    eventually disagree. /upload's behaviour and response shape are
+    byte-for-byte unchanged by this extraction; it is a straight house move.
     """
     t0 = time.perf_counter()
-    file_bytes = photo.file.read()
-    filename = photo.filename or "upload.jpg"
     t_read = time.perf_counter()
 
     img = storage_service.decode_image(file_bytes)
@@ -252,6 +276,31 @@ def recognize(
             "registered_faces_indexed": recognition_index.size(),
         }
 
-    background_tasks.add_task(_persist_recognition, file_bytes, filename, user.id, threshold, faces, matches, scaled_bboxes, new_person_ids, activity_id)
+    background_tasks.add_task(_persist_recognition, file_bytes, filename, user_id, threshold, faces, matches, scaled_bboxes, new_person_ids, activity_id)
 
     return response
+
+
+@router.post("/upload")
+def recognize(
+    background_tasks: BackgroundTasks,
+    photo: UploadFile = File(...),
+    debug: bool | None = None,
+    activity_id: str | None = Form(None),
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """Recognize-first, persist-second: everything up to the return in
+    run_recognition() is in-memory only (no DB query, no DB write, no disk
+    write) so the identity result comes back as fast as detection + embedding
+    + comparison allow. Storage and history bookkeeping happen in a
+    background task afterward. Thin wrapper around run_recognition() — see
+    its docstring for why this is shared rather than duplicated.
+    """
+    file_bytes = photo.file.read()
+    filename = photo.filename or "upload.jpg"
+    return run_recognition(
+        file_bytes, filename,
+        background_tasks=background_tasks, session=session,
+        user_id=user.id, activity_id=activity_id, debug=debug,
+    )

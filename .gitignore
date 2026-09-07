@@ -41,9 +41,9 @@ Thumbs.db
 # Verified database snapshots taken before an application update
 backups/
 
-# Patch backups keep source files only - never runtime data
-patch/**/*.db
-patch/**/storage/
+# Local backups and real face test images must never be published
+/patch/
+/backend/test_images/
 
 # Camera/ffmpeg runtime logs written while stations are running
 recordings/

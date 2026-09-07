@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
 from app.auth.deps import get_current_user
@@ -10,6 +11,13 @@ from app.database.db import get_session
 from app.models.models import FaceDetection, Person, Upload, User
 
 router = APIRouter(prefix="/api/history", tags=["history"])
+
+# Same options offered on every paginated list in the app (Upload History
+# mirrors this) — a fixed set rather than an arbitrary integer keeps a
+# mistyped page_size from someone hand-editing the URL into a
+# one-page-of-50000 request, which is the exact slowness this replaces.
+ALLOWED_PAGE_SIZES = (20, 50, 100, 200, 500, 1000)
+DEFAULT_PAGE_SIZE = 50
 
 
 @router.get("")
@@ -19,10 +27,25 @@ def recognition_history(
     person_id: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    stmt = select(FaceDetection).order_by(FaceDetection.detected_at.desc())
+    page = max(page, 1)
+    if page_size not in ALLOWED_PAGE_SIZES:
+        page_size = DEFAULT_PAGE_SIZE
+
+    # Person/Upload are joined here — not looked up per-row afterward — so
+    # filtering, counting and paging all happen in the database. With tens
+    # of thousands of history rows, a per-row session.get() for both the
+    # matched Person and the source Upload was two extra queries EACH,
+    # which is what made this page slow; that N+1 is gone, not just capped.
+    stmt = (
+        select(FaceDetection, Person, Upload)
+        .outerjoin(Person, FaceDetection.person_id == Person.id)
+        .outerjoin(Upload, FaceDetection.upload_id == Upload.id)
+    )
     if status:
         stmt = stmt.where(FaceDetection.status == status)
     if person_id:
@@ -31,25 +54,23 @@ def recognition_history(
         stmt = stmt.where(FaceDetection.detected_at >= datetime.fromisoformat(date_from))
     if date_to:
         stmt = stmt.where(FaceDetection.detected_at <= datetime.fromisoformat(date_to))
+    if q:
+        like = f"%{q}%"
+        full_name = Person.first_name.concat(" ").concat(Person.last_name)
+        stmt = stmt.where(or_(
+            full_name.ilike(like),
+            Person.participant_id.ilike(like),
+            Upload.filename.ilike(like),
+        ))
 
-    detections = session.exec(stmt).all()
+    total = session.exec(select(func.count()).select_from(stmt.subquery())).one()
+
+    paged = stmt.order_by(FaceDetection.detected_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    rows = session.exec(paged).all()
 
     out = []
-    for d in detections:
-        person = session.get(Person, d.person_id) if d.person_id else None
-        upload = session.get(Upload, d.upload_id)
+    for d, person, upload in rows:
         name = f"{person.first_name} {person.last_name}".strip() if person else "Unknown"
-
-        if q:
-            ql = q.lower()
-            haystack = " ".join(filter(None, [
-                name.lower(),
-                person.participant_id.lower() if person else "",
-                upload.filename.lower() if upload else "",
-            ]))
-            if ql not in haystack:
-                continue
-
         out.append({
             "id": d.id,
             "upload_id": d.upload_id,
@@ -61,7 +82,7 @@ def recognition_history(
             "status": d.status,
             "detected_at": d.detected_at,
         })
-    return out
+    return {"items": out, "total": total, "page": page, "page_size": page_size}
 
 
 @router.delete("")

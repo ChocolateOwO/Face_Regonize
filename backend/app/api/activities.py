@@ -155,30 +155,50 @@ def update_activity(
 @router.delete("/{activity_id}")
 def delete_activity(
     activity_id: str,
+    delete_attendance: bool = False,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    """Deletes an activity that nobody has been checked in to.
+    """Delete an activity. What happens to its check-ins is the caller's choice.
 
-    An activity WITH attendance is refused rather than cascaded: those rows are
-    the event's record of who was there, and deleting the activity would either
-    destroy them or leave them pointing at nothing. Archiving is the intended
-    way to retire an activity that has been used.
+    Those rows are the event's record of who was there, so the destructive
+    option is never the default:
+
+      delete_attendance=false (default)
+          the check-ins are KEPT and detached - their activity_id is cleared,
+          so they still count as attendance and appear under "No activity" in
+          reports. Nothing about who was present is lost.
+
+      delete_attendance=true
+          the check-ins are deleted along with the activity. Irreversible, and
+          intended for clearing out test activities.
+
+    Defaulting to false matters beyond the UI: anything calling this endpoint
+    without thinking about the flag gets the option that cannot lose data.
     """
     activity = session.get(Activity, activity_id)
     if not activity:
         raise HTTPException(404, "Activity not found")
 
-    used = len(session.exec(select(Attendance).where(Attendance.activity_id == activity_id)).all())
-    if used:
-        raise HTTPException(
-            409,
-            f"'{activity.name}' has {used} check-in(s) and cannot be deleted. "
-            "Archive it instead to hide it from the kiosk while keeping its records.",
-        )
+    records = session.exec(select(Attendance).where(Attendance.activity_id == activity_id)).all()
+
+    if delete_attendance:
+        for record in records:
+            session.delete(record)
+    else:
+        # Detach rather than cascade. A row whose activity_id still pointed at a
+        # deleted activity would be a dangling reference, and reports would show
+        # a blank name instead of an honest "No activity".
+        for record in records:
+            record.activity_id = None
+            session.add(record)
 
     if get_current_activity_id(session) == activity_id:
         _set_current(session, "")
     session.delete(activity)
     session.commit()
-    return {"deleted": True}
+    return {
+        "deleted": True,
+        "attendance_deleted": len(records) if delete_attendance else 0,
+        "attendance_kept": 0 if delete_attendance else len(records),
+    }

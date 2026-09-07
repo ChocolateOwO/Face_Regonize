@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { apiDelete, apiGet, downloadFile } from "../api/client";
-import { Badge, Button, Card, EmptyState, Input, PageHeader, Spinner } from "../components/ui";
+import { Badge, Button, Card, EmptyState, Input, PageHeader, Pagination, Spinner } from "../components/ui";
 
 interface HistoryEntry {
   id: string;
@@ -14,27 +14,63 @@ interface HistoryEntry {
   detected_at: string;
 }
 
+const DEFAULT_PAGE_SIZE = 50;
+
 export default function History() {
   const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
+  const [total, setTotal] = useState(0);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
 
   async function load() {
     const params = new URLSearchParams();
     if (q) params.set("q", q);
     if (status) params.set("status", status);
-    setEntries(await apiGet(`/api/history?${params.toString()}`));
+    params.set("page", String(page));
+    params.set("page_size", String(pageSize));
+    const data = await apiGet(`/api/history?${params.toString()}`);
+    // Deleting the last row on the last page (or a filter change shrinking
+    // the result set) can leave `page` pointing past the end — step back to
+    // the new last page instead of showing a stuck, falsely-empty result.
+    const lastPage = Math.max(1, Math.ceil(data.total / pageSize));
+    if (page > lastPage) {
+      setPage(lastPage);
+      return;
+    }
+    setEntries(data.items);
+    setTotal(data.total);
   }
 
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, status]);
+  }, [q, status, page, pageSize]);
+
+  // A new search/filter/page-size makes the old page number meaningless —
+  // land back on page 1 rather than showing (say) page 6 of a 2-page result.
+  // Bundled into the same handler as the filter change itself (rather than a
+  // separate effect watching q/status/pageSize) so React batches both state
+  // updates into one render, and the load effect above fires exactly once
+  // with the final values instead of once with the stale page first.
+  function updateQ(value: string) {
+    setQ(value);
+    setPage(1);
+  }
+  function updateStatus(value: string) {
+    setStatus(value);
+    setPage(1);
+  }
+  function updatePageSize(size: number) {
+    setPageSize(size);
+    setPage(1);
+  }
 
   async function handleDelete(id: string) {
     if (!confirm("Are you sure you want to delete this recognition history entry? This data will be gone forever and cannot be recovered.")) return;
     await apiDelete(`/api/history/${id}`);
-    setEntries((prev) => (prev ? prev.filter((e) => e.id !== id) : prev));
+    load(); // re-fetch this page — deleting the last row on a page should not leave a gap
   }
 
   async function handleDeleteAll() {
@@ -50,6 +86,7 @@ export default function History() {
     await apiDelete("/api/history");
     setQ("");
     setStatus("");
+    setPage(1);
     load();
   }
 
@@ -63,7 +100,7 @@ export default function History() {
             <Button variant="secondary" onClick={() => downloadFile("/api/export/history?format=csv", "recognition_history.csv")}>
               Export CSV
             </Button>
-            <Button variant="danger" onClick={handleDeleteAll} disabled={!entries || entries.length === 0}>
+            <Button variant="danger" onClick={handleDeleteAll} disabled={total === 0}>
               Delete All
             </Button>
           </div>
@@ -71,10 +108,10 @@ export default function History() {
       />
 
       <Card className="mb-4 flex gap-3 flex-wrap">
-        <Input placeholder="Search by name, ID, or filename..." value={q} onChange={(e) => setQ(e.target.value)} className="flex-1 min-w-[200px]" />
+        <Input placeholder="Search by name, ID, or filename..." value={q} onChange={(e) => updateQ(e.target.value)} className="flex-1 min-w-[200px]" />
         <select
           value={status}
-          onChange={(e) => setStatus(e.target.value)}
+          onChange={(e) => updateStatus(e.target.value)}
           className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
         >
           <option value="">All statuses</option>
@@ -119,6 +156,9 @@ export default function History() {
               ))}
             </tbody>
           </table>
+        )}
+        {entries && (
+          <Pagination page={page} pageSize={pageSize} total={total} onPageChange={setPage} onPageSizeChange={updatePageSize} />
         )}
       </Card>
     </div>

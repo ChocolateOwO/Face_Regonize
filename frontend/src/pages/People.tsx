@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { apiDelete, apiGet, apiPostForm, ApiError, fileUrl } from "../api/client";
+import { apiDelete, apiPostForm, ApiError, fileUrl } from "../api/client";
 import { Badge, Button, Card, EmptyState, Input, PageHeader, Spinner } from "../components/ui";
+import { useLiveEvents } from "../hooks/useLiveEvents";
+import { useCachedGet } from "../hooks/useCachedGet";
 
 interface Person {
   id: string;
@@ -18,19 +20,22 @@ interface Person {
 }
 
 export default function People() {
-  const [people, setPeople] = useState<Person[] | null>(null);
   const [search, setSearch] = useState("");
   const [showAdd, setShowAdd] = useState(false);
 
-  async function load() {
-    const q = search ? `?q=${encodeURIComponent(search)}` : "";
-    setPeople(await apiGet(`/api/people${q}`));
-  }
+  const q = search ? `?q=${encodeURIComponent(search)}` : "";
+  const { data: people, refresh: load } = useCachedGet<Person[]>(`/api/people${q}`);
 
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search]);
+  // Every kiosk scan, CCTV match, and mobile scan changes detection_count /
+  // last_detected for someone on this list — refetch when that happens
+  // instead of requiring a manual reload. Debounced: several cameras can
+  // report the same person within milliseconds of each other, and this
+  // should coalesce into one refetch, not one per event.
+  const refreshTimerRef = useRef<number | null>(null);
+  useLiveEvents(() => {
+    if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = window.setTimeout(load, 400);
+  });
 
   async function handleDelete(id: string, name: string) {
     if (!confirm(`Are you sure you want to delete participant "${name}"? This data will be gone forever and cannot be recovered.`))

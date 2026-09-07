@@ -28,6 +28,11 @@ export default function Activities() {
   // while a Food table, where everyone consented at registration, does not.
   const [rowMode, setRowMode] = useState<Record<string, string>>({});
   const [opened, setOpened] = useState<Record<string, boolean>>({});
+  // The activity awaiting delete confirmation, and whether the user chose to
+  // destroy its check-ins too. Defaults to keeping them every time the dialog
+  // opens, so the destructive option is never one careless Enter away.
+  const [deleting, setDeleting] = useState<Activity | null>(null);
+  const [alsoDeleteAttendance, setAlsoDeleteAttendance] = useState(false);
 
   useEffect(() => {
     load();
@@ -71,10 +76,18 @@ export default function Activities() {
       setRenaming(null);
     });
 
-  const remove = (a: Activity) =>
+  function askDelete(a: Activity) {
+    setAlsoDeleteAttendance(false);   // always reopen on the safe choice
+    setDeleting(a);
+  }
+
+  const confirmDelete = () =>
     run(async () => {
-      if (!confirm(`Delete the activity "${a.name}"? This cannot be undone.`)) return;
-      await apiDelete(`/api/activities/${a.id}`);
+      if (!deleting) return;
+      await apiDelete(
+        `/api/activities/${deleting.id}?delete_attendance=${alsoDeleteAttendance}`,
+      );
+      setDeleting(null);
     });
 
   // Camera labels stay hidden until permission is granted once, so this is a
@@ -251,10 +264,8 @@ export default function Activities() {
                         className="text-gray-600 text-sm hover:underline">Rename</button>
                       <button onClick={() => setArchived(a.id, true)} disabled={busy}
                         className="text-gray-600 text-sm hover:underline">Archive</button>
-                      {a.checked_in_count === 0 && (
-                        <button onClick={() => remove(a)} disabled={busy}
-                          className="text-red-600 text-sm hover:underline">Delete</button>
-                      )}
+                      <button onClick={() => askDelete(a)} disabled={busy}
+                        className="text-red-600 text-sm hover:underline">Delete</button>
                     </td>
                   </tr>
                 ))}
@@ -286,6 +297,71 @@ export default function Activities() {
             ))}
           </div>
         </Card>
+      )}
+
+      {deleting && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl w-full max-w-md p-6">
+            <h2 className="font-semibold text-lg mb-1">Delete “{deleting.name}”?</h2>
+
+            {deleting.checked_in_count === 0 ? (
+              <p className="text-sm text-gray-600 mb-5">
+                Nobody has been checked in to this activity, so nothing else is affected.
+              </p>
+            ) : (
+              <>
+                <p className="text-sm text-gray-600 mb-3">
+                  This activity has <strong>{deleting.checked_in_count}</strong> check-in
+                  {deleting.checked_in_count === 1 ? "" : "s"}. Choose what happens to them.
+                </p>
+                <div className="space-y-2 mb-5">
+                  <label className="flex gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer hover:bg-gray-50">
+                    <input
+                      type="radio"
+                      className="mt-0.5"
+                      checked={!alsoDeleteAttendance}
+                      onChange={() => setAlsoDeleteAttendance(false)}
+                    />
+                    <span className="text-sm">
+                      <span className="font-medium text-gray-900">Keep the check-in records</span>
+                      <span className="block text-gray-500">
+                        They still count as attendance and appear under “No activity” in Reports.
+                      </span>
+                    </span>
+                  </label>
+                  <label className="flex gap-3 p-3 rounded-lg border border-gray-200 cursor-pointer hover:bg-gray-50">
+                    <input
+                      type="radio"
+                      className="mt-0.5"
+                      checked={alsoDeleteAttendance}
+                      onChange={() => setAlsoDeleteAttendance(true)}
+                    />
+                    <span className="text-sm">
+                      <span className="font-medium text-red-700">Delete the check-ins too</span>
+                      <span className="block text-gray-500">
+                        Permanently removes all {deleting.checked_in_count} record
+                        {deleting.checked_in_count === 1 ? "" : "s"}. This cannot be undone.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              </>
+            )}
+
+            <div className="flex justify-end gap-2">
+              <Button variant="secondary" onClick={() => setDeleting(null)} disabled={busy}>
+                Cancel
+              </Button>
+              <button
+                onClick={confirmDelete}
+                disabled={busy}
+                className="px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+              >
+                {busy ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

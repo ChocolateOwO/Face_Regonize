@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useRef } from "react";
 import { Link } from "react-router-dom";
-import { apiGet, fileUrl } from "../api/client";
+import { fileUrl } from "../api/client";
 import { Badge, Card, EmptyState, PageHeader, Spinner } from "../components/ui";
+import { useLiveEvents } from "../hooks/useLiveEvents";
+import { useCachedGet } from "../hooks/useCachedGet";
 
 interface Attendee {
   id: string;
@@ -17,11 +19,18 @@ interface Attendee {
 }
 
 export default function Attendees() {
-  const [attendees, setAttendees] = useState<Attendee[] | null>(null);
+  const { data: attendees, refresh: load } = useCachedGet<Attendee[]>("/api/attendees");
 
-  useEffect(() => {
-    apiGet("/api/attendees").then(setAttendees);
-  }, []);
+  // This whole page IS an attendance summary — any detection anywhere
+  // (kiosk, CCTV, mobile) can flip someone from "Not Detected" to
+  // "In Event" or update their counts, so refetch on every event rather
+  // than requiring a manual reload. Debounced against event bursts (several
+  // cameras reporting the same person within milliseconds of each other).
+  const refreshTimerRef = useRef<number | null>(null);
+  useLiveEvents(() => {
+    if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = window.setTimeout(load, 400);
+  });
 
   if (!attendees) return <Spinner label="Loading attendees..." />;
 
