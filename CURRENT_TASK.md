@@ -1,5 +1,17 @@
 # Reconize Current Task
 
+## Reproducible Windows Installation — 2026-09-07
+
+Active task: make current Main reproducibly installable on a new Windows PC.
+Main-only setup/documentation work adds pinned GPU runtime dependencies, CPU/GPU
+Windows setup, actual InsightFace CUDA preflight, Node declaration, credential
+ignore coverage and current-feature documentation. No Main database, storage,
+participant data, recognition configuration, CCTV behavior, Event Photo
+behavior or Dummy content was changed. Automated verification passed and user
+approved one normal GitHub commit/push. No release or VERSION change is part of
+this task. Existing Main CCTV and navigation manual-verification status below
+remains unchanged.
+
 ## Main GitHub Publication — 2026-09-07
 
 The user authorized publishing the current approved Main source and rebuilding

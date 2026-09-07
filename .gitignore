@@ -16,6 +16,7 @@ storage/people/*
 storage/events/*
 storage/thumbnails/*
 storage/photo_batches/
+storage/node_recordings/
 backend/storage/
 !storage/people/.gitkeep
 !storage/events/.gitkeep
@@ -28,6 +29,13 @@ frontend/dist/
 # Env
 .env
 service_account.json
+*.service-account.json
+*oauth*.json
+*credential*.json
+*.pem
+*.key
+*.pfx
+*.p12
 
 # OS / editor
 .DS_Store

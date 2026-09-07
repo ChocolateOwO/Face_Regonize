@@ -20,28 +20,36 @@ with cosine similarity against a configurable threshold (Settings page).
 
 ## Requirements
 
-- Python 3.11–3.13 (3.14 is too new for some ML wheels at time of writing)
-- Node.js 18+
+Current Main features include GPU/CPU recognition, HEIC enrollment, Activities,
+PDPA, Event Photos, Drive integration, multi-camera CCTV, Local Agent stations,
+recording, live feed and reports. No participant data, photos, recordings,
+model cache or credentials are included in Git.
+
+- Windows 10/11, Python **3.13 x64**, Node **20.19+** or **22.12+** (tested: Node 25.2.1)
+- Microsoft Visual C++ Runtime, current Chrome or Edge
 - ~500MB free disk for the InsightFace model (downloaded automatically on first run)
 
 ## Installation
 
 ```bash
-# Backend
-cd backend
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # macOS/Linux
-pip install -r requirements.txt
+# Windows backend: NVIDIA GPU path, or use -Mode cpu
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Mode gpu
 
 # Frontend
 cd ../frontend
-npm install
+npm ci
 ```
 
-Copy `.env.example` to `.env` in the project root if you want to override any
-defaults (admin password, thresholds, storage location, etc.). It's optional —
-sensible defaults are baked in.
+Copy `.env.example` to `.env`. Before real use set a strong `ADMIN_PASSWORD`
+and `JWT_SECRET`; do this before first backend start because initial admin is
+created once. Paths in `.env` are resolved from repository root; launcher
+scripts start backend from `backend/`, so omit path overrides unless needed.
+
+GPU setup needs compatible NVIDIA hardware/driver. Setup installs exact CUDA
+runtime Python wheels and proves an actual InsightFace session uses CUDA; it
+does not install drivers. CPU mode keeps identical recognition quality but is
+slower. `buffalo_l` downloads on first model use into `~/.insightface/models/`;
+internet, ~500 MB free space and writable cache are required.
 
 ## Running the Application
 
@@ -59,13 +67,7 @@ npm run dev
 
 Open **http://localhost:5173** in Chrome or Edge.
 
-To seed a couple of demo participants (uses the two photos already in
-`backend/test_images/`):
-
-```bash
-cd backend
-.venv\Scripts\python.exe scripts\seed_demo.py
-```
+No demo face photos are distributed. Add own test participant images.
 
 ### Single-process alternative
 
@@ -166,9 +168,33 @@ are listed individually; you don't need to redo the whole file).
 port 8000 and the frontend on port 5173; `app/main.py` only allows those two
 origins by default.
 
-**Camera doesn't work anywhere in the app** — this build focuses on uploaded
-photos (registration and recognition both accept file uploads). Live webcam
-capture is a natural next step but isn't wired into this version's UI.
+## CCTV, Local Agent and LAN
+
+Central owns database, attendance, history and settings. A Windows Local Agent
+only performs local inference against Central's synchronized index:
+
+```powershell
+cd backend
+.venv\Scripts\python.exe node_agent.py --node-id CAM-01 --port 8101 --central http://CENTRAL-PC:8000
+```
+
+Use station's configured node ID, port and Central admin credentials. Allow
+Python/port 8000 through Windows Firewall for private LAN use. `start-network.bat`
+serves Central on LAN HTTP. Remote browser camera access may fail on HTTP:
+`getUserMedia` requires HTTPS or localhost. Do not assume `recognize.local`;
+this repository does not provide mDNS/HTTPS server helpers.
+
+## Google Drive
+
+Public single-file import works with shared links. Event Photo input folders
+use a service account: enable Drive API, create own service-account JSON, set
+`GOOGLE_SERVICE_ACCOUNT_KEY_PATH`, then share source folder with its email.
+Event Photo output uses own OAuth Web client: configure consent screen/audience,
+set `GOOGLE_DRIVE_CLIENT_ID` and `GOOGLE_DRIVE_CLIENT_SECRET`, restart, then
+use Connect Google Drive. Default callback is
+`http://localhost:8000/api/photo-batches/drive-oauth/callback`. Never commit
+JSON keys, `.env`, OAuth secrets or local database; OAuth refresh token is local
+database state. Private single-file import still uses public-download behavior.
 
 ## Privacy
 
