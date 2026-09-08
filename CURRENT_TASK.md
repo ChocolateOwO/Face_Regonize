@@ -1,5 +1,57 @@
 # Reconize Current Task
 
+## Urgent Event Photo Crowd Detection — 2026-09-08
+
+The user paused Phase A and explicitly authorized this isolated urgent patch,
+including a normal push to origin/main. This section supersedes older task labels.
+Base: 41ba9b6bb896edbe6bdc7c555a88f081608eec88, verified against GitHub main.
+Worktree: E:\งาน\491\Face_Reconize\Reconize_UrgentBlur.
+
+Paused original Main remains untouched. At freeze, tracked and staged diffs were
+empty; untracked files included .vscode/ and
+backend/app/migrations/004_photo_batch_local_first.py. Phase A migration 004 had
+already added source_type, source_status, local_status, drive_status and
+workflow_version in Main's backend/database/app.db. It was NOT rolled back.
+SQLite user_version remained 0. The sole batch
+36a03b2808dd4700bd929ba7c90d6e39 was completed; no Python backend or port 8000
+listener was present. Existing Phase A backups remain in
+patch/2026-09-08_0851_phase-a-local-first-main/. Do not resume Phase A automatically.
+
+Urgent implementation: Event-only global detection plus sequential 640px tiles
+with 192px overlap. The shared detector retains its 320px input configuration.
+Boxes and five-point landmarks map back to the original. Invalid boxes are
+discarded; valid boxes are clipped. Deterministic geometry suppression prefers
+non-boundary crops, then detector confidence and stable source order. It uses
+IoU >= 0.4, or containment >= 0.8 with close centers. Surviving faces receive
+existing normalized 512-dimensional embeddings from original-image alignment.
+No image upscale, concurrent tile inference or additional model is introduced.
+
+Only the Event worker's detection import changes. Existing matching thresholds,
+per-face explicit-declined-only MEDIA blur and subsequent logo remain intact.
+Detection alone never causes blur. Unknown, missing-consent and consented faces
+remain visible. Download, Drive phases, stop/delete, recognition engine, kiosk,
+schema and frontend are unchanged. Existing outputs are not reprocessed.
+
+Verification: 15 isolated tiling/privacy tests and 13 existing download/privacy
+tests passed (the latter repeats three privacy tests). Python compileall passed.
+AST comparison confirms all existing Event worker executable logic is unchanged
+except the detection import. Geometry tests use generated arrays and fake model
+responses; they are not evidence of real-world recall or identity accuracy.
+No production DB/storage or credentials are used in tests.
+
+Read-only image-header audit found 79 existing originals at 3600x2400; none were
+copied, decoded for recognition, or modified. The 640px tile choice limits the
+unchanged 320px detector's reduction to 2:1 instead of 11.25:1 on those originals.
+Real CUDA inference on generated blank arrays measured 1920x1080 global 14.08ms
+versus tiled 133.51ms (8 tiles), and 6000x4000 global 22.15ms versus tiled 1914.85ms
+(117 tiles), after model warmup. Both had 0 global/unique faces and 0 duplicates.
+These single-run measurements show added detection overhead only, not crowd
+recall, identity accuracy, or representative per-face embedding cost.
+
+This worktree is prepared for the user-authorized urgent commit/push. Push outcome
+is verified and reported separately. The original Main runtime is not deployed
+or restarted by this task. Actual crowd-photo visual verification remains needed.
+
 ## Event Photo Download During Drive — 2026-09-07
 
 Current task supersedes older active-task labels. User explicitly authorized

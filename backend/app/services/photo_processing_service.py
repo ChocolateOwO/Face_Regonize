@@ -47,7 +47,7 @@ from sqlmodel import Session, select
 
 from app.config import PHOTO_BATCHES_DIR, STORAGE_PATH
 from app.database.db import engine
-from app.face_recognition.engine import detect_faces
+from app.services.event_photo_detection_service import detect_event_faces as detect_faces
 from app.face_recognition.index import recognition_index
 from app.models.models import (
     CleanupLog,
