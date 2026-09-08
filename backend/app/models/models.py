@@ -173,9 +173,14 @@ class PhotoBatch(SQLModel, table=True):
     media_folder_id: str = Field(default="")
     ambience_folder_id: str = Field(default="")
     review_folder_id: str = Field(default="")
-    # syncing_drive = local processing finished and every local result is
-    # final and previewable; only the Google Drive mirror is still running.
-    status: str = Field(default="pending")  # pending | processing | syncing_drive | completed | failed
+    # ready = local processing finished; every local result is final and
+    # previewable. Google Drive upload to a manually-chosen destination is a
+    # separate, explicit action from here (see drive_destination_service.py):
+    # ready -> uploading -> completed, or -> upload_failed on error (local
+    # output is untouched either way). "syncing_drive" is the OLD automatic-
+    # mirror status, kept only for backward compatibility with batches
+    # created before this flow existed.
+    status: str = Field(default="pending")  # pending | processing | ready | uploading | upload_failed | syncing_drive | completed | failed
     current_stage: str = Field(default="")
 
     total_photos: int = 0

@@ -69,7 +69,7 @@ export default function PhotoBatchDownload({ id, ready, status, stopping = false
 
   const blocked = stopping || ["pending", "processing", "stopping", "deleting", "cancelled"].includes(status);
   return <span className="inline-flex flex-col items-start gap-1"
-    title="Download local SORTED, REVIEW and MEDIA. Google Drive upload continues independently.">
+    title="Download local SORTED, REVIEW and MEDIA. Available regardless of Google Drive upload status.">
     <Button variant="secondary" disabled={!ready || blocked || busy} onClick={download}>
       {busy ? "Preparing download..." : status === "processing" || status === "pending" ? "Processing..." : "Download ZIP"}
     </Button>

@@ -26,6 +26,9 @@ from app.services.photo_processing_service import _cancelled, cancel_and_delete_
 from app.services.photo_batch_download_service import (
     TemporaryZipResponse, build_output_zip, local_output_ready, output_manifest,
 )
+from app.services.drive_destination_service import (
+    DriveDestinationError, parse_destination_folder_url, reserve_upload, run_drive_upload, validate_destination,
+)
 
 router = APIRouter(prefix="/api/photo-batches", tags=["photo-batches"])
 
@@ -41,6 +44,16 @@ class CreateBatchBody(BaseModel):
 class RetentionChangeBody(BaseModel):
     password: str
     retention_days: int
+
+
+class DriveDestinationValidateBody(BaseModel):
+    folder_url: str
+
+
+class DriveUploadBody(BaseModel):
+    folder_url: str
+    upload_people: bool = True
+    upload_media: bool = True
 
 
 def _link(folder_id: str) -> str | None:
@@ -198,6 +211,59 @@ def download_photo_batch(batch_id: str, session: Session = Depends(get_session),
     except (OSError, ValueError) as e:
         raise HTTPException(409, "Local output is not ready or changed during download. Refresh and retry.") from e
     return TemporaryZipResponse(archive, media_type="application/zip", filename=f"event-photos-{batch_id}.zip")
+
+
+@router.post("/{batch_id}/drive-destination/validate")
+def validate_drive_destination(
+    batch_id: str,
+    body: DriveDestinationValidateBody,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """Read-only check: does the EXISTING Drive write identity already have
+    access to this pasted folder? Never expands OAuth scope and never
+    uploads anything — see drive_destination_service.py for why a pasted
+    folder not created by this app usually cannot be validated."""
+    if not session.get(PhotoBatch, batch_id):
+        raise HTTPException(404, "Photo batch not found")
+    try:
+        folder_id = parse_destination_folder_url(body.folder_url)
+        return validate_destination(folder_id)
+    except DriveDestinationError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/{batch_id}/drive-upload")
+def start_drive_upload(
+    batch_id: str,
+    body: DriveUploadBody,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """Explicit, user-initiated Drive upload of the batch's existing local
+    SORTED (Person) and MEDIA output only — never REVIEW/ORIGINAL/SOURCE, and
+    never a re-run of detection/recognition/blur/logo. Destination is
+    revalidated here, server-side, regardless of what the frontend already
+    checked."""
+    batch = session.get(PhotoBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Photo batch not found")
+    if _cancelled(batch_id):
+        raise HTTPException(409, "Batch is stopping or deleting.")
+    if not local_output_ready(batch, STORAGE_PATH):
+        raise HTTPException(409, "Local processing output is not ready yet.")
+    if not (body.upload_people or body.upload_media):
+        raise HTTPException(400, "Select at least one of Person folders or Media to upload.")
+    try:
+        folder_id = parse_destination_folder_url(body.folder_url)
+        validate_destination(folder_id)
+    except DriveDestinationError as e:
+        raise HTTPException(400, str(e))
+    if not reserve_upload(batch_id):
+        raise HTTPException(409, "An upload for this batch is already running.")
+    background_tasks.add_task(run_drive_upload, batch_id, body.folder_url, body.upload_people, body.upload_media)
+    return {"status": "uploading"}
 
 
 @router.get("/{batch_id}/participants")

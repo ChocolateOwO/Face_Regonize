@@ -12,18 +12,16 @@ Flow per photo: download -> decode -> detect_faces() -> recognition_index
 each matched participant's CURRENT consent status -> blur only matched faces
 with explicit declined consent. Unknown and pending faces remain visible.
 
-There are then TWO INDEPENDENT OUTPUTS, in this order:
+Local processing is now the ONLY thing this pipeline does automatically:
 
-  STAGE 1 (local, always runs) — write ORIGINAL/SORTED/AMBIENCE/REVIEW/MEDIA
-    under storage/photo_batches/{batch_id}/ and commit the DB rows. This is
-    what the in-app web preview reads, so the preview never depends on
-    Google Drive being reachable, connected, or working.
+  write ORIGINAL/SORTED/AMBIENCE/REVIEW/MEDIA under
+  storage/photo_batches/{batch_id}/, commit the DB rows, then set
+  status="ready" and STOP. This is what the in-app web preview reads, so it
+  never depends on Google Drive being reachable, connected, or working.
 
-  STAGE 2 (Google Drive, best-effort) — mirror the same tree into the
-    photographer's Drive folder and VERIFY every uploaded file actually
-    landed in the folder it was meant to. Any failure here is recorded
-    (drive_upload_status/drive_error) and surfaced to the admin, but never
-    raises past the local result and never deletes it.
+Google Drive upload is a separate, explicit, user-initiated action — see
+app.services.drive_destination_service (paste a destination folder URL,
+validate it, then Upload). Nothing here calls Drive on completion.
 
 Consent is resolved from the existing ConsentRecord table (same "latest
 record wins" rule the PDPA feature uses) and then frozen into
@@ -72,7 +70,6 @@ from app.services.google_drive_oauth_service import (
     copy_file,
     create_root_folder,
     get_or_create_subfolder,
-    is_connected,
     upload_bytes,
 )
 
@@ -317,18 +314,6 @@ def _run_photo_batch(batch_id: str) -> None:
             (batch_dir / sub).mkdir(parents=True, exist_ok=True)
         logo_config = _load_logo_config(batch_dir)
 
-        # Whether Drive output is possible at all. is_connected() only reads a
-        # stored refresh token out of the local database, so this costs no
-        # network and can be answered before any photo is processed — the
-        # common failure ("not connected") is reported immediately instead of
-        # after a long local run. Creating the output FOLDERS is a Drive write
-        # and therefore belongs to phase 2, not here.
-        drive_enabled = is_connected()
-        if not drive_enabled:
-            batch.drive_error = "Google Drive is not connected — processed photos were saved locally only."
-            session.add(batch)
-            session.commit()
-
         threshold = settings_cache.get_threshold()
 
         try:
@@ -513,49 +498,26 @@ def _run_photo_batch(batch_id: str) -> None:
                 session.commit()
 
         # Phase 1 is done: every local output exists and the web preview is
-        # fully usable from here on, whatever Drive does next.
+        # fully usable from here on. STOP here — Google Drive upload is now a
+        # separate, explicit, user-initiated action (see
+        # app.services.drive_destination_service), never automatic.
         local_note = "" if batch.failed_photos == 0 else f"{batch.failed_photos} photo(s) failed — see last error below."
+        batch.status = "ready"
         batch.current_stage = local_note
         session.add(batch)
         session.commit()
 
-    # ---- PHASE 2: Drive sync -----------------------------------------------
-    # Deliberately outside the session above: this opens its own session, and a
-    # failure inside it must not be able to roll back any phase 1 work.
-    try:
-        if drive_enabled and not _cancelled(batch_id):
-            _sync_batch_to_drive(batch_id)
-    except Exception:  # noqa: BLE001 — never strand the batch mid-sync
-        logger.exception("Photo batch %s: Drive sync raised unexpectedly", batch_id)
-    finally:
-        # Whatever happened above, the batch is finished as far as local
-        # processing is concerned and must never be left showing "syncing".
-        _finish_batch(batch_id)
 
-
-def _finish_batch(batch_id: str) -> None:
-    """Mark the batch completed and leave a stage message that tells the truth.
-
-    Local processing having succeeded does NOT mean the whole batch succeeded:
-    the message distinguishes a clean run from one where Drive was skipped or
-    partly failed, using only fields that already exist.
-    """
-    with Session(engine) as session:
-        if _cancelled(batch_id): return
-        batch = session.get(PhotoBatch, batch_id)
-        if not batch:
-            return
-        notes: list[str] = []
-        if batch.failed_photos:
-            notes.append(f"{batch.failed_photos} photo(s) failed locally — see last error below.")
-        if batch.drive_failed_photos:
-            notes.append(f"Google Drive sync completed with errors — {batch.drive_failed_photos} photo(s) not uploaded.")
-        batch.status = "completed"
-        batch.current_stage = " ".join(notes)
-        session.add(batch)
-        session.commit()
-
-
+# ---- Legacy automatic Drive mirror (kept, no longer called automatically) --
+# _sync_batch_to_drive/_drive_upload_photo implemented the OLD behaviour of
+# mirroring every batch into a NEW folder this app created at the Drive root,
+# immediately and automatically after phase 1. That automatic call has been
+# removed (see the "ready" status above) in favour of the explicit, user-
+# chosen destination flow in drive_destination_service.py. These two
+# functions are intentionally left in place, unused by the automatic
+# pipeline, only because test_photo_batch_download.py exercises them
+# directly; they are safe to delete in a follow-up cleanup if no longer
+# wanted.
 def _sync_batch_to_drive(batch_id: str) -> None:
     """PHASE 2 — mirror an already locally-processed batch into Google Drive.
 

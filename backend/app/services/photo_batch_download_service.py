@@ -52,11 +52,15 @@ def batch_output_root(batch, storage: Path) -> Path:
 def local_output_ready(batch, storage: Path) -> bool:
     """Cheap UI hint. The download itself additionally validates the file manifest.
 
-    Existing Phase 2/completed states are published only after the local loop.
-    Counters alone are insufficient: they also advance for failed photos.
-    Drive failures normally keep status=completed in the existing pipeline.
+    "ready"/"uploading"/"upload_failed"/"completed" are all published only
+    after local processing's per-photo loop has finished — Google Drive
+    upload (manual, explicit) runs after "ready" and never affects local
+    output, so download must stay available through all of its states, not
+    just once it succeeds. "syncing_drive" is kept for backward compatibility
+    with the old automatic-mirror pipeline. Counters alone are insufficient:
+    they also advance for failed photos.
     """
-    if batch.status not in {"syncing_drive", "completed", "failed"}:
+    if batch.status not in {"ready", "uploading", "upload_failed", "syncing_drive", "completed", "failed"}:
         return False
     if batch.status == "failed" and not batch.drive_error:
         return False

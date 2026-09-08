@@ -3,14 +3,17 @@ import { Link, useParams } from "react-router-dom";
 import { apiGet, apiPutJson, fileUrl, ApiError } from "../api/client";
 import { Badge, Button, Card, EmptyState, PageHeader, Spinner } from "../components/ui";
 import PhotoBatchDownload from "../components/PhotoBatchDownload";
+import DriveDestinationPanel from "../components/DriveDestinationPanel";
 
 interface Batch {
   id: string;
   label: string;
-  // "syncing_drive" = local processing has finished and the results below are
-  // already complete and previewable; only the Google Drive mirror is still
-  // running. It is NOT a kind of "processing".
-  status: "pending" | "processing" | "syncing_drive" | "completed" | "failed";
+  // "ready" = local processing finished; every result below is final and
+  // previewable. Google Drive upload to a manually-chosen destination is a
+  // separate, explicit action from here: ready -> uploading -> completed, or
+  // -> upload_failed. "syncing_drive" is the old automatic-mirror status,
+  // kept only for batches created before this flow existed.
+  status: "pending" | "processing" | "ready" | "uploading" | "upload_failed" | "syncing_drive" | "completed" | "failed";
   download_ready?: boolean;
   current_stage: string;
   total_photos: number;
@@ -112,24 +115,17 @@ export default function PhotoBatchDetail() {
 
   const progressPct = batch.total_photos > 0 ? Math.round((batch.processed_photos / batch.total_photos) * 100) : 0;
 
-  // Local results are finished and safe to show from the moment phase 1 ends,
-  // whether or not the Drive mirror has run, failed, or been skipped.
-  const localDone = batch.status === "syncing_drive" || batch.status === "completed";
-
-  // Say what actually happened to the Drive half, using only fields the
-  // backend already records. "Processing complete" alone would read as an
-  // unconditional success even when nothing reached Drive.
-  const driveSummary: { text: string; tone: "good" | "warn" | "bad" } =
-    batch.status === "syncing_drive"
-      ? { text: "Google Drive sync in progress…", tone: "warn" }
-      : batch.drive_failed_photos > 0
-        ? { text: `Google Drive sync completed with errors — ${batch.drive_failed_photos} photo(s) not uploaded`, tone: "bad" }
-        : batch.processed_folder_url
-          ? { text: "Google Drive sync complete", tone: "good" }
-          : { text: batch.drive_error || "Google Drive sync skipped — photos are saved locally only", tone: "warn" };
+  // Local results are finished and safe to show from the moment phase 1 ends
+  // ("ready"), whether or not a Drive upload has since been started, failed,
+  // or succeeded. "syncing_drive"/"completed" also cover batches created
+  // under the old automatic-mirror flow.
+  const localDone = ["ready", "uploading", "upload_failed", "syncing_drive", "completed"].includes(batch.status);
 
   const statusLabel =
-    batch.status === "syncing_drive" ? "local processing done, syncing to Google Drive" : batch.status;
+    batch.status === "ready" ? "local processing complete"
+    : batch.status === "uploading" || batch.status === "syncing_drive" ? "uploading to Google Drive"
+    : batch.status === "upload_failed" ? "Google Drive upload failed"
+    : batch.status;
 
   return (
     <div>
@@ -192,36 +188,8 @@ export default function PhotoBatchDetail() {
 
       {localDone && (
         <>
-          {batch.status === "syncing_drive" && (
-            <Card className="mb-4 border-indigo-200 bg-indigo-50">
-              <div className="flex items-center gap-3">
-                <Spinner />
-                <div>
-                  <div className="font-semibold text-indigo-900">Uploading to Google Drive…</div>
-                  <div className="text-sm text-gray-700">
-                    Face processing has finished — all results below are final and can be viewed now.
-                    Only the Google Drive copy is still being uploaded.
-                  </div>
-                  {batch.current_stage && <div className="text-xs text-gray-500 mt-1">{batch.current_stage}</div>}
-                </div>
-              </div>
-            </Card>
-          )}
-
           <Card className="mb-4">
-            <h2 className="font-semibold text-gray-900 mb-1 text-lg">Local Processing Complete ✓</h2>
-            <p
-              className={
-                "text-sm mb-3 " +
-                (driveSummary.tone === "good"
-                  ? "text-green-700"
-                  : driveSummary.tone === "bad"
-                    ? "text-red-700"
-                    : "text-amber-700")
-              }
-            >
-              {driveSummary.text}
-            </p>
+            <h2 className="font-semibold text-gray-900 mb-3 text-lg">Local Processing Complete ✓</h2>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <Stat label="Total Photos" value={batch.total_photos} />
               <Stat label="Recognized Photos" value={batch.recognized_photos} tone="good" />
@@ -241,38 +209,13 @@ export default function PhotoBatchDetail() {
           </Card>
 
           <Card className="mb-4">
-            <h2 className="font-semibold text-gray-900 mb-1">Google Drive Results</h2>
-            <p className="text-xs text-gray-400 mb-3">
-              Download from Google Drive. The preview below reads local copies and works even if Drive is unavailable.
-            </p>
-            {batch.processed_folder_url ? (
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                <DriveLinkButton label="📁 All Processed Photos" url={batch.processed_folder_url} />
-                <DriveLinkButton label="📁 Media" url={batch.media_folder_url} />
-                <DriveLinkButton label="📁 Ambience" url={batch.ambience_folder_url} />
-                <DriveLinkButton label="📁 Review" url={batch.review_folder_url} />
-              </div>
-            ) : batch.status === "syncing_drive" ? (
-              <div className="text-sm text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
-                Creating the Google Drive folders… links appear here once they exist.
-              </div>
-            ) : (
-              <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                No Google Drive output for this batch — local processing completed and the photos are available in the preview below.
-              </div>
-            )}
-            {batch.drive_failed_photos > 0 && (
-              <div className="mt-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
-                ⚠️ Google Drive upload failed for {batch.drive_failed_photos} photo(s). Processing itself succeeded — every photo is still
-                available in the preview below.
-                {batch.drive_error && <div className="text-xs text-red-600 mt-1">Last Drive error: {batch.drive_error}</div>}
-              </div>
-            )}
-            {batch.drive_failed_photos === 0 && batch.drive_error && (
-              <div className="mt-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-                {batch.drive_error}
-              </div>
-            )}
+            <DriveDestinationPanel
+              batchId={batch.id}
+              status={batch.status}
+              currentStage={batch.current_stage}
+              driveError={batch.drive_error}
+              processedFolderUrl={batch.processed_folder_url}
+            />
           </Card>
         </>
       )}
@@ -381,21 +324,6 @@ export default function PhotoBatchDetail() {
         />
       )}
     </div>
-  );
-}
-
-function DriveLinkButton({ label, url }: { label: string; url: string | null }) {
-  if (!url) return null;
-  return (
-    <a
-      href={url}
-      target="_blank"
-      rel="noreferrer"
-      className="block text-center border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg px-3 py-3 text-sm font-medium"
-    >
-      {label}
-      <div className="text-xs font-normal mt-1">Open Google Drive →</div>
-    </a>
   );
 }
 

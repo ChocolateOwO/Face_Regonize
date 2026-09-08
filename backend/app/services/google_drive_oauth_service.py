@@ -204,6 +204,24 @@ def create_root_folder(name: str) -> str:
         raise DriveOAuthError(f"Could not create the Drive output folder '{name}': {e}") from e
 
 
+def create_subfolder(parent_id: str, name: str) -> str:
+    """Like create_root_folder but nested under an existing parent_id instead
+    of the Drive root — used for mirroring into a user-pasted destination
+    folder. Not idempotent by name, same reasoning as create_root_folder:
+    each upload run gets its own clearly-dated folder rather than merging
+    into a previous run's."""
+    service = get_write_service()
+    try:
+        folder = (
+            service.files()
+            .create(body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}, fields="id")
+            .execute()
+        )
+        return folder["id"]
+    except Exception as e:  # noqa: BLE001
+        raise DriveOAuthError(f"Could not create the Drive output folder '{name}': {e}") from e
+
+
 def get_or_create_subfolder(parent_id: str, name: str) -> str:
     """Idempotent: returns the existing child folder's id if one with this
     name is already there, otherwise creates it. Avoids duplicate PROCESSED/

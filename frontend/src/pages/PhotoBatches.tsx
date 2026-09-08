@@ -7,7 +7,7 @@ import PhotoBatchDownload from "../components/PhotoBatchDownload";
 interface Batch {
   id: string;
   label: string;
-  status: "pending" | "processing" | "syncing_drive" | "completed" | "failed";
+  status: "pending" | "processing" | "ready" | "uploading" | "upload_failed" | "syncing_drive" | "completed" | "failed";
   download_ready?: boolean;
   current_stage: string;
   total_photos: number;
@@ -23,9 +23,12 @@ function StatusBadge({ status }: { status: string }) {
   if (status === "completed") return <Badge tone="good">Completed</Badge>;
   if (status === "failed") return <Badge tone="bad">Failed</Badge>;
   if (status === "processing") return <Badge tone="warn">Processing</Badge>;
-  // Photos are already processed and previewable here — only the Drive mirror
-  // is outstanding, so this must not read as "still processing".
-  if (status === "syncing_drive") return <Badge tone="warn">Syncing to Drive</Badge>;
+  if (status === "ready") return <Badge tone="good">Ready</Badge>;
+  // Photos are already processed and previewable here — only the (manually
+  // started) Drive upload is outstanding, so this must not read as "still
+  // processing". "syncing_drive" is the old automatic-mirror status.
+  if (status === "uploading" || status === "syncing_drive") return <Badge tone="warn">Uploading to Drive</Badge>;
+  if (status === "upload_failed") return <Badge tone="bad">Drive Upload Failed</Badge>;
   return <Badge>Pending</Badge>;
 }
 
@@ -62,7 +65,7 @@ export default function PhotoBatches() {
 
   // Reflect the local/Drive boundary without requiring a page reload.
   useEffect(() => {
-    if (!batches?.some((b) => ["pending", "processing", "syncing_drive"].includes(b.status))) return;
+    if (!batches?.some((b) => ["pending", "processing", "uploading", "syncing_drive"].includes(b.status))) return;
     const timer = window.setInterval(load, 2000);
     return () => window.clearInterval(timer);
   }, [batches]);
