@@ -1,7 +1,7 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { apiDelete, apiPostForm, ApiError, fileUrl } from "../api/client";
-import { Badge, Button, Card, EmptyState, Input, PageHeader, Spinner } from "../components/ui";
+import { apiDelete, apiGet, apiPostForm, ApiError, fileUrl } from "../api/client";
+import { Badge, Button, Card, EmptyState, Input, PageHeader, Pagination, Spinner } from "../components/ui";
 import { useLiveEvents } from "../hooks/useLiveEvents";
 import { useCachedGet } from "../hooks/useCachedGet";
 
@@ -19,12 +19,33 @@ interface Person {
   last_detected: string | null;
 }
 
+interface PageOf<T> {
+  items: T[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
 export default function People() {
   const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
   const [showAdd, setShowAdd] = useState(false);
 
-  const q = search ? `?q=${encodeURIComponent(search)}` : "";
-  const { data: people, refresh: load } = useCachedGet<Person[]>(`/api/people${q}`);
+  // Phase I1 — a server-side page (search, count, offset and limit all run in
+  // the database) instead of the whole participant table.
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (search) params.set("q", search);
+  const { data, refresh: load } = useCachedGet<PageOf<Person>>(`/api/people?${params}`);
+  const people = data?.items ?? null;
+  const total = data?.total ?? 0;
+
+  // A new search is a new result set — page 7 of the old one would be empty.
+  useEffect(() => setPage(1), [search]);
+  // Deleting the last row of the last page must not strand the view on a blank page.
+  useEffect(() => {
+    if (data && data.items.length === 0 && page > 1) setPage((p) => p - 1);
+  }, [data, page]);
 
   // Every kiosk scan, CCTV match, and mobile scan changes detection_count /
   // last_detected for someone on this list — refetch when that happens
@@ -45,14 +66,15 @@ export default function People() {
   }
 
   async function handleDeleteAll() {
-    if (!people || people.length === 0) return;
+    if (!total) return;
     if (
       !confirm(
-        `Are you sure you want to delete ALL ${people.length} participants? This also deletes their attendance records, recognition history, and PDPA consent history. This data will be gone forever and cannot be recovered.`
+        `Are you sure you want to delete ALL ${total} participants? This also deletes their attendance records, recognition history, and PDPA consent history. This data will be gone forever and cannot be recovered.`
       )
     )
       return;
     await apiDelete("/api/people");
+    setPage(1);
     load();
   }
 
@@ -63,7 +85,7 @@ export default function People() {
         subtitle="Manage registered participants."
         action={
           <div className="flex gap-2">
-            <Button variant="danger" onClick={handleDeleteAll} disabled={!people || people.length === 0}>
+            <Button variant="danger" onClick={handleDeleteAll} disabled={!total}>
               Delete All
             </Button>
             <Button onClick={() => setShowAdd(true)}>+ Add Person</Button>
@@ -79,7 +101,7 @@ export default function People() {
         {!people ? (
           <Spinner />
         ) : people.length === 0 ? (
-          <EmptyState>No participants yet. Click "Add Person" or use Import Participants.</EmptyState>
+          <EmptyState>{search ? "No participants match this search." : 'No participants yet. Click "Add Person" or use Import Participants.'}</EmptyState>
         ) : (
           <table className="w-full text-sm">
             <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
@@ -128,6 +150,18 @@ export default function People() {
             </tbody>
           </table>
         )}
+        {people && total > 0 && (
+          <Pagination
+            page={page}
+            pageSize={pageSize}
+            total={total}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+          />
+        )}
       </Card>
 
       {showAdd && (
@@ -152,6 +186,21 @@ function AddPersonModal({ onClose, onCreated }: { onClose: () => void; onCreated
   const [preview, setPreview] = useState<string>("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // Phase L1 — prefill the next never-reused number. A read-only preview: the
+  // number is only consumed if this person is actually registered, and the
+  // field stays editable for a custom ID. Never overwrites what was typed.
+  useEffect(() => {
+    let active = true;
+    apiGet("/api/people/next-id")
+      .then((r) => {
+        if (active && r?.next_id) setParticipantId((current) => current || r.next_id);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
 
   function handleFile(f: File) {
     setFile(f);
@@ -202,7 +251,10 @@ function AddPersonModal({ onClose, onCreated }: { onClose: () => void; onCreated
             onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
           />
 
-          <Input placeholder="Participant ID (e.g. P001)" value={participantId} onChange={(e) => setParticipantId(e.target.value)} />
+          <div>
+            <Input placeholder="Participant ID (e.g. P001)" value={participantId} onChange={(e) => setParticipantId(e.target.value)} />
+            <p className="text-xs text-gray-400 mt-1">Suggested next number — you can change it.</p>
+          </div>
           <Input placeholder="First Name" value={firstName} onChange={(e) => setFirstName(e.target.value)} />
           <Input placeholder="Last Name" value={lastName} onChange={(e) => setLastName(e.target.value)} />
           <Input placeholder="Email (optional)" value={email} onChange={(e) => setEmail(e.target.value)} />

@@ -321,18 +321,66 @@ def pick_column(scored: list[dict]) -> tuple[str | None, list[dict] | None]:
     return None, plausible if len(plausible) > 1 else scored[:3]
 
 
-def next_auto_id_start(session: Session) -> int:
-    """Auto-generated participant numbers continue from the highest existing
-    numeric participant_id already in the system (whether from an earlier
-    import or manual entry), rather than restarting at 1 every time — so a
-    second import (or a manually-added participant) never collides with an
-    unrelated existing person under the same number."""
+_PARTICIPANT_ID_HIGH_WATER_KEY = "participant_id_high_water"
+
+
+def _live_scan_max_participant_id(session: Session) -> int:
+    """The OLD logic, kept only as the one-time seed for the persistent
+    counter below (and as a fallback if the Setting row is ever missing) —
+    no longer called on every request, since a fresh scan is exactly what
+    let a deleted top-numbered participant's ID be reissued."""
     existing = session.exec(select(Person.participant_id)).all()
     max_id = 0
     for pid in existing:
         if pid and pid.isdigit():
             max_id = max(max_id, int(pid))
-    return max_id + 1
+    return max_id
+
+
+def _read_high_water(session: Session) -> int:
+    from app.models.models import Setting
+
+    row = session.get(Setting, _PARTICIPANT_ID_HIGH_WATER_KEY)
+    if row:
+        return int(row.value)
+    # First use on this database: seed from the live-scan result once, then
+    # persist it — existing installations don't jump or collide.
+    seeded = _live_scan_max_participant_id(session)
+    session.add(Setting(key=_PARTICIPANT_ID_HIGH_WATER_KEY, value=str(seeded)))
+    session.commit()
+    return seeded
+
+
+def bump_high_water_if_greater(session: Session, participant_id: str | None) -> None:
+    """Call after a Person is actually created/kept with this
+    participant_id — advances the persistent counter if it's numeric and
+    higher than the current mark. Never moves it backward, and non-numeric
+    IDs stay invisible to it (same as the old isdigit() guard)."""
+    from app.models.models import Setting
+
+    if not (participant_id and participant_id.isdigit()):
+        return
+    value = int(participant_id)
+    row = session.get(Setting, _PARTICIPANT_ID_HIGH_WATER_KEY)
+    current = int(row.value) if row else _live_scan_max_participant_id(session)
+    if value > current:
+        if row:
+            row.value = str(value)
+            session.add(row)
+        else:
+            session.add(Setting(key=_PARTICIPANT_ID_HIGH_WATER_KEY, value=str(value)))
+        session.commit()
+
+
+def next_auto_id_start(session: Session) -> int:
+    """Auto-generated participant numbers continue from the PERSISTENT
+    high-water mark, never a fresh MAX() scan — so a deleted top-numbered
+    participant's ID is never reissued to someone else. This is a read-only
+    preview: it does not itself reserve or consume a number (see
+    bump_high_water_if_greater, called only once a Person is actually
+    created), so showing a preview and then not completing it never wastes
+    a number."""
+    return _read_high_water(session) + 1
 
 
 def existing_normalized_names(session: Session) -> set[str]:
@@ -781,6 +829,7 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                 session.add(row)
                 session.add(job)
                 session.commit()
+                bump_high_water_if_greater(session, row.participant_id)
 
                 # The participant is committed at this point; the index update
                 # that follows is the derived cache catching up. If it fails,

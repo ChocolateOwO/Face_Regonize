@@ -2,6 +2,7 @@
 import ast
 from pathlib import Path
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -105,6 +106,7 @@ class TilingTests(unittest.TestCase):
         engine = ModuleType('app.face_recognition.engine')
         engine.get_face_app = lambda: SimpleNamespace(det_model=detector, models={'recognition': SimpleNamespace(get=recognize)})
         engine.DetectedFace = lambda embedding, bbox, det_score: SimpleNamespace(embedding=embedding, bbox=bbox, det_score=det_score)
+        engine.inference_lock = threading.Lock()  # Phase G2 arbiter — detect_event_faces() now imports this too
         common = ModuleType('insightface.app.common')
         common.Face = SimpleNamespace
         with patch.dict(sys.modules, {'app.face_recognition.engine': engine, 'insightface.app.common': common}):

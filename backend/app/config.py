@@ -44,6 +44,16 @@ BACKEND_BASE_URL = _env("BACKEND_BASE_URL", "http://localhost:8000")
 FRONTEND_URL = _env("FRONTEND_URL", "http://localhost:5173")
 OAUTH_REDIRECT_URI = f"{BACKEND_BASE_URL}/api/photo-batches/drive-oauth/callback"
 
+# Phase H — Google Picker for choosing the Drive DESTINATION folder. Both
+# values are PUBLIC (they are sent to the browser); neither is a secret. They
+# must come from the SAME Google Cloud project as GOOGLE_DRIVE_CLIENT_ID.
+GOOGLE_PICKER_API_KEY = _env("GOOGLE_PICKER_API_KEY", "")
+GOOGLE_CLOUD_PROJECT_NUMBER = _env("GOOGLE_CLOUD_PROJECT_NUMBER", "")
+# Extra browser origins allowed to request a short-lived Picker token
+# (comma-separated). FRONTEND_URL, BACKEND_BASE_URL and same-origin requests
+# are always allowed.
+PICKER_ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in _env("PICKER_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
 # How often the retention background loop checks for expired photo batches.
 RETENTION_CHECK_INTERVAL_SECONDS = int(_env("RETENTION_CHECK_INTERVAL_SECONDS", "300"))
 

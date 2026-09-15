@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Badge, Card, EmptyState, Input, PageHeader, Spinner } from "../components/ui";
+import { Card, ConsentBadge, ConsentSourceLabel, EmptyState, Input, PageHeader, Pagination, Spinner, Tabs } from "../components/ui";
 import { useCachedGet } from "../hooks/useCachedGet";
 
 interface StatusRow {
@@ -16,52 +16,35 @@ interface StatusRow {
 
 type Filter = "all" | "consented" | "declined" | "pending";
 
-function StatusBadge({ status }: { status: string }) {
-  if (status === "consented") return <Badge tone="good">CONSENTED</Badge>;
-  if (status === "declined") return <Badge tone="bad">NOT CONSENTED</Badge>;
-  return <Badge tone="default">PENDING</Badge>;
-}
-
-/** Where the current answer came from — a form answer is not the same evidence
- *  as someone tapping the kiosk themselves, so the page never conflates them. */
-function SourceLabel({ source }: { source: string | null }) {
-  if (source === "registration") return <span className="text-gray-600">Registration form</span>;
-  if (source === "kiosk") return <span className="text-gray-600">Kiosk</span>;
-  if (source === "admin") return <span className="text-gray-600">Set by admin</span>;
-  return <span className="text-gray-400">No answer yet</span>;
+interface StatusPage {
+  items: StatusRow[];
+  total: number;
+  page: number;
+  page_size: number;
+  counts: Record<Filter, number>;
 }
 
 export default function Pdpa() {
   const [filter, setFilter] = useState<Filter>("all");
   const [query, setQuery] = useState("");
-  const { data: rows, refresh: load } = useCachedGet<StatusRow[]>("/api/pdpa/status");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
 
-  const counts = useMemo(() => {
-    const c = { all: 0, consented: 0, declined: 0, pending: 0 };
-    for (const r of rows ?? []) {
-      c.all += 1;
-      c[r.status] += 1;
-    }
-    return c;
-  }, [rows]);
+  // Phase I2 — filtered and paged on the server; the tab counts come back
+  // with the page and always cover everyone.
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (filter !== "all") params.set("status", filter);
+  if (query.trim()) params.set("q", query.trim());
+  const { data, refresh: load } = useCachedGet<StatusPage>(`/api/pdpa/status?${params}`);
 
-  const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return (rows ?? []).filter((r) => {
-      if (filter !== "all" && r.status !== filter) return false;
-      if (!q) return true;
-      return (
-        `${r.first_name} ${r.last_name}`.toLowerCase().includes(q) ||
-        r.participant_id.toLowerCase().includes(q)
-      );
-    });
-  }, [rows, filter, query]);
+  useEffect(() => setPage(1), [filter, query]);
 
-  const tabs: { key: Filter; label: string; tone: string }[] = [
-    { key: "all", label: "All", tone: "text-gray-700" },
-    { key: "consented", label: "Consented", tone: "text-green-700" },
-    { key: "declined", label: "Not consented", tone: "text-red-700" },
-    { key: "pending", label: "Pending", tone: "text-gray-500" },
+  const counts = data?.counts ?? { all: 0, consented: 0, declined: 0, pending: 0 };
+  const tabs: { key: Filter; label: string; tone: string; count: number }[] = [
+    { key: "all", label: "All", tone: "text-gray-700", count: counts.all },
+    { key: "consented", label: "Consented", tone: "text-green-700", count: counts.consented },
+    { key: "declined", label: "Not consented", tone: "text-red-700", count: counts.declined },
+    { key: "pending", label: "Pending", tone: "text-gray-500", count: counts.pending },
   ];
 
   return (
@@ -81,21 +64,7 @@ export default function Pdpa() {
 
       <Card className="mb-4">
         <div className="flex flex-wrap items-center gap-2">
-          {tabs.map((t) => (
-            <button
-              key={t.key}
-              onClick={() => setFilter(t.key)}
-              className={
-                "px-3 py-1.5 rounded-lg text-sm border transition-colors " +
-                (filter === t.key
-                  ? "border-indigo-300 bg-indigo-50 text-indigo-800 font-medium"
-                  : "border-gray-200 hover:bg-gray-50 " + t.tone)
-              }
-            >
-              {t.label}
-              <span className="ml-1.5 tabular-nums text-gray-400">{counts[t.key]}</span>
-            </button>
-          ))}
+          <Tabs tabs={tabs} active={filter} onChange={setFilter} />
           <div className="flex-1 min-w-[12rem]">
             <Input
               value={query}
@@ -107,11 +76,11 @@ export default function Pdpa() {
       </Card>
 
       <Card className="p-0 overflow-hidden">
-        {!rows ? (
+        {!data ? (
           <Spinner />
-        ) : rows.length === 0 ? (
+        ) : counts.all === 0 ? (
           <EmptyState>No participants registered yet.</EmptyState>
-        ) : visible.length === 0 ? (
+        ) : data.items.length === 0 ? (
           <EmptyState>No participants match this filter.</EmptyState>
         ) : (
           <div className="overflow-x-auto">
@@ -125,19 +94,22 @@ export default function Pdpa() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {visible.map((r) => (
+                {data.items.map((r) => (
                   <tr key={r.person_id} className="hover:bg-gray-50">
                     <td className="px-4 py-3">
-                      <Link to={`/pdpa/${r.person_id}`} className="text-indigo-600 hover:underline font-medium">
+                      {/* The participant page is the one place a person's
+                          details and their consent live; PDPA is the
+                          overview/report that points into it. */}
+                      <Link to={`/people/${r.person_id}`} className="text-indigo-600 hover:underline font-medium">
                         {r.first_name} {r.last_name}
                       </Link>
                       <div className="text-xs text-gray-400">{r.participant_id}</div>
                     </td>
                     <td className="px-4 py-3">
-                      <StatusBadge status={r.status} />
+                      <ConsentBadge status={r.status} />
                     </td>
                     <td className="px-4 py-3 text-xs">
-                      <SourceLabel source={r.source} />
+                      <ConsentSourceLabel source={r.source} />
                     </td>
                     <td className="px-4 py-3 text-gray-500">
                       {r.last_updated ? new Date(r.last_updated).toLocaleString() : "—"}
@@ -147,6 +119,18 @@ export default function Pdpa() {
               </tbody>
             </table>
           </div>
+        )}
+        {data && data.total > 0 && (
+          <Pagination
+            page={page}
+            pageSize={pageSize}
+            total={data.total}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+          />
         )}
       </Card>
 

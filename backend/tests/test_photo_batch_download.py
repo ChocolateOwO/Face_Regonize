@@ -18,10 +18,11 @@ from unittest.mock import patch
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query
 from sqlmodel import Session, SQLModel, create_engine, select
 from app.models.models import Person, PhotoBatch, PhotoBatchFace, PhotoBatchParticipantFolder, PhotoBatchPhoto, User
 from app.services import photo_batch_download_service as download
+from app.services import batch_edit_lock
 from test_event_photo_explicit_deny import MediaPolicyTests
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -84,7 +85,8 @@ class DownloadTests(unittest.TestCase):
             HTTPException=HTTPException, select=select, STORAGE_PATH=self.storage,
             _cancelled=lambda identity: identity in self.cancelled,
             output_manifest=download.output_manifest, build_output_zip=download.build_output_zip,
-            TemporaryZipResponse=download.TemporaryZipResponse)
+            TemporaryZipResponse=download.TemporaryZipResponse, batch_edit_lock=batch_edit_lock, Query=Query,
+            export_selection_service=__import__('app.services.export_selection_service', fromlist=['zip_manifest']))
         load_functions("app/api/photo_batches.py", {"download_photo_batch"}, namespace)
         self.app = FastAPI()
         self.app.include_router(router, prefix="/api/photo-batches")

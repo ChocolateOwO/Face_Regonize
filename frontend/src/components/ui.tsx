@@ -95,6 +95,60 @@ export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
   );
 }
 
+/** A participant's current consent answer.
+ *
+ *  Shared rather than redefined per page: the PDPA overview and the
+ *  participant page must never disagree about what "declined" looks like,
+ *  because that badge is the visible face of whether someone's photos get
+ *  masked. "NOT CONSENTED" (not "DECLINED") is the wording the product uses. */
+export function ConsentBadge({ status }: { status: string }) {
+  if (status === "consented") return <Badge tone="good">CONSENTED</Badge>;
+  if (status === "declined") return <Badge tone="bad">NOT CONSENTED</Badge>;
+  return <Badge tone="default">PENDING</Badge>;
+}
+
+/** Where the current answer came from — a form answer is not the same evidence
+ *  as someone tapping the kiosk themselves, so nothing conflates them. */
+export function ConsentSourceLabel({ source }: { source: string | null }) {
+  if (source === "registration") return <span className="text-gray-600">Registration form</span>;
+  if (source === "kiosk") return <span className="text-gray-600">Kiosk</span>;
+  if (source === "admin") return <span className="text-gray-600">Set by admin</span>;
+  return <span className="text-gray-400">No answer yet</span>;
+}
+
+/** Filter/segment strip, extracted from the hand-rolled copy on the PDPA page
+ *  so a second user of it does not fork the styling. `count` is optional —
+ *  omit it where a tab has nothing meaningful to count. */
+export function Tabs<T extends string>({
+  tabs,
+  active,
+  onChange,
+}: {
+  tabs: { key: T; label: string; count?: number; tone?: string }[];
+  active: T;
+  onChange: (key: T) => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {tabs.map((t) => (
+        <button
+          key={t.key}
+          onClick={() => onChange(t.key)}
+          className={
+            "px-3 py-1.5 rounded-lg text-sm border transition-colors " +
+            (active === t.key
+              ? "border-indigo-300 bg-indigo-50 text-indigo-800 font-medium"
+              : "border-gray-200 hover:bg-gray-50 " + (t.tone || "text-gray-700"))
+          }
+        >
+          {t.label}
+          {t.count !== undefined && <span className="ml-1.5 tabular-nums text-gray-400">{t.count}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 const DEFAULT_PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500, 1000];
 
 /** Shared list-pagination bar — page-size selector + Prev/Next — for any

@@ -183,6 +183,18 @@ class PhotoBatch(SQLModel, table=True):
     status: str = Field(default="pending")  # pending | processing | ready | uploading | upload_failed | syncing_drive | completed | failed
     current_stage: str = Field(default="")
 
+    # Phase A workflow-axis columns (migration 004, restored verbatim from
+    # the Main tree where they are already live in the shared production
+    # DB). Additive, alongside `status` — not a replacement for it. No
+    # current code reads/writes these yet; they exist so this worktree's
+    # schema matches production and later phases (A1 onward) have them
+    # available without a further migration.
+    source_type: str = Field(default="drive")  # drive | local
+    source_status: str = Field(default="PENDING")
+    local_status: str = Field(default="CREATED")
+    drive_status: str = Field(default="NOT_UPLOADED")
+    workflow_version: int = Field(default=1)  # 1 = legacy sequential path (this worktree's only path today)
+
     total_photos: int = 0
     processed_photos: int = 0
     faces_detected: int = 0
@@ -191,10 +203,11 @@ class PhotoBatch(SQLModel, table=True):
     consented_faces: int = 0
     not_consented_faces: int = 0  # includes unrecognized faces — see blur rule
     blurred_faces: int = 0
-    recognized_photos: int = 0  # >=1 recognized participant, no unknown faces
+    recognized_photos: int = 0  # photos containing >=1 identified participant (a photo count — not faces, not participants)
     ambience_photos: int = 0  # zero faces
-    review_photos: int = 0  # any unrecognized face present
-    failed_photos: int = 0  # threw during processing — skipped, batch continued
+    review_photos: int = 0  # LEGACY: written only by the removed Review workflow; always 0 for new batches, historical values kept
+    failed_photos: int = 0  # unresolved: threw AFTER acceptance (past ORIGINAL/) — retriable via retry-unresolved
+    rejected_photos: int = 0  # permanent: failed validation BEFORE reaching ORIGINAL/ — never retried, never blocks ready
     last_error: Optional[str] = None  # most recent per-photo failure message, for the Admin to see
     drive_failed_photos: int = 0  # processed fine locally, but the Drive upload failed/could not be verified
     drive_error: Optional[str] = None  # most recent Drive upload failure, shown separately from processing failures
@@ -202,6 +215,14 @@ class PhotoBatch(SQLModel, table=True):
     retention_days: int = 7  # 1-7, enforced at the API layer
     retention_start_at: datetime = Field(default_factory=datetime.now)
     delete_at: datetime = Field(default_factory=datetime.now)  # recomputed whenever retention_days changes
+
+    # Phase G4 — how long processing actually took, persisted so the figure
+    # survives a page refresh and a backend restart (the live ETA is
+    # in-memory only). Both cover the MOST RECENT processing run: a retry
+    # overwrites the start, so the reported duration is always the run the
+    # admin just watched, never one inflated by idle time between attempts.
+    processing_started_at: Optional[datetime] = None
+    processing_finished_at: Optional[datetime] = None
 
     created_at: datetime = Field(default_factory=datetime.now)
     created_by: Optional[str] = Field(default=None, foreign_key="user.id")
@@ -228,11 +249,25 @@ class PhotoBatchPhoto(SQLModel, table=True):
     media_drive_file_id: Optional[str] = None  # verified MEDIA copy in the batch's Drive folder
     drive_upload_status: str = Field(default="pending")  # pending | uploaded | failed
     drive_error: Optional[str] = None
-    classification: str = Field(default="pending")  # pending | ambience | sorted | review
+    classification: str = Field(default="pending")  # pending | ambience | sorted  ("review" appears only on legacy rows)
     faces_total: int = 0
     faces_matched: int = 0
     faces_unknown: int = 0
     processed_at: datetime = Field(default_factory=datetime.now)
+
+
+class PhotoBatchIngestionIssue(SQLModel, table=True):
+    """One row per source item rejected before it ever reached ORIGINAL/ —
+    a corrupt/unreadable file, for example. Permanent and never retried
+    (rejected_photos on PhotoBatch is the count; this is the per-item detail
+    a bare counter can't carry — filename + reason, never overwritten the
+    way a single last_error string would be)."""
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    batch_id: str = Field(foreign_key="photobatch.id", index=True)
+    filename: str
+    reason: str
+    occurred_at: datetime = Field(default_factory=datetime.now)
 
 
 class PhotoBatchParticipantFolder(SQLModel, table=True):
@@ -260,6 +295,79 @@ class PhotoBatchFace(SQLModel, table=True):
     bbox: str  # "x1,y1,x2,y2", original-image coordinates
     consent_status_at_processing: str = Field(default="unknown")  # consented | declined | unknown (no person match)
     blurred: bool = Field(default=False)
+    # Phase E1 — persistent reviewer override, NOT client state:
+    #   None  = no override, use the computed privacy decision
+    #   True  = reviewer force-hid an otherwise-visible face
+    #   False = reviewer explicitly confirmed this face visible
+    # A reviewer can never set False on a face whose identity+consent computes
+    # to mandatorily masked; that rule is enforced backend-side in Phase E2,
+    # never by trusting this column alone.
+    manual_mask: Optional[bool] = Field(default=None)
+
+    # Phase D1 — the detector's original box, frozen on the FIRST geometry
+    # edit (NULL = never edited, `bbox` is still the detector output). For a
+    # face whose privacy decision requires a mask, every later edit must still
+    # contain this region, so repeated edits can never shrink the mask below
+    # what the detector found.
+    detected_bbox: Optional[str] = Field(default=None)
+
+
+class PhotoBatchReviewItem(SQLModel, table=True):
+    """Phase E1 — the review QUEUE/workflow state for one photo.
+
+    Distinct from the REVIEW output archive: archive membership is DERIVED
+    from the mere existence of a row here (resolved or not), so resolving an
+    item corrects the archived copy's content but never removes the photo
+    from the archive. That is why no separate "ever required review" flag
+    exists — it would be second state that could drift from this table.
+
+    Only genuinely ambiguous cases belong here. An ordinary confident
+    unknown face is visible, is NOT review work, and must not block ready.
+    """
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    batch_id: str = Field(foreign_key="photobatch.id", index=True)
+    photo_id: str = Field(foreign_key="photobatchphoto.id", index=True)
+    # score_ambiguous | margin_ambiguous | tile_conflict | manual | artifact
+    reason: str
+    created_at: datetime = Field(default_factory=datetime.now)
+    resolved_at: Optional[datetime] = Field(default=None)
+    resolved_by: Optional[str] = Field(default=None, foreign_key="user.id")
+
+
+class PhotoBatchReviewDecision(SQLModel, table=True):
+    """Phase E1 — append-only audit log of every reviewer action.
+
+    Append-only, matching ConsentRecord's existing philosophy: nothing here
+    is ever updated or deleted. `outcome` distinguishes a decision that fully
+    landed (DB state AND regenerated artifacts) from an attempt whose
+    regeneration failed partway, so the audit trail can never claim an
+    assignment that never reached the delivered files.
+
+    consent_snapshot_at_decision locks the participant's effective consent at
+    the moment of the decision, so a later regeneration of the same photo
+    cannot silently produce a different privacy outcome because live consent
+    changed in between.
+    """
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    review_item_id: str = Field(foreign_key="photobatchreviewitem.id", index=True)
+    photo_id: str = Field(foreign_key="photobatchphoto.id", index=True)
+    face_id: Optional[str] = Field(default=None, foreign_key="photobatchface.id")
+    action: str  # assign | confirm_unknown | hide | unhide | skip
+    previous_person_id: Optional[str] = Field(default=None)
+    new_person_id: Optional[str] = Field(default=None)
+    previous_manual_mask: Optional[bool] = Field(default=None)
+    new_manual_mask: Optional[bool] = Field(default=None)
+    consent_snapshot_at_decision: Optional[str] = Field(default=None)
+    reviewer_id: Optional[str] = Field(default=None, foreign_key="user.id")
+    decided_at: datetime = Field(default_factory=datetime.now)
+    outcome: str = Field(default="applied")  # applied | failed
+
+
+# Phase F1 — EventIdentitySample (and EventIdentityCandidate) live in
+# app/models/identity_models.py on a SEPARATE metadata, so create_all() never
+# creates them; migration 010 does.
 
 
 class SchemaMigration(SQLModel, table=True):

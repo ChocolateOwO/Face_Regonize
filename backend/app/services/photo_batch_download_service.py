@@ -57,19 +57,32 @@ def local_output_ready(batch, storage: Path) -> bool:
     upload (manual, explicit) runs after "ready" and never affects local
     output, so download must stay available through all of its states, not
     just once it succeeds. "syncing_drive" is kept for backward compatibility
-    with the old automatic-mirror pipeline. Counters alone are insufficient:
-    they also advance for failed photos.
+    with the old automatic-mirror pipeline. "needs_retry" is deliberately
+    EXCLUDED: failed_photos>0 there means local output is not yet complete.
+
+    Compares against accepted_photos = total_photos - rejected_photos, not
+    total_photos: a batch with any rejected (permanently-excluded, never
+    retried) items legitimately finalizes fewer photos than were discovered,
+    and that must not be mistaken for incompleteness.
     """
     if batch.status not in {"ready", "uploading", "upload_failed", "syncing_drive", "completed", "failed"}:
         return False
     if batch.status == "failed" and not batch.drive_error:
         return False
-    if not (batch.total_photos > 0 and batch.processed_photos == batch.total_photos
-            and 0 <= batch.failed_photos < batch.total_photos):
+    accepted_photos = batch.total_photos - batch.rejected_photos
+    if not (accepted_photos > 0 and batch.processed_photos == accepted_photos and batch.failed_photos == 0):
         return False
     try:
         root = batch_output_root(batch, storage)
-        return all(_safe_path(root, root / name).is_dir() for name in ("SORTED", "MEDIA"))
+        if not all(_safe_path(root, root / name).is_dir() for name in ("SORTED", "MEDIA")):
+            return False
+        # Defense-in-depth: catches the counter under-reporting missing
+        # output (the historical 917/854 bug) — not exact equality, since a
+        # directory can legitimately carry unrelated/leftover files without
+        # that meaning any accepted photo's MEDIA output is actually missing.
+        media_dir = _safe_path(root, root / "MEDIA")
+        media_count = sum(1 for p in media_dir.iterdir() if p.is_file())
+        return media_count >= accepted_photos
     except (OSError, ValueError):
         return False
 
@@ -79,7 +92,7 @@ def output_manifest(batch, photos, storage: Path) -> tuple[Path, list[Path]]:
         raise DownloadNotReady("Local processing is incomplete or output is unavailable.")
     root = batch_output_root(batch, storage)
     completed = [p for p in photos if p.media_path]
-    if len(completed) != batch.total_photos - batch.failed_photos:
+    if len(completed) != batch.total_photos - batch.rejected_photos - batch.failed_photos:
         raise DownloadNotReady("Completed local photo records are incomplete.")
     names = set()
     storage_relative = batch.storage_dir.replace("\\", "/")
@@ -123,18 +136,22 @@ def output_manifest(batch, photos, storage: Path) -> tuple[Path, list[Path]]:
     return root, files
 
 
-def build_output_zip(root: Path, files: list[Path]) -> Path:
+def build_output_zip(root: Path, files: list[Path], *, folders: list[str] | None = None) -> Path:
     """ZIP_STORED avoids recompressing images. Bounded RAM; temp outside storage.
 
     No processing lock is acquired. Deletion/expiry races fail the download;
     they never change or cancel the processing worker.
+
+    `folders=None` (the legacy full ZIP) writes a top-level entry for every
+    existing output folder, exactly as before. Phase O passes the folders that
+    actually hold selected files, so a MEDIA-only download has no empty SORTED/.
     """
     fd, name = tempfile.mkstemp(prefix="reconize-download-", suffix=".zip")
     os.close(fd)
     archive = Path(name)
     try:
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zip_file:
-            for output in OUTPUTS:
+            for output in (OUTPUTS if folders is None else folders):
                 if (root / output).is_dir():
                     zip_file.writestr(output + "/", b"")
             for file in files:

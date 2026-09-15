@@ -1,7 +1,7 @@
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { fileUrl } from "../api/client";
-import { Badge, Card, EmptyState, PageHeader, Spinner } from "../components/ui";
+import { Badge, Card, EmptyState, PageHeader, Pagination, Spinner } from "../components/ui";
 import { useLiveEvents } from "../hooks/useLiveEvents";
 import { useCachedGet } from "../hooks/useCachedGet";
 
@@ -18,8 +18,24 @@ interface Attendee {
   status: "in_event" | "not_detected";
 }
 
+interface AttendeePage {
+  items: Attendee[];
+  total: number;
+  page: number;
+  page_size: number;
+  in_event: number;
+}
+
 export default function Attendees() {
-  const { data: attendees, refresh: load } = useCachedGet<Attendee[]>("/api/attendees");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  // Phase I3 — one server-side page; the "detected" count comes from the
+  // server over everyone, not from the rows currently on screen.
+  const { data, refresh: load } = useCachedGet<AttendeePage>(`/api/attendees?page=${page}&page_size=${pageSize}`);
+
+  useEffect(() => {
+    if (data && data.items.length === 0 && page > 1) setPage((p) => p - 1);
+  }, [data, page]);
 
   // This whole page IS an attendance summary — any detection anywhere
   // (kiosk, CCTV, mobile) can flip someone from "Not Detected" to
@@ -32,16 +48,15 @@ export default function Attendees() {
     refreshTimerRef.current = window.setTimeout(load, 400);
   });
 
-  if (!attendees) return <Spinner label="Loading attendees..." />;
-
-  const inEvent = attendees.filter((a) => a.status === "in_event").length;
+  if (!data) return <Spinner label="Loading attendees..." />;
+  const attendees = data.items;
 
   return (
     <div>
-      <PageHeader title="Attendees" subtitle={`${inEvent} of ${attendees.length} registered participants detected at the event.`} />
+      <PageHeader title="Attendees" subtitle={`${data.in_event} of ${data.total} registered participants detected at the event.`} />
 
       <Card className="p-0 overflow-hidden">
-        {attendees.length === 0 ? (
+        {data.total === 0 ? (
           <EmptyState>No participants registered yet.</EmptyState>
         ) : (
           <table className="w-full text-sm">
@@ -76,6 +91,18 @@ export default function Attendees() {
               ))}
             </tbody>
           </table>
+        )}
+        {data.total > 0 && (
+          <Pagination
+            page={page}
+            pageSize={pageSize}
+            total={data.total}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+          />
         )}
       </Card>
     </div>

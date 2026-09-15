@@ -1,8 +1,31 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { apiDelete, apiGet, fileUrl } from "../api/client";
-import { Badge, Button, Card, EmptyState, PageHeader, Spinner } from "../components/ui";
+import { apiDelete, apiGet, apiPostJson, fileUrl } from "../api/client";
+import {
+  Badge,
+  Button,
+  Card,
+  ConsentBadge,
+  ConsentSourceLabel,
+  EmptyState,
+  PageHeader,
+  Spinner,
+} from "../components/ui";
 import { useLiveEvents } from "../hooks/useLiveEvents";
+
+interface ConsentHistoryItem {
+  choice: "consented" | "declined";
+  source: "kiosk" | "admin" | "registration";
+  recorded_at: string;
+}
+
+interface ConsentData {
+  person_id: string;
+  status: "consented" | "declined" | "pending";
+  last_updated: string | null;
+  source: string | null;
+  history: ConsentHistoryItem[];
+}
 
 interface PersonDetailData {
   id: string;
@@ -27,15 +50,40 @@ export default function PersonDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [data, setData] = useState<PersonDetailData | null>(null);
+  // Consent lives on this page now — a participant and their PDPA answer are
+  // one thing, and having to visit a second page to see whether someone's
+  // photos get masked was the confusing part. The endpoints are the existing
+  // ones, unchanged: ConsentRecord stays append-only and the semantics of an
+  // admin override are exactly what the PDPA page already recorded.
+  const [consent, setConsent] = useState<ConsentData | null>(null);
+  const [savingConsent, setSavingConsent] = useState(false);
 
   function load() {
     if (id) apiGet(`/api/people/${id}`).then(setData);
   }
 
+  function loadConsent() {
+    if (id) apiGet(`/api/pdpa/status/${id}`).then(setConsent);
+  }
+
   useEffect(() => {
     load();
+    loadConsent();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  async function setConsentChoice(choice: "consented" | "declined") {
+    if (!id || !data) return;
+    const label = choice === "consented" ? "CONSENTED" : "NOT CONSENTED";
+    if (!confirm(`Set ${data.first_name}'s consent status to ${label}? This will be recorded as an admin override.`)) return;
+    setSavingConsent(true);
+    try {
+      await apiPostJson("/api/pdpa/record", { person_ids: [id], choice, source: "admin" });
+      loadConsent();
+    } finally {
+      setSavingConsent(false);
+    }
+  }
 
   // Refetch when THIS specific person is detected again anywhere (kiosk,
   // CCTV, mobile) — their Attendance Summary/history changes live, without
@@ -65,7 +113,8 @@ export default function PersonDetail() {
         title={`${data.first_name} ${data.last_name}`}
         subtitle={`Participant ID: ${data.participant_id}`}
         action={
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
+            {consent && <ConsentBadge status={consent.status} />}
             <Link to="/people">
               <Button variant="secondary">Back to People</Button>
             </Link>
@@ -138,6 +187,86 @@ export default function PersonDetail() {
           )}
         </Card>
       </div>
+
+      <Card className="mt-4">
+        <div className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
+          <h2 className="font-semibold text-gray-900">PDPA Consent</h2>
+          <Link to="/pdpa" className="text-xs text-indigo-600 hover:underline">
+            All participants' consent →
+          </Link>
+        </div>
+
+        {!consent ? (
+          <Spinner label="Loading consent..." />
+        ) : (
+          <div className="grid md:grid-cols-2 gap-6">
+            <div>
+              <div className="flex items-center gap-3 flex-wrap">
+                <ConsentBadge status={consent.status} />
+                <span className="text-xs">
+                  <ConsentSourceLabel source={consent.source} />
+                </span>
+              </div>
+              {consent.last_updated && (
+                <div className="text-xs text-gray-400 mt-2">
+                  Last updated {new Date(consent.last_updated).toLocaleString()}
+                </div>
+              )}
+              {consent.status === "declined" && (
+                <p className="text-xs text-red-700 bg-red-50 border border-red-100 rounded-lg px-3 py-2 mt-3">
+                  This participant's face is masked in every delivered event photo.
+                </p>
+              )}
+
+              <div className="mt-4 pt-4 border-t border-gray-100">
+                <div className="text-xs text-gray-500 mb-2">Admin override</div>
+                <div className="flex gap-2">
+                  <button
+                    disabled={savingConsent}
+                    onClick={() => setConsentChoice("consented")}
+                    className="px-4 py-2 rounded-lg text-sm font-medium border border-green-200 text-green-700 hover:bg-green-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Set CONSENTED
+                  </button>
+                  <button
+                    disabled={savingConsent}
+                    onClick={() => setConsentChoice("declined")}
+                    className="px-4 py-2 rounded-lg text-sm font-medium border border-red-200 text-red-700 hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Set NOT CONSENTED
+                  </button>
+                </div>
+                <p className="text-xs text-gray-400 mt-2">
+                  Recorded in history as an admin-set entry, distinct from the participant's own kiosk choices.
+                  Photos already delivered keep the consent that applied when they were processed.
+                </p>
+              </div>
+            </div>
+
+            <div>
+              <h3 className="font-medium text-gray-900 mb-2 text-sm">Consent History</h3>
+              {consent.history.length === 0 ? (
+                <p className="text-sm text-gray-400">
+                  No consent actions recorded yet — status is pending until this participant answers at
+                  registration or the kiosk.
+                </p>
+              ) : (
+                <div className="divide-y divide-gray-100">
+                  {consent.history.map((h, i) => (
+                    <div key={i} className="py-2.5 flex items-center justify-between text-sm">
+                      <span className="text-gray-500">
+                        {new Date(h.recorded_at).toLocaleString()}
+                        <span className="text-xs text-gray-400 ml-2">via {h.source}</span>
+                      </span>
+                      <ConsentBadge status={h.choice} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </Card>
     </div>
   );
 }

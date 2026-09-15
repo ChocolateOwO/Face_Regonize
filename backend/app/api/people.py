@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
 from app.auth.deps import get_current_user
@@ -12,6 +12,7 @@ from app.face_recognition.engine import detect_faces
 from app.face_recognition.enrollment import EnrollmentFaceError, select_primary_enrollment_face
 from app.face_recognition.index import recognition_index
 from app.services.index_sync import apply_index_change
+from app.services.import_service import bump_high_water_if_greater, next_auto_id_start
 from app.models.models import Attendance, ConsentRecord, FaceDetection, Person, User
 from app.services import storage_service
 
@@ -43,8 +44,42 @@ def _person_out(session: Session, p: Person, summary: tuple[int, datetime | None
     }
 
 
+def _normalize_page(page: int, page_size: int) -> tuple[int, int]:
+    from app.api.uploads import ALLOWED_PAGE_SIZES, DEFAULT_PAGE_SIZE
+
+    return max(1, int(page)), (page_size if page_size in ALLOWED_PAGE_SIZES else DEFAULT_PAGE_SIZE)
+
+
 @router.get("")
-def list_people(q: str | None = None, session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+def list_people(q: str | None = None, page: int | None = None, page_size: int = 50,
+                session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    """Phase I1 — with `page`, a real SQL page in the Uploads envelope
+    {items,total,page,page_size}: search, count, offset and limit all run in
+    the database, and detection summaries are computed for that page only.
+    Without `page` the bare list is returned exactly as before, so any caller
+    not yet migrated keeps working."""
+    if page is not None:
+        page, page_size = _normalize_page(page, page_size)
+        stmt = select(Person)
+        if q:
+            like = f"%{q.strip().lower()}%"
+            stmt = stmt.where(or_(
+                func.lower(Person.first_name).like(like), func.lower(Person.last_name).like(like),
+                func.lower(Person.participant_id).like(like), func.lower(func.coalesce(Person.email, "")).like(like),
+            ))
+        total = session.exec(select(func.count()).select_from(stmt.subquery())).one()
+        rows = session.exec(stmt.order_by(Person.created_at, Person.id)
+                            .offset((page - 1) * page_size).limit(page_size)).all()
+        ids = [p.id for p in rows]
+        summary_rows = session.exec(
+            select(Attendance.person_id, func.count(Attendance.id), func.min(Attendance.detected_at),
+                   func.max(Attendance.detected_at))
+            .where(Attendance.person_id.in_(ids)).group_by(Attendance.person_id)
+        ).all() if ids else []
+        summaries = {person_id: (count, first, last) for person_id, count, first, last in summary_rows}
+        return {"items": [_person_out(session, p, summaries.get(p.id, (0, None, None))) for p in rows],
+                "total": total, "page": page, "page_size": page_size}
+
     stmt = select(Person)
     people = session.exec(stmt).all()
     if q:
@@ -57,6 +92,15 @@ def list_people(q: str | None = None, session: Session = Depends(get_session), u
     summary_rows = session.exec(select(Attendance.person_id, func.count(Attendance.id), func.min(Attendance.detected_at), func.max(Attendance.detected_at)).group_by(Attendance.person_id)).all()
     summaries = {person_id: (count, first, last) for person_id, count, first, last in summary_rows}
     return [_person_out(session, p, summaries.get(p.id, (0, None, None))) for p in people]
+
+
+@router.get("/next-id")
+def next_participant_id(session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    """Read-only preview for the Add-Person form (Phase L1) — does NOT
+    itself reserve or consume a number, so showing this and then not
+    creating a person never wastes one. MUST be registered before
+    /{person_id} below, or FastAPI would match "next-id" as a person_id."""
+    return {"next_id": f"{next_auto_id_start(session):04d}"}
 
 
 @router.get("/{person_id}")
@@ -125,6 +169,11 @@ def create_person(
     session.add(person)
     session.commit()
     session.refresh(person)
+    # Advances the persistent participant-ID high-water mark (Phase L1) if
+    # this numeric ID is above the current one — a manually-typed high
+    # custom ID must still push the auto-counter forward so a later blank-
+    # field Add-Person never collides with it.
+    bump_high_water_if_greater(session, person.participant_id)
     # DB is already committed; if the index update fails, rebuild it from the
     # committed rows so RAM cannot silently disagree with the database.
     apply_index_change(session, lambda: recognition_index.upsert(person), what="create participant")
@@ -189,6 +238,8 @@ def delete_all_people(session: Session = Depends(get_session), user: User = Depe
     for d in session.exec(select(FaceDetection)).all():
         if d.person_id:
             session.delete(d)
+    from app.services import identity_candidate_service
+    identity_candidate_service.forget_person(session, None)
     for p in people:
         session.delete(p)
     session.commit()
@@ -205,6 +256,8 @@ def delete_person(person_id: str, session: Session = Depends(get_session), user:
     session.exec(select(FaceDetection).where(FaceDetection.person_id == person_id))
     for a in session.exec(select(Attendance).where(Attendance.person_id == person_id)).all():
         session.delete(a)
+    from app.services import identity_candidate_service
+    identity_candidate_service.forget_person(session, person_id)
     session.delete(p)
     session.commit()
     apply_index_change(session, lambda: recognition_index.remove(person_id), what="delete participant")

@@ -1,12 +1,16 @@
 import { useState } from "react";
 import { API_BASE, ApiError } from "../api/client";
+import { type ExportSelectionValue, selectionIsEmpty, selectionQuery } from "./ExportSelectionPanel";
 import { Button } from "./ui";
 
 type FileWriter = { write: (chunk: Uint8Array) => Promise<void>; close: () => Promise<void>; abort: () => Promise<void> };
 type SavePicker = (options: { suggestedName: string }) => Promise<{ createWritable: () => Promise<FileWriter> }>;
 
-export default function PhotoBatchDownload({ id, ready, status, stopping = false }: {
-  id: string; ready?: boolean; status: string; stopping?: boolean;
+/** Without `selection`: the full ZIP exactly as before (a historical batch
+ *  keeps its REVIEW/ folder). With `selection` (Phase O): only the chosen
+ *  MEDIA / People / AMBIENCE outputs. */
+export default function PhotoBatchDownload({ id, ready, status, stopping = false, selection }: {
+  id: string; ready?: boolean; status: string; stopping?: boolean; selection?: ExportSelectionValue;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -23,7 +27,8 @@ export default function PhotoBatchDownload({ id, ready, status, stopping = false
       const picker = (window as unknown as { showSaveFilePicker?: SavePicker }).showSaveFilePicker;
       const target = picker ? await picker.call(window, { suggestedName: filename }) : undefined;
       const token = localStorage.getItem("token");
-      const response = await fetch(`${API_BASE}/api/photo-batches/${id}/download`, {
+      const query = selection ? `?${selectionQuery(selection)}` : "";
+      const response = await fetch(`${API_BASE}/api/photo-batches/${id}/download${query}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: controller.signal,
       });
       if (!response.ok) {
@@ -68,10 +73,13 @@ export default function PhotoBatchDownload({ id, ready, status, stopping = false
   }
 
   const blocked = stopping || ["pending", "processing", "stopping", "deleting", "cancelled"].includes(status);
+  const empty = !!selection && selectionIsEmpty(selection);
   return <span className="inline-flex flex-col items-start gap-1"
-    title="Download local SORTED, REVIEW and MEDIA. Available regardless of Google Drive upload status.">
-    <Button variant="secondary" disabled={!ready || blocked || busy} onClick={download}>
-      {busy ? "Preparing download..." : status === "processing" || status === "pending" ? "Processing..." : "Download ZIP"}
+    title={selection
+      ? "Download the selected outputs. Available regardless of Google Drive upload status."
+      : "Download local SORTED, REVIEW and MEDIA. Available regardless of Google Drive upload status."}>
+    <Button variant="secondary" disabled={!ready || blocked || busy || empty} onClick={download}>
+      {busy ? "Preparing download..." : status === "processing" || status === "pending" ? "Processing..." : selection ? "Download Selected" : "Download ZIP"}
     </Button>
     {error && <span role="alert" className="text-xs text-red-600 max-w-xs text-left">{error}</span>}
   </span>;

@@ -16,6 +16,7 @@ never used their output.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import cv2
@@ -37,11 +38,38 @@ logger = logging.getLogger(__name__)
 _face_app: FaceAnalysis | None = None
 MODEL_NAME = "buffalo_l"
 
+# Phase G2 — process-wide inference arbiter. Wraps every direct call into
+# the ONE shared FaceAnalysis session (det_model.detect()/
+# models["recognition"].get()), whether from detect_faces() below (kiosk/
+# enrollment) or from event_photo_detection_service.py's tiled scan (Event
+# Auto mode) — both acquire this SAME lock object. Concurrent calls into
+# one loaded ONNX session are undocumented-behavior territory; this makes
+# that actually safe instead of accidentally-usually-fine. An Event batch
+# running under an EXPLICITLY selected dedicated device (Phase G3) would
+# build its own separate FaceAnalysis instance and never touch this lock —
+# nothing else uses that session, so nothing else needs to wait for it.
+inference_lock = threading.Lock()
+
 
 def get_face_app() -> FaceAnalysis:
     global _face_app
     if _face_app is None:
+        # One process-wide verification decides the provider (see
+        # hardware_info_service.verified_providers): TensorRT is skipped when
+        # its runtime is absent, and CUDA is only requested once a real session
+        # has proved it initialises — so this session uses exactly the provider
+        # /hardware-info reports, and the first Event batch re-probes nothing.
+        from app.services.hardware_info_service import verified_providers
+
         try:
+            usable = verified_providers()
+        except Exception:  # noqa: BLE001 — verification must never block startup
+            logger.info("Provider verification unavailable; trying CUDA, then CPU", exc_info=True)
+            usable = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+        try:
+            if "CUDAExecutionProvider" not in usable:
+                raise RuntimeError("CUDAExecutionProvider is not usable on this machine")
             app = FaceAnalysis(
                 name=MODEL_NAME,
                 providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
@@ -108,21 +136,22 @@ def detect_faces(image_bgr: np.ndarray, timings: dict | None = None) -> list[Det
     rather than reported as its own stage."""
     app = get_face_app()
 
-    t0 = time.perf_counter()
-    bboxes, kpss = app.det_model.detect(image_bgr, max_num=0, metric="default")
-    t_detect = time.perf_counter()
+    with inference_lock:
+        t0 = time.perf_counter()
+        bboxes, kpss = app.det_model.detect(image_bgr, max_num=0, metric="default")
+        t_detect = time.perf_counter()
 
-    faces: list[Face] = []
-    for i in range(bboxes.shape[0]):
-        bbox = bboxes[i, 0:4]
-        det_score = bboxes[i, 4]
-        kps = kpss[i] if kpss is not None else None
-        faces.append(Face(bbox=bbox, kps=kps, det_score=det_score))
+        faces: list[Face] = []
+        for i in range(bboxes.shape[0]):
+            bbox = bboxes[i, 0:4]
+            det_score = bboxes[i, 4]
+            kps = kpss[i] if kpss is not None else None
+            faces.append(Face(bbox=bbox, kps=kps, det_score=det_score))
 
-    rec_model = app.models["recognition"]
-    for face in faces:
-        rec_model.get(image_bgr, face)
-    t_embed = time.perf_counter()
+        rec_model = app.models["recognition"]
+        for face in faces:
+            rec_model.get(image_bgr, face)
+        t_embed = time.perf_counter()
 
     if timings is not None:
         timings["detection_ms"] = (t_detect - t0) * 1000

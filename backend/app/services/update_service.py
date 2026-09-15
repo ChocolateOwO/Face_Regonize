@@ -419,6 +419,57 @@ def _free_bytes(path: Path) -> int:
     return usage.free
 
 
+def refuse_if_event_work_in_flight() -> None:
+    """Phase P1 — refuse an update while Event Photo work is still running.
+
+    Three independent sources are consulted, because none of them alone sees
+    all in-flight work:
+      1. the batch's persisted status — covers pending/processing, and
+         uploading (a Drive upload mid-flight must not be cut off by the
+         restart an update performs; the same states retention refuses to
+         delete).
+      2. PipelineRegistry — authoritative for "are worker threads still
+         touching this batch's files RIGHT NOW". A workflow_version=2 batch
+         can have committed a terminal status while its pipeline threads are
+         still finishing, which the DB row cannot show.
+      3. the Drive upload reservation guard — held for the duration of an
+         upload, independent of the row's status.
+
+    Separate from preflight() so it is directly testable: preflight() runs a
+    long chain of git/GitHub/disk checks first, and this gate is the one thing
+    Phase P1 actually adds.
+    """
+    from app.services import drive_destination_service
+    from app.services.event_pipeline_registry import registry as pipeline_registry
+
+    with Session(engine) as session:
+        busy = session.exec(
+            select(PhotoBatch).where(
+                PhotoBatch.status.in_(("pending", "processing", "uploading"))  # type: ignore[attr-defined]
+            )
+        ).first()
+    if busy:
+        raise UpdateError(
+            f"Photo batch '{busy.label}' is still {busy.status}. Wait for it to finish before updating."
+        )
+
+    active_ids = pipeline_registry.active_batch_ids()
+    if active_ids:
+        raise UpdateError(
+            "Event Photo processing is still running for batch(es): "
+            + ", ".join(active_ids[:5])
+            + ". Wait for it to finish before updating."
+        )
+
+    uploading = sorted(drive_destination_service._uploading_batches)
+    if uploading:
+        raise UpdateError(
+            "A Google Drive upload is still running for batch(es): "
+            + ", ".join(uploading[:5])
+            + ". Wait for it to finish before updating."
+        )
+
+
 def preflight(target_tag: str | None = None, allow_downgrade: bool = False) -> dict:
     """Every check that must pass before anything is touched. Raises
     UpdateError with an admin-readable reason on the first failure."""
@@ -472,14 +523,7 @@ def preflight(target_tag: str | None = None, allow_downgrade: bool = False) -> d
         )
     checks.append("working tree clean")
 
-    with Session(engine) as session:
-        busy = session.exec(
-            select(PhotoBatch).where(PhotoBatch.status.in_(("pending", "processing")))  # type: ignore[attr-defined]
-        ).first()
-    if busy:
-        raise UpdateError(
-            f"Photo batch '{busy.label}' is still {busy.status}. Wait for it to finish before updating."
-        )
+    refuse_if_event_work_in_flight()
     checks.append("no photo batch in progress")
 
     try:

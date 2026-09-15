@@ -119,8 +119,11 @@ class ValidateDestinationTests(unittest.TestCase):
     expands scope, never leaks credentials."""
 
     def setUp(self):
-        self.ns = dict(DriveOAuthError=type("DriveOAuthError", (Exception,), {}))
-        load_from_source("app/services/drive_destination_service.py", {"DriveDestinationError", "validate_destination"}, self.ns)
+        self.ns = dict(DriveOAuthError=type("DriveOAuthError", (Exception,), {}), re=__import__("re"))
+        # Follow-up Task 1 — validation now explains Drive errors specifically.
+        load_from_source("app/services/drive_destination_service.py",
+                         {"DriveDestinationError", "PickerGrantRequired", "validate_destination", "NOT_GRANTED_MESSAGE", "EXPIRED_MESSAGE", "NOT_CONNECTED_MESSAGE", "VIEW_ONLY_MESSAGE", "_SECRET_RE", "_redact", "_http_status", "explain_drive_error",
+                          "_RAW_ID_RE", "_FOLDER_MIME", "_SHORTCUT_MIME", "_META_FIELDS", "_drive_folder_url", "_get_meta"}, self.ns)
         self.validate = self.ns["validate_destination"]
         self.Error = self.ns["DriveDestinationError"]
 
@@ -138,7 +141,7 @@ class ValidateDestinationTests(unittest.TestCase):
             def __init__(self, meta, error):
                 self._meta, self._error = meta, error
 
-            def get(self, fileId, fields):  # noqa: A002 - matches google-api-python-client's kwarg name
+            def get(self, fileId, fields, **kwargs):  # noqa: A002 - matches google-api-python-client's kwarg name
                 return FakeGet(self._meta, self._error)
 
         class FakeService:
@@ -160,7 +163,8 @@ class ValidateDestinationTests(unittest.TestCase):
             "id": "F1", "name": "Client Delivery", "mimeType": "application/vnd.google-apps.folder",
             "trashed": False, "capabilities": {"canAddChildren": True},
         })
-        self.assertEqual(self.validate("F1"), {"folder_id": "F1", "folder_name": "Client Delivery", "can_upload": True})
+        self.assertEqual(self.validate("F1"), {"folder_id": "F1", "folder_name": "Client Delivery", "can_upload": True,
+                                               "folder_url": "https://drive.google.com/drive/folders/F1"})
 
     def test_inaccessible_folder_returns_clear_error(self):
         self._install_service(get_error=Exception("404 File not found: F1"))
@@ -195,7 +199,7 @@ class ValidateDestinationTests(unittest.TestCase):
             "capabilities": {"canAddChildren": True}, "refreshToken": "should-never-leak",
         })
         result = self.validate("F1")
-        self.assertEqual(set(result), {"folder_id", "folder_name", "can_upload"})
+        self.assertEqual(set(result), {"folder_id", "folder_name", "can_upload", "folder_url"})
 
 
 class UploadFlowTests(unittest.TestCase):
@@ -229,33 +233,26 @@ class UploadFlowTests(unittest.TestCase):
             session.commit()
             session.refresh(self.batch)
 
+        from tests.test_drive_upload_flows import FakeDrive, folder_meta
+
+        self.dest = "1AbCdEfGhIjKlMnOpQrStUvWxYz0"
+        self.drive = FakeDrive({self.dest: folder_meta(self.dest, "Dest")})
         self.uploaded: list[tuple[str, str, bytes]] = []
-        self.folders_created: list[tuple[str, str, str]] = []
         self.fail_on_upload_number = None
 
-        def fake_create_subfolder(parent_id, name):
-            self.folders_created.append(("root", parent_id, name))
-            return f"run-root::{name}"
-
-        def fake_get_or_create_subfolder(parent_id, name):
-            self.folders_created.append(("sub", parent_id, name))
-            return f"{parent_id}::{name}"
-
-        def fake_upload_bytes(parent_id, filename, data, mime_type):
+        def fake_upload_file(service, parent_id, name, data, mime_type, props):
             if self.fail_on_upload_number and len(self.uploaded) + 1 == self.fail_on_upload_number:
                 raise RuntimeError("simulated Drive failure")
-            self.uploaded.append((parent_id, filename, data))
-            return f"file-{len(self.uploaded)}"
+            self.uploaded.append((parent_id, name, data))
+            return self.drive.add_item(name, parent_id, props)
 
         self.ns = dict(
             Session=Session, engine=self.engine, PhotoBatch=PhotoBatch, STORAGE_PATH=self.storage,
             mimetypes=mimetypes, threading=threading, datetime=datetime, Path=Path, dataclass=dataclass,
             re=__import__("re"), urlparse=urlparse, logging=logging, logger=logging.getLogger("isolated-drive-destination"),
             DriveOAuthError=type("DriveOAuthError", (Exception,), {}),
-            create_subfolder=fake_create_subfolder,
-            get_or_create_subfolder=fake_get_or_create_subfolder,
-            upload_bytes=fake_upload_bytes,
-            get_write_service=lambda: None,
+            hashlib=__import__("hashlib"), io=__import__("io"), json=__import__("json"),
+            get_write_service=lambda: self.drive,
             _safe_path=download._safe_path,
             batch_output_root=download.batch_output_root,
             local_output_ready=download.local_output_ready,
@@ -263,13 +260,21 @@ class UploadFlowTests(unittest.TestCase):
         load_from_source(
             "app/services/drive_destination_service.py",
             {
-                "DriveDestinationError", "_FOLDER_PATH_RE", "_RAW_ID_RE", "_ALLOWED_HOSTS",
+                "DriveDestinationError", "PickerGrantRequired", "_FOLDER_PATH_RE", "_RAW_ID_RE", "_ALLOWED_HOSTS",
                 "parse_destination_folder_url", "_UploadFile", "_iter_upload_files",
                 "_upload_lock", "_uploading_batches", "reserve_upload", "_release_upload",
                 "_fail", "_run_upload", "run_drive_upload",
+                # Follow-up Task 1 — upload failures are explained specifically.
+                "NOT_GRANTED_MESSAGE", "EXPIRED_MESSAGE", "NOT_CONNECTED_MESSAGE", "VIEW_ONLY_MESSAGE", "_SECRET_RE", "_redact", "_http_status", "explain_drive_error",
+                # Revalidation before every upload.
+                "validate_destination", "_FOLDER_MIME", "_SHORTCUT_MIME", "_META_FIELDS", "_drive_folder_url", "_get_meta",
+                # Idempotent upload/retry: stable key, Drive lookup, local manifest.
+                "_UPLOAD_KEY_PROP", "_BATCH_PROP", "_STATE_DIRNAME", "upload_key", "_state_path", "_load_state",
+                "_save_state", "_escape_query_value", "_find_by_key", "_still_in_place", "_ensure_subfolder",
             },
             self.ns,
         )
+        self.ns["_upload_file"] = fake_upload_file
 
     def current(self):
         with Session(self.engine) as session:
@@ -295,7 +300,7 @@ class UploadFlowTests(unittest.TestCase):
         self.assertNotIn(b"logo-should-never-upload", uploaded_bytes)
         batch = self.current()
         self.assertEqual(batch.status, "completed")
-        self.assertTrue(batch.processed_folder_id.startswith("run-root::"))
+        self.assertEqual(batch.processed_folder_id, "1AbCdEfGhIjKlMnOpQrStUvWxYz0")
 
     def test_media_only(self):
         self.ns["run_drive_upload"](self.batch.id, "1AbCdEfGhIjKlMnOpQrStUvWxYz0", False, True)
@@ -309,9 +314,10 @@ class UploadFlowTests(unittest.TestCase):
 
     def test_destination_folder_becomes_parent(self):
         self.ns["run_drive_upload"](self.batch.id, "https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz0", True, True)
-        roots = [c for c in self.folders_created if c[0] == "root"]
-        self.assertEqual(len(roots), 1)
-        self.assertEqual(roots[0][1], "1AbCdEfGhIjKlMnOpQrStUvWxYz0")
+        # Directly inside the selected folder: no extra top-level folder.
+        folders = [i for i in self.drive.items.values() if i["mimeType"] == "application/vnd.google-apps.folder"]
+        self.assertEqual({p for f in folders for p in f["parents"]}, {self.dest})
+        self.assertEqual({f["name"] for f in folders}, {"MEDIA", "0001_Jane_Doe"})
 
     def test_not_ready_batch_rejected_before_any_upload(self):
         with Session(self.engine) as session:
@@ -328,14 +334,15 @@ class UploadFlowTests(unittest.TestCase):
             self.ns["_run_upload"](self.batch.id, "1AbCdEfGhIjKlMnOpQrStUvWxYz0", False, False)
 
     def test_failure_preserves_local_files_and_marks_upload_failed(self):
-        before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        outputs = lambda: {p: p.read_bytes() for p in self.root.rglob("*")  # noqa: E731
+                           if p.is_file() and "DRIVE_UPLOAD" not in p.parts}
+        before = outputs()
         self.fail_on_upload_number = 2
         self.ns["run_drive_upload"](self.batch.id, "1AbCdEfGhIjKlMnOpQrStUvWxYz0", True, True)
         batch = self.current()
         self.assertEqual(batch.status, "upload_failed")
         self.assertIn("simulated Drive failure", batch.drive_error)
-        after = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
-        self.assertEqual(before, after)
+        self.assertEqual(before, outputs())
         self.assertTrue(download.local_output_ready(batch, self.storage))  # download still works
 
     def test_retry_after_failure_restarts_from_same_local_output(self):
@@ -346,7 +353,9 @@ class UploadFlowTests(unittest.TestCase):
         self.uploaded.clear()
         self.ns["run_drive_upload"](self.batch.id, "1AbCdEfGhIjKlMnOpQrStUvWxYz0", True, True)
         self.assertEqual(self.current().status, "completed")
-        self.assertEqual(len(self.uploaded), 3)  # a full fresh mirror, no reprocessing, no partial resume needed
+        # Only what never landed is uploaded again: the file that already
+        # reached Drive before the failure is reconciled, not copied twice.
+        self.assertEqual(len(self.uploaded), 2)
 
     def test_duplicate_concurrent_upload_rejected(self):
         reserve, release = self.ns["reserve_upload"], self.ns["_release_upload"]
@@ -426,7 +435,7 @@ class ApiEndpointTests(unittest.TestCase):
             self.reserved.add(batch_id)
             return True
 
-        def fake_run_drive_upload(batch_id, folder_url, upload_people, upload_media):
+        def fake_run_drive_upload(batch_id, folder_url, upload_people, upload_media, *_selection):
             self.upload_calls.append((batch_id, folder_url, upload_people, upload_media))
 
         def get_session():
@@ -444,10 +453,22 @@ class ApiEndpointTests(unittest.TestCase):
             STORAGE_PATH=self.storage, _cancelled=lambda _id: False,
             local_output_ready=download.local_output_ready,
             DriveDestinationError=DriveDestinationError,
+            # A never-granted pasted folder is answered with the Picker-grant
+            # state instead of an error, so the route needs both names.
+            PickerGrantRequired=type("PickerGrantRequired", (DriveDestinationError,), {}),
+            PICKER_GRANT_PROMPT="Google requires one confirmation before Reconize can upload to this folder.",
             parse_destination_folder_url=fake_parse,
+            # Phase H — the routes resolve a URL or a Picker folder id first.
+            resolve_folder_ref=lambda url, fid=None: fid if fid else fake_parse(url or ""),
             validate_destination=fake_validate,
             reserve_upload=fake_reserve,
+            # Phase D1 — the route reserves through the edit/activity lock;
+            # the fake keeps this test's reservation semantics.
+            batch_edit_lock=SimpleNamespace(try_reserve_upload=fake_reserve),
             run_drive_upload=fake_run_drive_upload,
+            # Phase O — the shared ExportSelection (real module).
+            export_selection_service=__import__('app.services.export_selection_service',
+                                                fromlist=['sorted_folder_names']),
             DriveDestinationValidateBody=DriveDestinationValidateBody,
             DriveUploadBody=DriveUploadBody,
         )
@@ -566,8 +587,8 @@ class AutomaticSyncRemovedTests(unittest.TestCase):
     def setUp(self):
         source = (BACKEND / "app/services/photo_processing_service.py").read_text(encoding="utf-8")
         self.source = source
-        tree = ast.parse(source)
-        self.run_batch = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_run_photo_batch")
+        self.tree = ast.parse(source)
+        self.run_batch = next(n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef) and n.name == "_run_photo_batch")
 
     def test_never_calls_sync_or_finish_automatically(self):
         calls = {
@@ -578,13 +599,28 @@ class AutomaticSyncRemovedTests(unittest.TestCase):
         self.assertNotIn("_finish_batch", calls)
 
     def test_sets_ready_status_on_completion(self):
+        # Phase B extracted the phase-end status decision into
+        # _finalize_batch_status(), shared verbatim by the sequential path
+        # AND the pipeline path — so the "ready" assignment itself now
+        # lives there, not inline in _run_photo_batch. Confirm both halves:
+        # _run_photo_batch actually calls it, and that function actually
+        # sets status = "ready".
+        calls = {
+            node.func.id for node in ast.walk(self.run_batch)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn("_finalize_batch_status", calls)
+
+        finalize_fn = next(
+            n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef) and n.name == "_finalize_batch_status"
+        )
         assigns_ready = any(
             isinstance(node, ast.Assign)
             and any(isinstance(t, ast.Attribute) and t.attr == "status" for t in node.targets)
             and isinstance(node.value, ast.Constant) and node.value.value == "ready"
-            for node in ast.walk(self.run_batch)
+            for node in ast.walk(finalize_fn)
         )
-        self.assertTrue(assigns_ready, '_run_photo_batch must set batch.status = "ready" after local processing')
+        self.assertTrue(assigns_ready, '_finalize_batch_status must set batch.status = "ready" after local processing')
 
     def test_legacy_sync_function_still_defined(self):
         # Kept (unused by the automatic flow) only because

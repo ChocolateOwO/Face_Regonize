@@ -46,8 +46,12 @@ async function handle(res: Response) {
   return res.blob();
 }
 
-export async function apiGet(path: string) {
-  const res = await fetch(`${API_BASE}${path}`, { headers: { ...authHeaders() } });
+/** `signal` lets a caller cancel a request that is no longer wanted — e.g. the
+ *  photo grid when the user pages or switches tab again before the previous
+ *  page arrived. Without it the stale response can land last and overwrite the
+ *  current one, which is what made fast paging feel like it jumped around. */
+export async function apiGet(path: string, signal?: AbortSignal) {
+  const res = await fetch(`${API_BASE}${path}`, { headers: { ...authHeaders() }, signal });
   return handle(res);
 }
 
@@ -60,6 +64,18 @@ export async function apiPostJson(path: string, body: unknown) {
   const data = await handle(res);
   clearCachedGets();
   return data;
+}
+
+/** POST with extra request headers — e.g. the marker header the Google Drive
+ *  Picker token endpoint requires. Not cached and never stored. */
+export async function apiPostJsonWithHeaders(path: string, body: unknown, headers: Record<string, string>) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders(), ...headers },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+  return handle(res);
 }
 
 export async function apiPutJson(path: string, body: unknown) {
@@ -82,6 +98,52 @@ export async function apiPostForm(path: string, form: FormData) {
   const data = await handle(res);
   clearCachedGets();
   return data;
+}
+
+/** Same as apiPostForm, but reports upload progress. fetch() cannot observe
+ *  request-body progress at all, and a photo-batch upload can be gigabytes —
+ *  an indeterminate spinner for minutes reads as "nothing is happening". */
+export function apiPostFormWithProgress(
+  path: string,
+  form: FormData,
+  onProgress: (percent: number) => void,
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE}${path}`);
+    const token = localStorage.getItem("token");
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      if (xhr.status === 401) {
+        window.dispatchEvent(new Event("auth:unauthorized"));
+        reject(new ApiError(401, "Not authenticated"));
+        return;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        clearCachedGets();
+        try {
+          resolve(xhr.responseText ? JSON.parse(xhr.responseText) : null);
+        } catch {
+          resolve(null);
+        }
+        return;
+      }
+      let detail = xhr.statusText;
+      try {
+        const data = JSON.parse(xhr.responseText);
+        detail = data.detail || JSON.stringify(data);
+      } catch {
+        /* not json */
+      }
+      reject(new ApiError(xhr.status, detail));
+    };
+    xhr.onerror = () => reject(new ApiError(0, "Network error during upload."));
+    xhr.send(form);
+  });
 }
 
 export async function apiPutForm(path: string, form: FormData) {

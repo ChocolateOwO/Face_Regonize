@@ -183,6 +183,21 @@ def get_write_service():
     return build("drive", "v3", credentials=_get_write_credentials(), cache_discovery=False)
 
 
+def mint_picker_access_token() -> dict:
+    """Phase H — a SHORT-LIVED access token for the Google Picker, minted from
+    the stored refresh token with the same drive.file scope as every other
+    write. Returns only the access token and its remaining lifetime — never
+    the refresh token, the client secret or any other credential."""
+    from datetime import datetime, timezone
+
+    creds = _get_write_credentials()
+    expires_in = 3600
+    if getattr(creds, "expiry", None) is not None:
+        expiry = creds.expiry if creds.expiry.tzinfo else creds.expiry.replace(tzinfo=timezone.utc)
+        expires_in = max(0, int((expiry - datetime.now(timezone.utc)).total_seconds()))
+    return {"access_token": creds.token, "expires_in": expires_in, "scope": SCOPES}
+
+
 def create_root_folder(name: str) -> str:
     """Creates the batch's top-level output folder in the connected admin's
     own Drive and returns its id.
@@ -214,7 +229,8 @@ def create_subfolder(parent_id: str, name: str) -> str:
     try:
         folder = (
             service.files()
-            .create(body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}, fields="id")
+            .create(body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}, fields="id",
+                    supportsAllDrives=True)
             .execute()
         )
         return folder["id"]
@@ -230,7 +246,8 @@ def get_or_create_subfolder(parent_id: str, name: str) -> str:
     safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
     query = f"'{parent_id}' in parents and name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     try:
-        resp = service.files().list(q=query, fields="files(id)", pageSize=1).execute()
+        resp = service.files().list(q=query, fields="files(id)", pageSize=1,
+                                     supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
         existing = resp.get("files", [])
         if existing:
             return existing[0]["id"]
@@ -239,6 +256,7 @@ def get_or_create_subfolder(parent_id: str, name: str) -> str:
             .create(
                 body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
                 fields="id",
+                supportsAllDrives=True,
             )
             .execute()
         )
@@ -258,7 +276,7 @@ def verify_file(file_id: str, expected_parent_id: str, expect_nonempty: bool = T
     report an upload as successful without this check."""
     service = get_write_service()
     try:
-        meta = service.files().get(fileId=file_id, fields="id,parents,size,trashed").execute()
+        meta = service.files().get(fileId=file_id, fields="id,parents,size,trashed", supportsAllDrives=True).execute()
     except Exception as e:  # noqa: BLE001
         raise DriveOAuthError(f"Upload verification failed — Drive file {file_id} could not be read back: {e}") from e
 
@@ -281,7 +299,8 @@ def upload_bytes(parent_id: str, filename: str, data: bytes, mime_type: str) -> 
     service = get_write_service()
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=False)
     try:
-        f = service.files().create(body={"name": filename, "parents": [parent_id]}, media_body=media, fields="id").execute()
+        f = service.files().create(body={"name": filename, "parents": [parent_id]}, media_body=media, fields="id",
+                                   supportsAllDrives=True).execute()
     except Exception as e:  # noqa: BLE001
         raise DriveOAuthError(f"Could not upload '{filename}' to Drive: {e}") from e
 
@@ -305,7 +324,7 @@ def copy_file(file_id: str, parent_id: str, name: str | None = None) -> str:
     if name:
         body["name"] = name
     try:
-        f = service.files().copy(fileId=file_id, body=body, fields="id").execute()
+        f = service.files().copy(fileId=file_id, body=body, fields="id", supportsAllDrives=True).execute()
     except Exception as e:  # noqa: BLE001
         raise DriveOAuthError(f"Could not copy file in Drive: {e}") from e
 
