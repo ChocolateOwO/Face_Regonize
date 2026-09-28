@@ -4,13 +4,14 @@ import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { apiGet } from "../api/client";
 
-const NAV = [
+const NAV: { to: string; label: string; icon: string; adminOnly?: boolean }[] = [
   { to: "/", label: "Dashboard", icon: "📊" },
   { to: "/people", label: "People", icon: "👥" },
   { to: "/recognition", label: "Face Recognition", icon: "🔍" },
   { to: "/attendees", label: "Attendees", icon: "✅" },
   { to: "/activities", label: "Activities", icon: "🎪" },
   { to: "/cctv", label: "CCTV", icon: "📡" },
+  { to: "/local-video-experiment", label: "Local Video Experiment", icon: "\uD83C\uDFAC", adminOnly: true },
   { to: "/connect", label: "Connect", icon: "📱" },
   { to: "/import", label: "Import Participants", icon: "📥" },
   { to: "/uploads", label: "Upload History", icon: "🖼️" },
@@ -18,7 +19,6 @@ const NAV = [
   { to: "/reports", label: "Reports", icon: "📈" },
   { to: "/pdpa", label: "PDPA", icon: "🛡️" },
   { to: "/photo-batches", label: "Event Photos", icon: "📷" },
-  { to: "/local-video-experiment", label: "Local Video Experiment", icon: "\uD83C\uDFAC" },
   { to: "/settings", label: "Settings", icon: "⚙️" },
 ];
 
@@ -59,6 +59,15 @@ export default function Layout({ children }: { children: ReactNode }) {
   const { username, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    let current = true;
+    setIsAdmin(false);
+    apiGet("/api/auth/me")
+      .then(user => { if (current) setIsAdmin(user.role === "admin"); })
+      .catch(() => {});
+    return () => { current = false; };
+  }, [username]);
   // The Face Recognition screen is a dedicated event check-in kiosk, not a
   // dashboard panel — it gets the entire viewport, with no sidebar, header,
   // or page chrome around it at all.
@@ -84,7 +93,7 @@ export default function Layout({ children }: { children: ReactNode }) {
         </div>
         <UpdateBanner />
         <nav className="flex-1 py-3 px-2 space-y-1 overflow-y-auto">
-          {NAV.map((item) => (
+          {NAV.filter(item => !item.adminOnly || isAdmin).map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
@@ -96,7 +105,7 @@ export default function Layout({ children }: { children: ReactNode }) {
               }
             >
               <span>{item.icon}</span>
-              {item.label}
+              <span>{item.label}{item.adminOnly && <span className="block text-xs font-normal opacity-80">Admin experiment</span>}</span>
             </NavLink>
           ))}
         </nav>

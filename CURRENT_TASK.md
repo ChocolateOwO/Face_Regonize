@@ -1,5 +1,49 @@
 # Reconize Current Task
 
+## Main 5173 video navigation/runtime correction - 2026-09-29
+
+User requested Main-only diagnosis/correction and authorized a focused commit
+and push if source changes are needed. Dummy, UrgentBlur files, media, storage,
+databases and credentials are protected and untouched by this task.
+
+Cause established: port 5173 listener PID 3708 is Vite whose working directory
+is Reconize_UrgentBlur/frontend. Its HTTP-served App/Layout modules lack the
+video route/sidebar entry. Initial Main HEAD 7374368 contained both. Main backend PID
+24908 runs from Reconize/backend on port 8000. An HTTP 200 for a deep link was
+only Vite's SPA fallback and did not prove the video route existed in the
+running frontend. Earlier activation reporting failed to check that distinction.
+
+Source correction: Layout reads authenticated /api/auth/me; only a verified
+admin sees Local Video Experiment, with Admin experiment label, near CCTV.
+Other navigation and kiosk chrome behavior are preserved. Focused fake-role
+navigation tests added. Mandatory Main originals were backed up/byte-verified.
+23 frontend regressions, npm run typecheck and build passed. Disposable browser
+using the Main build, synthetic admin/video/results and intercepted APIs verified
+visible sidebar, direct page, selection idle, explicit Upload/Start, default
+controls, named result count and hidden non-admin entry, with no real API writes.
+The user's signed-in browser is inaccessible to the available UI helper.
+
+The user then explicitly authorized stopping only PID 3708 after an immediate
+working-directory, command and port-owner recheck. All three checks passed;
+only that PID was stopped. No process-tree stop, other existing process stop,
+UrgentBlur file/data edit, backend restart or Dummy change occurred.
+
+Main Vite now runs as PID 10800, explicitly rooted/configured in Reconize/frontend
+on strict port 5173; Vite version 8.2.1, application VERSION unchanged. Served
+App/Layout source maps match the actual Main files, including the video route
+and admin-labelled entry. A disposable browser at http://localhost:5173 verified
+the visible admin sidebar, direct video page, selection idle, explicit synthetic
+Upload/Start with defaults, named result count 3 and hidden non-admin entry.
+All experiment API responses in that test were synthetic/intercepted, with no
+real media/data writes and no console errors. A separate real health fetch from
+that browser reached Main backend 8000, proven by its unique request marker in
+the confirmed Main backend log. Anonymous experiment API access remains denied.
+
+Stage: MAIN ACTIVATED / WAITING FOR USER MAIN VERIFICATION. Focused commit/push
+is explicitly authorized after staged audit; publication outcome reported in
+the handoff. Refresh http://localhost:5173/ and check Local Video Experiment near
+CCTV, or open /local-video-experiment directly. No real video was processed.
+
 ## Local Video Experiment and example match review - 2026-09-29
 
 User explicitly authorized Dummy implementation/verification, Main promotion,
