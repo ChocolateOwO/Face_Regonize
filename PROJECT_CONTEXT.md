@@ -611,3 +611,29 @@ The objective is to improve it incrementally while preserving:
 - Main stability
 
 Always follow PROJECT_RULES.md before making changes.
+
+
+## Local Video Experiment and configurable scans (2026-09-29)
+
+Admin /local-video-experiment accepts streamed local media into isolated,
+ignored experiment storage. Explicit Start uses a read-only frozen enrollment
+matcher and existing recognition configuration. Sequential decoding skips
+intervening inference frames and never queues/repeats saved-frame scans.
+OpenCV metadata totals are estimates; independent FFmpeg null decoding verifies
+EOF and retains honest partial failures. FFmpeg on PATH is required for EOF
+verification; no Python dependency/model/threshold/schema changes.
+
+Always On and video expose per-run camera FPS (default 30, range 1-120), wait
+(default .4s, 0-30), target starts/s (default 2.5, .1-30). Next start >=
+max(previous finish + wait, previous start + 1/target); defaults add no second
+rate-limit delay. Admin drafts freeze on Start; non-admin Always On stations
+retain automatic default starts. Requested/negotiated/achieved rates are distinct.
+
+Matched identity counts are sampled frames containing that identity, once per
+frame. One strongest valid cosine-match whole-frame example per identity,
+earliest tie, with the same face bbox. Admin-only zoom preview and separate
+Not reviewed/Correct/Incorrect/Unsure example verdicts are available. UTF-8 CSV
+exports counts, settings/rates/EOF metadata and example-only verdicts. A verdict
+does not validate every appearance or measure recognition accuracy. Old results
+never silently reprocess. No separate Legacy Drive Experiment promoted; normal
+Event Photo, CCTV, enrollment and consent semantics are preserved.

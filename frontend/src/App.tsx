@@ -20,6 +20,7 @@ import Settings from "./pages/Settings";
 import Pdpa from "./pages/Pdpa";
 import PdpaDetail from "./pages/PdpaDetail";
 import PhotoBatches from "./pages/PhotoBatches";
+import LocalVideoExperiment from "./pages/LocalVideoExperiment";
 import PhotoBatchDetail from "./pages/PhotoBatchDetail";
 import Privacy from "./pages/Privacy";
 
@@ -65,6 +66,7 @@ function AppRoutes() {
                 <Route path="/pdpa" element={<Pdpa />} />
                 <Route path="/pdpa/:id" element={<PdpaDetail />} />
                 <Route path="/photo-batches" element={<PhotoBatches />} />
+                <Route path="/local-video-experiment" element={<LocalVideoExperiment />} />
                 <Route path="/photo-batches/:id" element={<PhotoBatchDetail />} />
               </Routes>
             </Layout>

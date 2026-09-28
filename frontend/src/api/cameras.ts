@@ -123,6 +123,8 @@ export function resolveCameraDeviceId(
 
 /** Constraints for getUserMedia. `exact` so it fails loudly rather than
  *  silently opening a different camera than the one that was chosen. */
-export function videoConstraints(deviceId: string | null): MediaTrackConstraints {
-  return deviceId ? { deviceId: { exact: deviceId } } : { facingMode: "user" };
+export function videoConstraints(deviceId: string | null, requestedFps?: number): MediaTrackConstraints {
+  const constraints: MediaTrackConstraints = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: "user" };
+  if (requestedFps !== undefined) constraints.frameRate = { ideal: requestedFps, max: requestedFps };
+  return constraints;
 }

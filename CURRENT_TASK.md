@@ -1,5 +1,43 @@
 # Reconize Current Task
 
+## Local Video Experiment and example match review - 2026-09-29
+
+User explicitly authorized Dummy implementation/verification, Main promotion,
+commit and push. Scope: local video and required three per-run scan settings.
+Separate Legacy Drive Experiment remains Dummy-only.
+
+Dummy verification: 41 focused video backend tests, 772 full backend tests
+(235.359 s), 18 frontend result/modal/scan regressions, typecheck/build passed.
+Actual modal visually checked at 1x and 2x using synthetic cartoon media; only
+selected face boxed. No user video or real Drive was processed/contacted.
+
+Main: surgically integrated local video routes/page/navigation and Always On
+controls. Existing Event Batch, check-in/consent, CCTV, recognition configuration,
+enrollment, schema and app data are preserved. Main originals backed up and
+byte-verified before edits. No user data, credentials or absolute paths copied.
+Defaults: requested/virtual camera 30 FPS, completed-scan wait .4s, target 2.5
+starts/s; one awaited scan, no backlog, immutable run settings. Local media
+stays under ignored per-server experiment storage. Independent EOF verification
+separates metadata estimates from decode failures. One strongest valid cosine
+whole-frame example per identity, earliest tie; same detection bbox scaled for
+zoom preview. Admin-only image/verdict routes. Verdicts live separately from
+automatic counts/state and cover one shown example only, never overall accuracy.
+Older results remain unchanged without silent reprocessing.
+
+Main verification: 45 focused video/scan backend tests, 696 full backend tests
+(210.817 s), 18 frontend result/modal/scan regressions, typecheck/build passed.
+Both backend/frontend pairs are active: Main 8000/5173; Dummy 8010/5180.
+Direct/proxied health and video pages return 200; anonymous video/preview access
+returns 401. Main excludes Legacy Experiment routes. Main schema and protected
+identity/attendance/consent/user row counts are unchanged after activation, as
+are 11 protected Main code/configuration and 13 existing Dummy result/config
+hashes. No Dummy media or experiment storage was copied to Main.
+
+Stage: VERIFIED AND ACTIVATED. User authorized normal commit/push after final
+staged source/data audit; publication outcome reported in the handoff. User
+hardware/manual verification remains needed. No version/tag/release changes.
+
+
 ## Urgent Event Photo Crowd Detection — 2026-09-08
 
 The user paused Phase A and explicitly authorized this isolated urgent patch,

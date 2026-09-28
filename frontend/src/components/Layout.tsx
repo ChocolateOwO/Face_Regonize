@@ -18,6 +18,7 @@ const NAV = [
   { to: "/reports", label: "Reports", icon: "📈" },
   { to: "/pdpa", label: "PDPA", icon: "🛡️" },
   { to: "/photo-batches", label: "Event Photos", icon: "📷" },
+  { to: "/local-video-experiment", label: "Local Video Experiment", icon: "\uD83C\uDFAC" },
   { to: "/settings", label: "Settings", icon: "⚙️" },
 ];
 

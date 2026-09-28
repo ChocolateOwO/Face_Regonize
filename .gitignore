@@ -55,3 +55,7 @@ backups/
 
 # Camera/ffmpeg runtime logs written while stations are running
 recordings/
+
+# Private local video uploads, representative images, reports and runtime logs
+/backend/local_video_experiment_storage/
+/backend/*.log

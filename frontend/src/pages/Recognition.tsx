@@ -10,6 +10,9 @@ import {
   type CameraDevice,
 } from "../api/cameras";
 
+import ScanSettingsFields from "../components/ScanSettingsFields";
+import { DEFAULT_SCAN_SETTINGS, freezeScanSettings, scanSettingsError, runSerialScans, type ScanSettings } from "../api/scanSettings";
+
 interface RecognitionResult {
   bbox: number[]; // [x1, y1, x2, y2] — not displayed anywhere in this UI, kept for /api/uploads parity
   confidence: number;
@@ -107,16 +110,25 @@ interface PersonResult {
 }
 
 // Self-paced scan loop instead of a fixed setInterval: each scan is awaited
-// to completion, then we wait SCAN_DELAY_MS before starting the next one.
+// to completion. Tap retains SCAN_DELAY_MS; Always On uses frozen controls.
 const SCAN_DELAY_MS = 200;
 // How long the result screen stays up before auto-returning to IDLE.
 const RESULT_SCREEN_MS = 1800;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 export default function Recognition() {
+  const [scanAccess, setScanAccess] = useState<{ can_configure: boolean } | null>(null);
+  const [scanSettings, setScanSettings] = useState<ScanSettings>({ ...DEFAULT_SCAN_SETTINGS });
+  const [runSettings, setRunSettings] = useState<Readonly<ScanSettings> | null>(null);
+  const [negotiatedFps, setNegotiatedFps] = useState<number | null>(null);
+  const [scanStats, setScanStats] = useState({ completed: 0, firstStart: 0, lastStart: 0 });
+  const startingRef = useRef(false);
+  const [starting, setStarting] = useState(false);
+  const scanLoopRef = useRef<Promise<void> | null>(null);
+  const [scanLoopBusy, setScanLoopBusy] = useState(false);
+  const runGenerationRef = useRef(0);
+  const lastScanSucceededRef = useRef(false);
+  const achievedScanRate = scanStats.completed > 1 && scanStats.lastStart > scanStats.firstStart
+    ? (scanStats.completed - 1) / (scanStats.lastStart - scanStats.firstStart) : null;
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
@@ -167,6 +179,10 @@ export default function Recognition() {
   const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
 
   useEffect(() => {
+    apiGet("/api/scan-settings").then(data => {
+      setScanAccess({ can_configure: data.can_configure });
+      setScanSettings({ ...data.defaults });
+    }).catch(err => setError(err instanceof Error ? err.message : "Cannot load scanning settings."));
     apiGet("/api/settings").then((s) => {
       setDebugMode(s.debug_mode === "true");
       setCameraLabelSetting(s.camera_label ?? "");
@@ -231,15 +247,14 @@ export default function Recognition() {
     await startScanning();
   }
 
-  // In always-on mode the kiosk is meant to need no interaction at all, so
-  // the camera starts by itself once we know that is the active mode. Guarded
-  // on kioskState so a running scan is never restarted underneath itself.
+  // Admins configure before explicit Start. Non-admin stations retain default
+  // auto-start only after authenticated defaults/access are known.
   useEffect(() => {
-    if (kioskMode === "always" && kioskState === "idle" && !activeRef.current) {
+    if (scanAccess && !scanAccess.can_configure && kioskMode === "always" && kioskState === "idle" && !activeRef.current && !startingRef.current && !scanLoopRef.current) {
       startScanning();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kioskMode, kioskState]);
+  }, [kioskMode, kioskState, scanAccess, scanLoopBusy]);
 
   useEffect(() => {
     return () => {
@@ -268,57 +283,89 @@ export default function Recognition() {
   }
 
   async function startScanning() {
+    // A stopped in-flight request must drain before any new run can start.
+    if (startingRef.current || scanLoopRef.current || activeRef.current) return;
+    startingRef.current = true; setStarting(true);
+    const generation = ++runGenerationRef.current;
+    const mode = kioskMode;
     setError("");
     try {
-      // Which camera: this kiosk's local override, else the app-wide default
-      // from Settings (matched by label), else whatever the browser picks.
+      let settings: Readonly<ScanSettings> | null = null;
+      if (mode === "always") {
+        if (!scanAccess) throw new Error("Scanning settings are still loading.");
+        const candidate = freezeScanSettings(scanSettings);
+        const accepted = scanAccess.can_configure
+          ? await apiPostJson("/api/scan-settings/validate", candidate)
+          : (await apiGet("/api/scan-settings")).defaults;
+        settings = freezeScanSettings(accepted);
+      }
+      if (generation !== runGenerationRef.current) return;
       const available = await listCameras();
-      // A pinned camera is used as-is. It is NOT silently swapped for another
-      // if it has been unplugged: two stations sharing one machine would
-      // otherwise quietly collapse onto the same camera.
+      if (generation !== runGenerationRef.current) return;
+      // Preserve camera selection and exact pinned device behavior.
       const deviceId = pinnedCamera || resolveCameraDeviceId(available, cameraLabelSetting);
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: videoConstraints(deviceId),
+        video: videoConstraints(deviceId, settings?.camera_fps),
       });
-      // Labels are only readable once permission is granted, so refresh the
-      // list now that the stream is open - this is what fills the switcher.
+      if (generation !== runGenerationRef.current) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
       listCameras().then(setCameras).catch(() => {});
       streamRef.current = stream;
       if (videoRef.current) videoRef.current.srcObject = stream;
+      const actual = stream.getVideoTracks()[0]?.getSettings?.()?.frameRate;
+      setNegotiatedFps(actual !== undefined && Number.isFinite(actual) && actual > 0 ? actual : null);
+      setRunSettings(settings);
+      setScanStats({ completed: 0, firstStart: 0, lastStart: 0 });
+      activeRef.current = true;
+      setKioskState("scanning");
+      setScanLoopBusy(true);
+      const loop = runScanLoop(mode, settings, generation);
+      scanLoopRef.current = loop;
+      void loop.catch(err => {
+        if (generation === runGenerationRef.current) {
+          setError(err instanceof Error ? err.message : "Scan loop failed.");
+          stopCamera(); setKioskState("idle");
+        }
+      }).finally(() => {
+        if (scanLoopRef.current === loop) {
+          scanLoopRef.current = null; setScanLoopBusy(false);
+        }
+      });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not access the camera.");
-      consentRef.current = null;
-      setKioskState("idle");
-      return;
+      if (generation === runGenerationRef.current) {
+        setError(err instanceof Error ? err.message : "Could not access the camera.");
+        consentRef.current = null;
+        stopCamera(); setKioskState("idle");
+      }
+    } finally {
+      startingRef.current = false; setStarting(false);
     }
-    activeRef.current = true;
-    setKioskState("scanning");
-    runScanLoop();
   }
 
-  // Self-paced loop: scan, wait a small fixed delay, scan again. Keeps going
-  // while nobody known is recognized (empty frame or unknown-only faces
-  // don't stop it) — stops the instant a scan tick finds at least one known
-  // participant, releases the camera, and shows the result.
-  async function runScanLoop() {
-    while (activeRef.current) {
-      const people = await scanFrame();
-      if (people.length > 0) {
-        if (kioskMode === "always") {
-          // Stay on the camera: announce whoever is newly recognised and keep
-          // scanning, so a queue can walk past without anyone touching it.
-          announce(people);
-        } else {
-          activeRef.current = false;
-          stopCamera();
-          recordConsent(people.map((p) => p.person_id)); // fire-and-forget — never blocks showing the result
-          showResult(people);
-          return;
+  async function runScanLoop(mode: KioskMode, settings: Readonly<ScanSettings> | null, generation: number) {
+    // Tap keeps its existing completion + 200ms behavior. Always On freezes
+    // the validated controls and awaits each complete request before its deadline.
+    await runSerialScans({
+      settings: settings ?? { ...DEFAULT_SCAN_SETTINGS, post_scan_delay_seconds: SCAN_DELAY_MS / 1000,
+        target_detections_per_second: 1000 / SCAN_DELAY_MS },
+      isActive: () => activeRef.current && generation === runGenerationRef.current,
+      scan: scanFrame,
+      onResult: (people, start) => {
+        if (mode === "always" && lastScanSucceededRef.current) {
+          setScanStats(previous => ({ completed: previous.completed + 1,
+            firstStart: previous.completed ? previous.firstStart : start, lastStart: start }));
         }
-      }
-      if (!activeRef.current) return;
-      await sleep(SCAN_DELAY_MS);
-    }
+        if (!people.length) return;
+        if (mode === "always") announce(people);
+        else {
+          stopCamera();
+          recordConsent(people.map(person => person.person_id));
+          showResult(people);
+        }
+      },
+    });
   }
 
   // Show a recognised person briefly without interrupting the loop. Somebody
@@ -362,6 +409,7 @@ export default function Recognition() {
   }
 
   function stopCamera() {
+    ++runGenerationRef.current;
     activeRef.current = false;
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
@@ -392,11 +440,12 @@ export default function Recognition() {
   // were found in this frame — the loop above decides whether that means
   // "stop and show the result" or "keep scanning."
   async function scanFrame(): Promise<PersonResult[]> {
+    lastScanSucceededRef.current = false;
     try {
       const tCaptureStart = performance.now();
       const blob = await captureBlob();
       const tCaptureEnd = performance.now();
-      if (!blob) return [];
+      if (!blob || !activeRef.current) return [];
 
       const form = new FormData();
       form.append("photo", blob, "scan.jpg");
@@ -407,6 +456,8 @@ export default function Recognition() {
       const tFetchStart = performance.now();
       const data: RecognitionResponse = await apiPostForm(`/api/recognition/upload${debugMode ? "?debug=true" : ""}`, form);
       const tFetchEnd = performance.now();
+      if (!activeRef.current) return [];
+      lastScanSucceededRef.current = true;
 
       setResult(data);
       setError("");
@@ -467,10 +518,21 @@ export default function Recognition() {
             <div className="text-indigo-300 text-2xl font-semibold -mt-4">{activityName}</div>
           )}
           {kioskMode === "always" ? (
-            <div className="text-white/60 text-xl">Starting camera...</div>
+            <div className="w-full max-w-2xl px-4 text-white">
+              {scanAccess?.can_configure ? <>
+                <ScanSettingsFields value={scanSettings} onChange={setScanSettings}
+                  disabled={starting || scanLoopBusy} dark />
+                <button onClick={() => void startScanning()}
+                  disabled={starting || scanLoopBusy || !!scanSettingsError(scanSettings)}
+                  className="rounded-lg bg-indigo-600 px-5 py-3 font-semibold disabled:opacity-50">
+                  {starting ? "Starting camera..." : scanLoopBusy ? "Waiting for completed scan..." : "Start Always On Check-in"}
+                </button>
+              </> : <p className="text-center text-white/60">{scanAccess ? "Starting camera with default scanning settings..." : "Loading scanning settings..."}</p>}
+            </div>
           ) : (
             <button
               onClick={tapToScan}
+              disabled={starting || scanLoopBusy}
               className="px-14 py-7 rounded-2xl bg-indigo-600 hover:bg-indigo-700 text-white text-3xl sm:text-4xl font-bold shadow-2xl"
             >
               TAP TO SCAN
@@ -539,6 +601,13 @@ export default function Recognition() {
               {activityName ? `Checking in to ${activityName}` : "Check-in running"}
             </div>
           </div>
+          {runSettings && <div className="absolute top-16 left-1/2 -translate-x-1/2 w-full max-w-xl rounded-lg bg-black/70 px-3 py-2 text-xs text-white">
+            Camera FPS requested: {runSettings.camera_fps}; negotiated actual: {negotiatedFps == null ? "unavailable" : negotiatedFps.toFixed(3)} FPS.
+            {" "}Wait after completed scan: {runSettings.post_scan_delay_seconds} s.
+            {" "}Target detections/s: {runSettings.target_detections_per_second}.
+            {" "}Achieved completed scan rate: {achievedScanRate == null ? "available after two completed scans" : achievedScanRate.toFixed(3) + "/s"} ({scanStats.completed} completed).
+            {" "}Requested FPS and target may exceed achieved rates. Values frozen; stop and restart to change.
+          </div>}
           {flash && (
             <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2 pointer-events-none">
               {flash.map((p) => (
@@ -562,10 +631,13 @@ export default function Recognition() {
             </div>
           )}
           <button
-            onClick={() => chooseMode("tap")}
+            onClick={() => {
+              if (scanAccess?.can_configure) { stopCamera(); setFlash(null); setKioskState("idle"); }
+              else chooseMode("tap");
+            }}
             className="absolute bottom-6 right-6 px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm font-medium backdrop-blur"
           >
-            Stop always-on
+            {scanAccess?.can_configure ? "Stop to change settings" : "Stop always-on"}
           </button>
         </>
       )}
