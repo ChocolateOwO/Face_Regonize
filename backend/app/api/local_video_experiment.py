@@ -97,6 +97,8 @@ def delete(job_id: str, user: User = Depends(require_admin)):
 @router.get("/{job_id}/video")
 def download_video(job_id: str, user: User = Depends(require_admin)):
     state = load(job_id)
+    if state.get("kind") == "drive_batch":
+        raise HTTPException(410, "Drive videos are temporary input and are removed locally after processing. Original Drive files are unchanged.")
     path = video.video_path(state)
     if not path.is_file():
         raise HTTPException(404, "Experiment video not found")

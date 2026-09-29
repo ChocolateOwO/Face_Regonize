@@ -14,6 +14,10 @@ always has real quota, so writes run under that identity instead. Reads
 
 Hand-rolled against the token endpoint directly with `requests` (already a
 dependency) rather than adding google-auth-oauthlib.
+
+Local Video Experiment additionally uses the same connected account with a
+separate read-only token. Its consent adds drive.readonly; writers/Picker keep
+their existing drive.file scope and service-account photo reads are unchanged.
 """
 from __future__ import annotations
 
@@ -45,13 +49,22 @@ USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 # photographer's photos is unaffected — that runs on the service account
 # (google_drive_folder_service.py), which needs no user consent at all.
 SCOPES = "https://www.googleapis.com/auth/drive.file"
+# Video inputs need arbitrary accessible folders, without broader write access.
+# Existing writers/Picker continue requesting drive.file only.
+VIDEO_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+VIDEO_SCOPES = (SCOPES, VIDEO_READ_SCOPE)
 
 _REFRESH_TOKEN_KEY = "google_drive_oauth_refresh_token"
 _EMAIL_KEY = "google_drive_oauth_email"
 _PENDING_STATE_KEY = "google_drive_oauth_pending_state"
+_GRANTED_SCOPES_KEY = "google_drive_oauth_granted_scopes"
 
 
 class DriveOAuthError(Exception):
+    pass
+
+
+class DriveScopeRequired(DriveOAuthError):
     pass
 
 
@@ -88,18 +101,20 @@ def verify_and_clear_pending_state(state: str) -> bool:
     return bool(expected) and secrets.compare_digest(expected, state)
 
 
-def get_auth_url(state: str) -> str:
+def get_auth_url(state: str, *, scopes: tuple[str, ...] | None = None) -> str:
     if not GOOGLE_DRIVE_CLIENT_ID:
         raise DriveOAuthError("GOOGLE_DRIVE_CLIENT_ID is not set in .env — create an OAuth client in Google Cloud Console first.")
     params = {
         "client_id": GOOGLE_DRIVE_CLIENT_ID,
         "redirect_uri": OAUTH_REDIRECT_URI,
         "response_type": "code",
-        "scope": SCOPES,
+        "scope": " ".join(scopes) if scopes else SCOPES,
         "access_type": "offline",
         "prompt": "consent",
         "state": state,
     }
+    if scopes:
+        params["include_granted_scopes"] = "true"
     return f"{AUTH_URL}?{urlencode(params)}"
 
 
@@ -119,6 +134,11 @@ def exchange_code_and_store(code: str) -> str:
     if resp.status_code != 200:
         raise DriveOAuthError(f"Google rejected the OAuth code exchange: {resp.text}")
     tokens = resp.json()
+    granted = set(tokens.get("scope", "").split())
+    if granted and SCOPES not in granted:
+        # Granular consent must not replace the existing connection with a
+        # readonly-only grant and break established app-created-file writes.
+        raise DriveOAuthError("Google consent did not include existing drive.file access. Reconnect and allow both requested permissions; the previous connection was preserved.")
     refresh_token = tokens.get("refresh_token")
     access_token = tokens.get("access_token")
     if not refresh_token:
@@ -138,6 +158,9 @@ def exchange_code_and_store(code: str) -> str:
     with Session(engine) as session:
         _set_setting(session, _REFRESH_TOKEN_KEY, refresh_token)
         _set_setting(session, _EMAIL_KEY, email)
+        # Store Google's actual grant, never assume every checkbox was allowed.
+        # A missing scope response is deliberately unverified for video input.
+        _set_setting(session, _GRANTED_SCOPES_KEY, " ".join(sorted(granted)))
     return email
 
 
@@ -151,7 +174,16 @@ def connected_email() -> str | None:
         return _get_setting(session, _EMAIL_KEY)
 
 
+def has_video_read_scope() -> bool:
+    with Session(engine) as session:
+        return VIDEO_READ_SCOPE in (_get_setting(session, _GRANTED_SCOPES_KEY) or "").split()
+
+
 def _get_write_credentials():
+    return _get_credentials([SCOPES])
+
+
+def _get_credentials(scopes: list[str]):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
@@ -168,13 +200,25 @@ def _get_write_credentials():
         token_uri=TOKEN_URL,
         client_id=GOOGLE_DRIVE_CLIENT_ID,
         client_secret=GOOGLE_DRIVE_CLIENT_SECRET,
-        scopes=[SCOPES],
+        scopes=scopes,
     )
     try:
         creds.refresh(Request())
     except Exception as e:  # noqa: BLE001
         raise DriveOAuthError(f"Could not refresh the Google Drive connection — reconnect it: {e}") from e
     return creds
+
+
+def get_video_read_service():
+    """Read-only token for video listing/download; no full Drive write scope."""
+    from googleapiclient.discovery import build
+
+    if not has_video_read_scope():
+        raise DriveScopeRequired("Reconnect Google Drive once and allow read-only access to list and download videos from pasted folder links.")
+    creds = _get_credentials([VIDEO_READ_SCOPE])
+    if creds.granted_scopes is not None and VIDEO_READ_SCOPE not in creds.granted_scopes:
+        raise DriveScopeRequired("The Google grant lacks drive.readonly. Reconnect and allow the read-only permission for video batches.")
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 def get_write_service():

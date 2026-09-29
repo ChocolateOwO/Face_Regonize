@@ -4,6 +4,7 @@ import { Button } from "./ui";
 
 export type ExampleVerdict = "Not reviewed" | "Correct" | "Incorrect" | "Unsure";
 export interface MatchExample {
+  source_filename?: string; source_video_key?: string;
   frame_index: number; frame_number: number; timestamp_seconds: number;
   source_timestamp_seconds?: number; match_score: number | null;
   score_meaning: string; selection_rule: string; width: number; height: number;
@@ -74,6 +75,7 @@ export default function VideoMatchPreview({ jobId, person, active, onClose, onRe
         <button ref={closeButton} type="button" onClick={onClose} className="rounded border px-3 py-2 text-sm">Close</button>
       </div>
       {!person.preview_available || !example ? <p className="py-8 text-sm text-gray-600">{person.preview_message ?? "Preview unavailable for this older run"}. No video is reprocessed.</p> : <>
+        {example.source_filename && <p className="mb-2 break-words text-sm font-medium">Source video: {example.source_filename}</p>}
         <p className="mb-2 text-sm">Video timestamp: {(example.source_timestamp_seconds ?? example.timestamp_seconds).toFixed(3)} s
           {example.source_timestamp_seconds != null ? " (source PTS)" : " (nominal)"}. Frame {example.frame_number} (index {example.frame_index}, zero-based).
           {example.match_score == null ? " Match score unavailable." : " Cosine similarity: " + example.match_score.toFixed(4) + " (higher is stronger; not a probability)."}</p>

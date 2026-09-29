@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { apiGet, apiPostJson, apiDelete, downloadFile, ApiError } from "../api/client";
 import { Button, Card, PageHeader } from "../components/ui";
 
 import VideoMatchPreview, { type MatchedPerson } from "../components/VideoMatchPreview";
 import ScanSettingsFields from "../components/ScanSettingsFields";
+import DriveVideoBatchPanel from "../components/DriveVideoBatchPanel";
+import VideoBatchSources, { type VideoSourceResult } from "../components/VideoBatchSources";
 import { DEFAULT_SCAN_SETTINGS, scanSettingsError, type ScanSettings } from "../api/scanSettings";
 
 const API = "/api/local-video-experiment";
@@ -15,6 +18,9 @@ interface Sample {
   capture_time_seconds?: number; scan_work_seconds?: number;
 }
 interface Experiment {
+  kind?: "drive_batch"; batch_name?: string; videos?: VideoSourceResult[];
+  total_videos?: number; finished_videos?: number; completed_videos?: number; failed_videos?: number;
+  temporary_downloads_cleaned?: boolean;
   id: string; filename: string; status: string; created_at: string;
   started_at: string | null; finished_at: string | null; error: string | null;
   media: { duration_seconds: number; fps: number; frame_count: number; expected_samples: number | null; max_samples?: number; sha256: string } | null;
@@ -34,6 +40,16 @@ interface Experiment {
   scan_settings?: ScanSettings | null;
   partial: boolean; can_start: boolean; can_cancel: boolean; can_delete: boolean;
   people?: Person[]; samples?: Sample[];
+}
+
+function experimentResponse(value: unknown): Experiment {
+  const state = value as Experiment | null;
+  if (!state || typeof state.id !== "string" || !state.id || typeof state.filename !== "string" ||
+      typeof state.status !== "string" || !Number.isFinite(state.progress_percent) || !Number.isFinite(state.processing_seconds) ||
+      (state.kind === "drive_batch" && !Array.isArray(state.videos))) {
+    throw new Error("The server returned an incomplete experiment response. Refresh the experiment list to check whether Start created a batch before trying again.");
+  }
+  return state;
 }
 
 function uploadVideo(file: File, progress: (value: number) => void): Promise<Experiment> {
@@ -62,6 +78,9 @@ const message = (err: unknown) => err instanceof Error ? err.message : "Experime
 const seconds = (value: number | null | undefined) => value == null ? "\u2014" : value.toFixed(3) + " s";
 
 export default function LocalVideoExperiment() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedId = searchParams.get("experiment");
+  const [sourceMode, setSourceMode] = useState<"local" | "drive">("local");
   const [scanSettings, setScanSettings] = useState<ScanSettings>({ ...DEFAULT_SCAN_SETTINGS });
   const [isAdmin, setIsAdmin] = useState(false);
   const [list, setList] = useState<Experiment[]>([]);
@@ -75,13 +94,39 @@ export default function LocalVideoExperiment() {
   const [clock, setClock] = useState(Date.now());
   const input = useRef<HTMLInputElement>(null);
   const selectedId = useRef<string | null>(null);
+  const recovered = useRef(false);
+  const resultTitle = useRef<HTMLHeadingElement>(null);
+  const selectionRequest = useRef(0);
+  const requestedIdRef = useRef(requestedId);
+  requestedIdRef.current = requestedId;
   selectedId.current = selected?.id ?? null;
 
   const loadList = useCallback(async () => {
     const data = await apiGet(API);
+    if (!Array.isArray(data?.experiments)) throw new Error("Unable to read the experiment list. Refresh this page; no new batch was started.");
     setList(data.experiments as Experiment[]); setIsAdmin(true);
   }, []);
   useEffect(() => { void loadList().catch(err => setError(message(err))); }, [loadList]);
+  useEffect(() => {
+    // Reopen an explicit result, otherwise recover the active/latest Drive
+    // batch. This reads existing status only: never call Start on recovery.
+    if (selectedId.current || recovered.current) return;
+    const candidate = requestedId ?? list.find(exp => ACTIVE.includes(exp.status))?.id ??
+      list.find(exp => exp.kind === "drive_batch")?.id;
+    if (!candidate) return;
+    const controller = new AbortController();
+    const request = ++selectionRequest.current;
+    void apiGet(API + "/" + encodeURIComponent(candidate), controller.signal).then(value => {
+      if (controller.signal.aborted || selectionRequest.current !== request || selectedId.current) return;
+      const fresh = experimentResponse(value);
+      recovered.current = true;
+      setSelected(fresh); setClock(Date.now());
+      if (fresh.kind === "drive_batch") setSourceMode("drive");
+      if (requestedIdRef.current !== fresh.id) setSearchParams({ experiment: fresh.id }, { replace: true });
+    }).catch(err => { if (!controller.signal.aborted && selectionRequest.current === request) setError(message(err)); });
+    return () => controller.abort();
+  }, [list, requestedId, setSearchParams]);
+  useEffect(() => { resultTitle.current?.scrollIntoView({ block: "start" }); }, [selected?.id]);
   const active = selected != null && ACTIVE.includes(selected.status);
   useEffect(() => {
     if (!active || !selected) return;
@@ -90,9 +135,9 @@ export default function LocalVideoExperiment() {
     let timer: number;
     async function poll() {
       try {
-        const fresh = await apiGet(API + "/" + id) as Experiment;
+        const fresh = experimentResponse(await apiGet(API + "/" + id));
         if (disposed || selectedId.current !== id) return;
-        setSelected(fresh); setClock(Date.now());
+        setSelected(fresh); setClock(Date.now()); setError("");
         if (!ACTIVE.includes(fresh.status)) { await loadList(); return; }
       } catch (err) { if (!disposed) setError(message(err)); }
       if (!disposed) timer = window.setTimeout(poll, 1000);
@@ -107,7 +152,8 @@ export default function LocalVideoExperiment() {
     setBusy(true); setUploading(true); setError(""); setUploadPercent(0);
     try {
       const fresh = await uploadVideo(file, setUploadPercent);
-      setSelected(fresh); setFile(null);
+      selectionRequest.current++; recovered.current = true; setSelected(experimentResponse(fresh)); setFile(null);
+      setSearchParams({ experiment: fresh.id }, { replace: true });
       if (input.current) input.current.value = "";
       await loadList();
     } catch (err) { setError(message(err)); }
@@ -115,8 +161,14 @@ export default function LocalVideoExperiment() {
   }
   async function select(id: string) {
     setError("");
-    try { setSelected(await apiGet(API + "/" + id) as Experiment); }
-    catch (err) { setError(message(err)); }
+    const request = ++selectionRequest.current;
+    try {
+      const fresh = experimentResponse(await apiGet(API + "/" + encodeURIComponent(id)));
+      if (selectionRequest.current !== request) return;
+      recovered.current = true;
+      setSelected(fresh); setClock(Date.now());
+      setSearchParams({ experiment: id }, { replace: true });
+    } catch (err) { if (selectionRequest.current === request) setError(message(err)); }
   }
   async function action(kind: "start" | "cancel") {
     if (!selected || busy) return;
@@ -126,15 +178,15 @@ export default function LocalVideoExperiment() {
     }
     setBusy(true); setError("");
     try {
-      setSelected(await apiPostJson(API + "/" + selected.id + "/" + kind, kind === "start" ? scanSettings : {}) as Experiment);
+      setSelected(experimentResponse(await apiPostJson(API + "/" + selected.id + "/" + kind, kind === "start" ? scanSettings : {})));
       setClock(Date.now()); await loadList();
     } catch (err) { setError(message(err)); }
     finally { setBusy(false); }
   }
   async function remove() {
-    if (!selected || !window.confirm("Delete this experiment's uploaded video and local results? Other experiments and application data are preserved.")) return;
+    if (!selected || !window.confirm("Delete this experiment's local results, previews and any remaining local video? Original Google Drive files and other experiments are preserved.")) return;
     setBusy(true); setError("");
-    try { await apiDelete(API + "/" + selected.id); setSelected(null); await loadList(); }
+    try { await apiDelete(API + "/" + selected.id); selectionRequest.current++; recovered.current = true; setSelected(null); setSearchParams({}, { replace: true }); await loadList(); }
     catch (err) { setError(message(err)); }
     finally { setBusy(false); }
   }
@@ -146,6 +198,7 @@ export default function LocalVideoExperiment() {
   const elapsed = active && selected?.started_at
     ? Math.max(selected.processing_seconds, (clock - Date.parse(selected.started_at)) / 1000)
     : selected?.processing_seconds;
+  const batch = selected?.kind === "drive_batch";
   return (
     <div>
       {reviewPerson && selected && <VideoMatchPreview jobId={selected.id} person={reviewPerson} active={active}
@@ -155,11 +208,22 @@ export default function LocalVideoExperiment() {
         }} />}
       <PageHeader title="Local Video Experiment" subtitle="Count sampled frames containing enrolled identities" />
       <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-        EXPERIMENT ONLY. Local video and results stay on this server. No Google Drive upload.
+        EXPERIMENT ONLY. Choose a local upload or read selected Google Drive videos. Results stay on this server; no Google Drive upload or deletion.
         Counts measure sampled-frame detections, not camera passages or recognition accuracy.
       </div>
       {error && <p role="alert" className="mb-3 text-sm text-red-600">{error}</p>}
       <Card className="mb-4">
+        <div className="mb-4 flex gap-2" role="group" aria-label="Video input source">
+          <Button aria-pressed={sourceMode === "local"} disabled={busy} onClick={() => setSourceMode("local")}>Local video upload</Button>
+          <Button aria-pressed={sourceMode === "drive"} disabled={busy} onClick={() => setSourceMode("drive")}>Google Drive batch</Button>
+        </div>
+        {sourceMode === "drive" && isAdmin ? <DriveVideoBatchPanel settings={scanSettings} onSettings={setScanSettings}
+          disabled={busy || list.some(exp => ACTIVE.includes(exp.status))} onStarted={state => {
+            const fresh = experimentResponse(state);
+            selectionRequest.current++; recovered.current = true; setSelected(fresh); setClock(Date.now()); setError("");
+            setSearchParams({ experiment: fresh.id }, { replace: true });
+            void loadList().catch(err => setError(message(err)));
+          }} /> : <>
         <label htmlFor="local-video-file" className="mb-2 block text-sm font-medium">Local video file</label>
         <input ref={input} id="local-video-file" type="file" accept=".mp4,.mov,.avi,.mkv,.webm,.m4v"
           disabled={busy} onChange={e => { setFile(e.target.files?.[0] || null); setError(""); }}
@@ -174,6 +238,7 @@ export default function LocalVideoExperiment() {
           Upload {uploadPercent}% {uploadPercent === 100 && "\u2014 validating video; recognition has not started"}
           <progress aria-label="Video upload progress" value={uploadPercent} max={100} className="block w-full" />
         </div>}
+        </>}
       </Card>
       <div className="grid gap-4 md:grid-cols-[260px_1fr]">
         <Card>
@@ -183,17 +248,18 @@ export default function LocalVideoExperiment() {
             {list.map(exp => <li key={exp.id}><button disabled={busy} onClick={() => void select(exp.id)}
               className={"w-full break-words rounded-lg px-3 py-2 text-left text-sm " + (selected?.id === exp.id ? "bg-indigo-50 text-indigo-700" : "hover:bg-gray-50")}>
               <div className="font-medium">{exp.filename}</div>
+              {exp.kind === "drive_batch" && <div className="text-xs">Drive batch | {exp.total_videos} videos</div>}
               <div className="text-xs text-gray-500">{exp.status} | {exp.sampled_frames} sampled frames</div>
             </button></li>)}
           </ul>
           <Button className="mt-3" disabled={busy} onClick={() => void loadList().catch(err => setError(message(err)))}>Refresh list</Button>
         </Card>
         {selected ? <Card>
-          <h2 className="break-words font-semibold">{selected.filename}</h2>
+          <h2 ref={resultTitle} className="break-words font-semibold">{selected.filename}</h2>
           <p role="status" className="my-2 text-sm">Status: <strong>{selected.status}</strong></p>
           {selected.status === "ready" && <p className="mb-3 text-sm">Video validated. Recognition has not started.</p>}
           {selected.partial && <p className="mb-3 rounded bg-amber-50 p-2 text-sm text-amber-900">
-            Partial results only. Completed sampled frames preserved. {active ? "Processing may add more results." : "Upload a new experiment to run again."}
+            Partial results only. Completed sampled frames preserved. {active ? "Processing may add more results." : batch ? "Create a new batch to retry explicitly. Completed sources will not restart." : "Upload a new experiment to run again."}
           </p>}
           {selected.error && <p role="alert" className="mb-3 text-sm text-red-600">{selected.error}</p>}
           {selected.can_start && <ScanSettingsFields value={scanSettings} onChange={setScanSettings}
@@ -206,7 +272,9 @@ export default function LocalVideoExperiment() {
             <Button disabled={busy || !selected.can_delete} onClick={() => void remove()}>Delete</Button>
             <Button onClick={() => void download()}>Download CSV</Button>
           </div>
-          <p className="text-sm">Progress: {selected.progress_percent.toFixed(1)}% {selected.progress_is_estimate && "(estimate against reported metadata)"} | {selected.decoded_frames} decoded frames
+          {batch && <p className="mb-2 text-sm">Batch: {selected.finished_videos} / {selected.total_videos} videos stopped; {selected.completed_videos} completed, {selected.failed_videos} failed.
+            {" "}{selected.temporary_downloads_cleaned ? "Temporary downloads removed." : "One temporary source may be in use; removed when it stops."} Original Drive files unchanged.</p>}
+          <p className="text-sm">Progress: {selected.progress_percent.toFixed(1)}% {selected.progress_is_estimate && (batch ? "(estimate across download and decode phases)" : "(estimate against reported metadata)")} | {selected.decoded_frames} decoded frames
             {selected.verified_total_frames != null && " / " + selected.verified_total_frames + " verified total"}</p>
           {selected.decode_phase === "verifying_eof" && <p role="status" className="text-sm">Verifying readable EOF with independent decoder; recognition results preserved. Cancel remains available.</p>}
           {selected.decode_audit?.outcome === "normal_eof" && selected.media?.frame_count !== selected.verified_total_frames && <p className="text-sm text-amber-800">Clean EOF confirmed. Reported frame count differs from actual decoded frames; metadata does not prove missing or corrupt frames.</p>}
@@ -220,16 +288,16 @@ export default function LocalVideoExperiment() {
               <dt>Target detections per second</dt><dd>{selected.scan_settings.target_detections_per_second} maximum intended starts/s</dd>
             </>}
             <dt>Maximum scan cadence</dt><dd>{selected.can_start ? "Calculated on Start" : selected.max_scan_hz} samples/s before scan work and source/virtual-FPS limits</dd>
-            <dt>Actual processed cadence (video time)</dt><dd>{selected.actual_video_detection_hz == null ? "Available after two samples" : selected.actual_video_detection_hz.toFixed(3) + " samples/s"}</dd>
+            <dt>{batch ? "Aggregate cadence (sum of source intervals / spans)" : "Actual processed cadence (video time)"}</dt><dd>{selected.actual_video_detection_hz == null ? "Available after two samples in a source" : selected.actual_video_detection_hz.toFixed(3) + " samples/s"}</dd>
             <dt>Measured processing throughput (wall time)</dt><dd>{selected.processing_throughput_fps == null ? "\u2014" : selected.processing_throughput_fps.toFixed(3) + " sampled frames/s"}</dd>
             <dt>Decoded frames not inferred</dt><dd>{selected.decoded_frames_not_inferred}</dd>
-            <dt>Video duration (nominal)</dt><dd>{seconds(selected.media?.duration_seconds)}</dd>
+            {!batch && <><dt>Video duration (nominal)</dt><dd>{seconds(selected.media?.duration_seconds)}</dd>
             <dt>Reported frame count (estimate)</dt><dd>{selected.media?.frame_count ?? "\u2014"}</dd>
             <dt>Verified readable frame total</dt><dd>{selected.verified_total_frames ?? "Not verified in this run"}</dd>
             <dt>Decoded source timestamp range</dt><dd>{seconds(selected.decoded_timestamp_first_seconds)} to {seconds(selected.decoded_timestamp_last_seconds)}</dd>
             <dt>Largest decoded timestamp gap</dt><dd>{seconds(selected.decoded_timestamp_max_gap_seconds)}</dd>
-            <dt>Source FPS</dt><dd>{selected.media?.fps.toFixed(6) ?? "\u2014"}</dd>
-            <dt>Frames sampled</dt><dd>{selected.sampled_frames} / {selected.media?.expected_samples ?? selected.actual_max_samples_zero_work ?? selected.media?.max_samples ?? 0} {selected.media?.expected_samples != null ? "expected" : selected.actual_max_samples_zero_work != null ? "maximum on actual decoded frames with zero scan work" : "estimated maximum with zero scan work"}</dd>
+            <dt>Source FPS</dt><dd>{selected.media?.fps.toFixed(6) ?? "\u2014"}</dd></>}
+            <dt>Frames sampled</dt><dd>{selected.sampled_frames}{!batch && <> / {selected.media?.expected_samples ?? selected.actual_max_samples_zero_work ?? selected.media?.max_samples ?? 0} {selected.media?.expected_samples != null ? "expected" : selected.actual_max_samples_zero_work != null ? "maximum on actual decoded frames with zero scan work" : "estimated maximum with zero scan work"}</>}</dd>
             <dt>Elapsed processing time</dt><dd>{seconds(elapsed)}</dd>
             <dt>Detected faces across sampled frames</dt><dd>{selected.detected_face_detections}</dd>
             <dt>Enrolled identities frozen at start</dt><dd>{selected.model?.enrolled_identities ?? "Captured when started"}</dd>
@@ -260,7 +328,11 @@ export default function LocalVideoExperiment() {
             Reported frame count and nominal duration are metadata estimates. VFR or timestamp gaps do not imply corruption; v3 cadence still uses nominal index/FPS, so gaps are not replayed. Independent EOF validation distinguishes metadata mismatch from decoder damage. Truncated decode retains partial results.
           </p>
           {selected.model?.enrolled_identities === 0 && <p className="my-2 text-sm text-amber-800">No enrolled identities in snapshot. Detected faces are unmatched.</p>}
-          <h3 className="mb-2 font-semibold">Matched people</h3>
+          {batch && <>
+            <p className="my-3 text-sm">Combined counts sum source results once. They do not deduplicate the same person across cameras or measure passages. First/last timestamps below are minimum/maximum clip-relative timestamps; see each source for its exact range. Equal-score examples keep the earliest source (filename order), then earliest frame.</p>
+            <VideoBatchSources sources={selected.videos ?? []} />
+          </>}
+          <h3 className="mb-2 font-semibold">{batch ? "Combined matched people" : "Matched people"}</h3>
           {!(selected.people?.length) && <p className="mb-3 text-sm text-gray-500">
             {selected.status === "ready" ? "No results yet." : selected.sampled_frames === 0
               ? "No sampled frame results yet." : selected.detected_face_detections === 0
@@ -283,7 +355,7 @@ export default function LocalVideoExperiment() {
             Matched/unmatched face detections count individual detector results across sampled frames; repeated faces count again.
             Unknown faces have no persistent identity. Unique identities use enrolled identity keys, not names.
           </p>
-          <details className="mt-4">
+          {!batch && <details className="mt-4">
             <summary className="cursor-pointer text-sm font-medium">Sampled timestamps and per-frame counts ({selected.sampled_frames})</summary>
             <div className="mt-2 max-h-64 overflow-auto">
               <table className="w-full text-left text-xs">
@@ -294,7 +366,7 @@ export default function LocalVideoExperiment() {
                 </tr>)}</tbody>
               </table>
             </div>
-          </details>
+          </details>}
           <p className="mt-4 text-xs text-gray-600">
             CSV: UTF-8 with BOM. record_type=metadata uses key/value; record_type=person uses identity_key,
             name, detection_count, first_timestamp_seconds, last_timestamp_seconds, manual_verdict, review_meaning, preview_frame_number, preview_timestamp_seconds and preview_match_score.
@@ -302,6 +374,7 @@ export default function LocalVideoExperiment() {
             partial flag, duration, source FPS, selected camera FPS, wait and target detections/s, selection rule, actual video-time cadence,
             wall throughput, historical reference, processing time, model/provider and thresholds.
             No accuracy metric without labeled ground truth.
+            {batch && " Batch CSV appends source/statistics columns. metadata rows describe the batch; video rows contain per-source statistics; person rows contain combined counts and the representative source filename/verdict; video_person rows contain the breakdown. Do not sum person and video_person rows together. Clip timestamps have no shared camera clock."}
           </p>
         </Card> : <Card><p className="text-sm text-gray-500">Upload a video or select an existing video experiment.</p></Card>}
       </div>

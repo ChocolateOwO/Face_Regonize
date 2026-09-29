@@ -24,10 +24,13 @@ async function renderSelected(state){
  const jsx=(type,props)=>({type,props});const exports={};
  new Function("require","exports",compiled)(name=>{
   if(name==="react")return react;
+  if(name==="react-router-dom")return {useSearchParams:()=>[new URLSearchParams(),()=>{}]};
   if(name==="react/jsx-runtime")return {jsx,jsxs:jsx,Fragment:"Fragment"};
   if(name==="../components/ui")return {Button:"Button",Card:"Card",PageHeader:"PageHeader"};
-  if(name==="../components/VideoMatchPreview")return {default:"VideoMatchPreview"};
-  if(name==="../components/ScanSettingsFields")return {default:"Fields"};
+  if(name==="../components/VideoMatchPreview")return {__esModule:true,default:"VideoMatchPreview"};
+  if(name==="../components/ScanSettingsFields")return {__esModule:true,default:"Fields"};
+  if(name==="../components/DriveVideoBatchPanel")return {__esModule:true,default:"DriveVideoBatchPanel"};
+  if(name==="../components/VideoBatchSources")return {__esModule:true,default:"VideoBatchSources"};
   if(name==="../api/scanSettings")return settings;
   if(name==="../api/client")return {apiGet:async path=>path.endsWith(state.id)?state:{experiments:[state]},ApiError:class extends Error{}};
   throw Error(name);
@@ -61,4 +64,14 @@ test("clean EOF shows actual decoded total and metadata estimate separately",asy
  assert.match(result.text,/Reported frame count \(estimate\)\s+348/);
  assert.match(result.text,/Clean EOF confirmed/);assert.match(result.text,/23.133 s/);
  assert.doesNotMatch(result.text,/Partial results only/);
+});
+test("Drive batch displays combined names, source breakdown, partial errors and CSV without local FPS fiction", async()=>{
+ const result=await renderSelected({...base,kind:"drive_batch",filename:"Seven cameras",media:null,status:"completed_with_errors",
+  total_videos:7,finished_videos:7,completed_videos:6,failed_videos:1,temporary_downloads_cleaned:true,
+  people:[{identity_key:"a",name:"Synthetic Batch Person",detection_count:18,first_timestamp_seconds:0,last_timestamp_seconds:.8}],videos:[]});
+ assert.match(result.text,/Combined matched people/);assert.match(result.text,/Synthetic Batch Person/);
+ assert.match(result.text,/7\s*\/\s*7 videos stopped/);assert.match(result.text,/6 completed,\s*1 failed/);
+ assert.match(result.text,/Temporary downloads removed/);assert.match(result.text,/Do not sum person and video_person rows together/);
+ assert.match(result.text,/Download CSV/);assert.ok(result.nodes.some(node=>node.type==="VideoBatchSources"));
+ assert.doesNotMatch(result.text,/Source FPS\s*—/);
 });

@@ -1,5 +1,177 @@
 # Reconize Current Task
 
+## Main Drive video GitHub publication - 2026-09-29
+
+The user personally verified the Main white-screen fix and explicitly asked to
+push the verified work to GitHub. Commit/push approval applies to the scoped
+Drive video batch implementation, link-only Drive listing, recovery fix, tests
+and documentation already in this worktree. Main code needs no new change.
+Branch: main, tracking origin/main; both were f27a9d5 before publication.
+Exclude unrelated .vscode and all ignored patch backups, user video/results,
+database, storage, logs, .env and credentials. The existing six-video user batch
+is completed; publication must not start or rerun it. Main stays on 5173/8000.
+The documentation originals were hash-verified at
+patch/2026-09-29_2357_github_publication/original before this status update.
+Stage: USER VERIFIED MAIN / GITHUB COMMIT AND PUSH AUTHORIZED. Git history and
+the push response establish the resulting commit and remote state.
+
+## Main Drive batch white-screen correction - 2026-09-29
+
+Explicit Main-only frontend repair; no commit/push. Earlier uncommitted work
+is preserved. Pre-edit copies/hash manifest are under ignored
+patch/2026-09-29_140723_video-batch-white-screen/original. HEAD f27a9d5 unchanged.
+
+Read-only inspection confirmed the user's existing six-video batch was running.
+Start returned 201; subsequent detail polling returned 200. No new real batch,
+download, retry, deletion, worker interruption or backend restart was initiated.
+At the latest inspection, sources 001-003 completed, 004 was downloading, and
+005-006 were pending, with no source errors. Main backend PID 25536 remains
+running from backend on 8000; Main Vite PID 23808 remains on 5173.
+
+Proven cause: public batch responses intentionally omit private source_file
+metadata, but VideoBatchSources dereferenced source.source_file.bytes when a
+source became downloading. A synthetic browser replay of that actual response
+shape captured TypeError: Cannot read properties of undefined (reading 'bytes'),
+and React cleared the root despite successful Start/poll responses. The user's
+browser tabs were unavailable to the UI helper; the replay used an isolated
+synthetic browser, not the user's session or media.
+
+Downloading rows now display transferred MiB safely when the total is absent.
+Start selects the returned batch immediately and records its ID in the URL.
+Reload/reopen reads that existing batch (or the active/listed batch), never
+starts another worker. Invalid Start/status responses and polling failures
+show visible actionable errors; the last valid progress stays visible.
+Per-video errors, old results, names, previews, verdicts, CSV, permissions,
+MKV support, frozen settings and temporary cleanup behavior are preserved.
+No backend source/config/data, recognition, Event, Legacy, Dummy or UrgentBlur
+changes were made for this correction.
+
+Changed: LocalVideoExperiment.tsx, VideoBatchSources.tsx,
+local-video-results.test.mjs, new video-batch-progress.test.mjs, this file,
+PROJECT_CONTEXT.md and docs/drive-video-batches.md.
+Focused backend regressions: 144 passed. Relevant frontend: 35 passed, including
+synthetic seven-video Start/download progress, reload/reopen with only one
+Start, partial failures, transient polling errors, rejected/malformed Start
+responses and explicit failed-result recovery. Typecheck/build passed.
+Live-5173 synthetic browser confirmed the same flow with no console exceptions;
+all experiment APIs were intercepted and no Main data was written.
+
+Manual recovery: open
+http://localhost:5173/local-video-experiment?experiment=<existing-job-id>
+while signed in as admin. Do not click Start again for that existing run.
+Stage: FRONTEND FIX VERIFIED / EXISTING USER BATCH CONTINUES / WAITING FOR USER
+VISUAL CONFIRMATION. No commit or push.
+
+## Main link-only Drive video listing correction - 2026-09-29
+
+Explicit Main-only user request supersedes Dummy-first workflow for this fix.
+No commit/push. Preserve earlier uncommitted batch implementation and unrelated
+.vscode. Pre-edit source backups/hash manifest: ignored
+patch/2026-09-29_130808_drive-link-listing/original. HEAD f27a9d5 unchanged.
+
+Actual metadata-only diagnosis: stored grant has no scope metadata; refreshed
+token grants drive.file only. Drive can resolve the folder but returns zero direct
+children before filters, with incompleteSearch=false. No real video download
+or processing. Real child MIME/size/duration remains unverified until consent.
+Separate restrictive MKV MIME gate removed; supported extensions are candidates
+regardless of generic MIME, with actual decoder validation during processing.
+
+Video start adds exactly drive.readonly while retaining drive.file through the
+same OAuth project/callback. One-time reconnect required for older grants.
+Existing writers/Picker still request drive.file; video token requests readonly.
+Google's granted scopes stored in existing Settings, no schema change. Partial
+readonly-only consent cannot overwrite the existing file connection. Video UI
+has paste link / List videos / checkboxes, no Picker or automatic processing.
+Authenticated metadata validates folders, parents, shared-drive/resource-key
+access, pagination, and account; access/empty/unsupported results differ.
+
+New Drive limits: 16 GiB / 12 hours per file, max 32 selected, 1-120 source FPS,
+4K pixels, reported size plus 1 GiB reserve before download and per-chunk disk
+checks. One source at a time. Frozen limits included in new state/CSV; local
+upload stays 512 MiB / 30 minutes. Existing counts, timing, previews, verdicts,
+CSV field meanings, partial failures, restart protection and cleanup preserved.
+
+Focused final backend: 144 passed (mocked Drive/OAuth, synthetic MKV/VFR and
+truncation, old video/scan/Picker/destination regressions). Relevant frontend:
+30 passed. Typecheck/build passed. Synthetic live-5173 browser verified seven
+checkboxes with generic-MIME MKV and 2 GiB/one-hour candidate; no Picker; idle
+listing/selection; one batch; matched names, per-source counts, boxed source
+preview, zoom, verdict and CSV. No Main data writes in preflight. Five unchanged
+photo-download frontend tests still fail because their mock omits
+ExportSelectionPanel; no unrelated fix. Full final backend: 732 passed. Main
+backend PID 25348 was immediately verified idle and stopped alone; updated
+Main PID 25536 serves 8000. Existing Main Vite PID 23808 remains on 5173. Both
+health paths pass; an unmocked browser marker reached confirmed Main backend,
+unauthenticated listing returns 401 and served TSX matches Main. Post-restart
+schema/row-count/old-experiment-state audit matches pre-change baseline.
+Actual account verifies connected; readonly access is false until user consent.
+See docs/drive-video-batches.md for final verification/manual
+consent steps. Main DB/schema and older experiment protected; no environment,
+credentials, thresholds, models, Event, Legacy, Dummy or UrgentBlur changes.
+
+Stage: MAIN IMPLEMENTED / WAITING FOR USER REAL DRIVE CONSENT + MANUAL TEST.
+
+## Earlier Main Drive batch implementation (grant flow superseded above)
+
+User explicitly requested implementation directly in Main, no commit/push.
+Dummy, UrgentBlur, Legacy Drive, normal Event Batch, recognition configuration,
+model weights, enrollment and real data are protected. Original Main source
+was backed up under the ignored patch folder. Initial HEAD f27a9d5; unrelated
+untracked .vscode is untouched. No dependencies, schema or environment edits.
+
+Implemented admin-only Drive input alongside the existing local upload on
+/local-video-experiment. Reuses existing OAuth/Picker grant/token flow with
+drive.file only; strict Drive API folder/file verification, no arbitrary URL
+downloads, no Drive mutations. Folder Picker plus multi-video Picker confirms
+missing per-file grants. Named batches freeze selected versions/account and
+all three scan settings. One source is downloaded/decoded/checked/removed at a
+time. Shared decoder keeps existing timing, threshold and count semantics.
+
+Per-source checkpoints feed replacement aggregation (no increment duplication).
+Mixed failures preserve successful/partial sources and continue; cancellation
+stops safely, marks remaining sources not_processed and removes downloads.
+Restart cleanup never starts/retries a worker. Best deterministic full-frame
+preview per batch identity retains source filename/frame/timestamp/bbox/score;
+one example's verdict stays separate from automatic counts. Existing single
+results and 13-column CSV remain readable; batch CSV appends source statistics
+and breakdown rows. Full details: docs/drive-video-batches.md.
+
+Verification: full Main backend 716 passed; 20 new mocked-Drive/synthetic-video
+tests plus existing video/scan regressions passed. Relevant frontend 28 passed;
+typecheck/build passed. Disposable browser on live Main 5173 verified seven
+checkboxes, idle selection, one named batch, frozen defaults, per-source and
+combined counts, source preview box, zoom and verdict without count changes.
+All experiment responses were synthetic/intercepted; no real Drive download
+or user-video processing. Five extra, unrelated photo-download frontend tests
+fail in unchanged code because their mock omits ExportSelectionPanel; normal
+Event/photo source/test files were left unchanged.
+
+Main runs on 5173 with its existing proxy to Main 8000. Backend must run from
+Reconize/backend: .env DB/storage paths are relative to that working directory.
+Read-only audit confirmed actual Main has no pending migrations; startup uses
+130 enrolled identities and preserves schema/counts/old experiment state.
+An initial root-working-directory audit saw the older root DB; corrected
+before startup, with no DB modification. Synthetic health probe reaches the
+confirmed Main backend. Protected recognition/Event source hashes are unchanged.
+
+Existing OAuth connection is present. Initially Picker lacked
+GOOGLE_PICKER_API_KEY and GOOGLE_CLOUD_PROJECT_NUMBER. The user supplied both
+settings and explicitly requested backend reload on 2026-09-29. After checking
+Main PID 2292's port/command/backend working directory and no active jobs, only
+that backend PID was stopped. Main backend now runs as PID 25348 on 8000;
+frontend PID 23808 on 5173 was preserved. Health on 8000 and through 5173 passed;
+Picker config reports enabled=true, connected=true, missing=[]. Read-only
+post-start audit confirms schema/row counts and old experiment state unchanged.
+No agent code/config/credential edit, Drive request, download, commit or push.
+CURRENT_TASK.md and docs/drive-video-batches.md runtime notes updated only.
+Actual Google grant/file access still awaits the user's manual test.
+
+Stage: IMPLEMENTED / AUTOMATED + SYNTHETIC VISUAL VERIFIED / WAITING FOR USER
+REAL DRIVE MANUAL TEST. No commit or push. Main left running for manual test.
+Original Drive files are never changed. Batch retains state.json, at most one
+previews/<identity_key>.jpg per person and reviews.json; CSV generated on demand.
+downloads/source.<container> removed after success/failure/cancel/recovery.
+
 ## Main 5173 video navigation/runtime correction - 2026-09-29
 
 User requested Main-only diagnosis/correction and authorized a focused commit

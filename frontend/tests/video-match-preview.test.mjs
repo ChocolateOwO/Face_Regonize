@@ -7,7 +7,7 @@ const source=readFileSync(new URL("../src/components/VideoMatchPreview.tsx",impo
 const compiled=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,jsx:ts.JsxEmit.ReactJSX}}).outputText;
 const person={identity_key:"a",name:"Synthetic Alpha",detection_count:8,manual_verdict:"Not reviewed",preview_available:true,
  preview:{frame_index:2,frame_number:3,timestamp_seconds:.4,source_timestamp_seconds:.433,match_score:.9,
-  selection_rule:"strongest valid cosine similarity; earliest tie",example_key:"1".repeat(32),width:80,height:30,bbox:[0,4.4,39.8,30]}};
+  selection_rule:"strongest valid cosine similarity; earliest tie",source_filename:"synthetic_cam07.avi",example_key:"1".repeat(32),width:80,height:30,bbox:[0,4.4,39.8,30]}};
 async function setup({old=false,active=false}={}){
  let cursor=0,dirty=true,tree;const hooks=[],effects=[],requests=[],posts=[],revoked=[],reviewed=[];
  globalThis.document={activeElement:{focus:()=>{}},addEventListener:()=>{},removeEventListener:()=>{}};
@@ -44,6 +44,7 @@ test("modal uses authenticated Blob endpoint, boxed whole frame and proportional
   const zoom=app.nodes().find(n=>n.props["aria-label"]==="Match preview zoom");zoom.props.onChange({target:{value:"2"}});await app.flush();
   assert.match(app.text(),/Zoom 2.0\s*x/);assert.ok(app.nodes().some(n=>n.props.style?.width==="200%"));
   assert.match(app.text(),/0.433 s/);assert.match(app.text(),/Frame 3/);assert.match(app.text(),/Cosine similarity: 0.9000/);
+  assert.match(app.text(),/Source video:\s*synthetic_cam07.avi/);
  }finally{app.cleanup();}assert.deepEqual(app.revoked,["blob:synthetic-authenticated"]);
 });
 test("manual verdict sends exact example key, does not send counts or accuracy",async()=>{

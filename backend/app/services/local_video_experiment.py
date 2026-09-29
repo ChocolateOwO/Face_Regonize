@@ -1,4 +1,7 @@
-"""Local video experiment: no Drive, Event Batch, attendance or DB writes.
+"""Sequential video recognition shared by local uploads and Drive video batches.
+
+No Event Batch, attendance or DB writes. Drive input/cleanup is isolated in
+drive_video_batch; this decoder has no Drive or legacy experiment dependency.
 
 Configured-camera v3: completion-paced scans with target-rate and virtual FPS limits.
 A virtual source clock advances without sleeping; decode/discard intervening
@@ -124,6 +127,9 @@ def initialize() -> None:
                     state = _read(path.name)
                 except NotFound:
                     continue
+                if state.get("kind") == "drive_batch":
+                    from app.services.drive_video_batch import recover
+                    recover(state)
                 if state["status"] in ACTIVE | {"uploading"}:
                     state.update(status="interrupted", finished_at=now(),
                         error="Backend restarted. Partial results preserved; upload a new experiment to run again.")
@@ -240,6 +246,9 @@ def save_representative(state: dict, row: dict, face, match, image, frame_index:
         bbox=[x1 * out_width / width, y1 * out_height / height, x2 * out_width / width, y2 * out_height / height],
         image_sha256=hashlib.sha256(encoded.tobytes()).hexdigest(),
         example_key=hashlib.sha256(encoded.tobytes() + json.dumps([frame_index, x1, y1, x2, y2, score]).encode()).hexdigest()[:32])
+    if state.get("source_video_key"):
+        row["preview"].update(source_filename=state["filename"], source_video_key=state["source_video_key"])
+        row["preview"]["example_key"] = hashlib.sha256((row["preview"]["example_key"] + state["source_video_key"]).encode()).hexdigest()[:32]
 
 
 def _reviews(job_id: str) -> dict:
@@ -310,7 +319,7 @@ def maximum_sample_count(frames: int, fps: float, settings: ScanSettings | None 
     return count
 
 
-def probe(path: Path) -> dict:
+def probe(path: Path, *, max_duration: float = MAX_DURATION) -> dict:
     with path.open("rb") as stream:
         header = stream.read(32)
     is_avi = header[:4] == b"RIFF" and header[8:12] == b"AVI "
@@ -328,8 +337,8 @@ def probe(path: Path) -> dict:
             raise MediaError("No reliable FPS, frame count or dimensions. Export a constant-frame-rate MP4 and retry.")
         frames = round(count)
         duration = frames / fps
-        if fps < 1.0 or fps > MAX_FPS or duration > MAX_DURATION or width * height > MAX_PIXELS:
-            raise MediaError("Video limit: 30 minutes, 1-120 FPS, at most 3840x2160 pixels. Export a smaller constant-frame-rate video.")
+        if fps < 1.0 or fps > MAX_FPS or duration > max_duration or width * height > MAX_PIXELS:
+            raise MediaError(f"Video limit: {max_duration / 60:g} minutes, 1-120 FPS, at most 3840x2160 pixels. Export a smaller supported video.")
         ok, first = cap.read()
         if not ok or first is None or first.size == 0:
             raise MediaError("First frame cannot be decoded. Try MP4/H.264 or AVI/MJPEG.")
@@ -396,13 +405,17 @@ def start(job_id: str, settings: ScanSettings | dict | None = None) -> dict:
             post_scan_delay_seconds=settings.post_scan_delay_seconds, historical_reference=HISTORICAL_COMMIT,
             timing_differences=TIMING_DIFFERENCES, scan_work_seconds=0.0,
             scan_settings=settings.model_dump(), preview_version=1)
-        state["media"].update(expected_samples=None,
-            max_samples=maximum_sample_count(state["media"]["frame_count"], state["media"]["fps"], settings),
-            virtual_capture_fps_limit=settings.camera_fps,
-            effective_available_fps_limit=min(settings.camera_fps, state["media"]["fps"]))
+        worker = run
+        if state.get("kind") == "drive_batch":
+            from app.services.drive_video_batch import run as worker
+        else:
+            state["media"].update(expected_samples=None,
+                max_samples=maximum_sample_count(state["media"]["frame_count"], state["media"]["fps"], settings),
+                virtual_capture_fps_limit=settings.camera_fps,
+                effective_available_fps_limit=min(settings.camera_fps, state["media"]["fps"]))
         _write(state)
         try:
-            threading.Thread(target=run, args=(job_id,), name="local-video-experiment", daemon=True).start()
+            threading.Thread(target=worker, args=(job_id,), name="local-video-experiment", daemon=True).start()
         except Exception:
             _active = None
             state.update(status="failed", error="Could not start worker.", finished_at=now())
@@ -485,17 +498,17 @@ def verify_eof(path: Path, decoded_frames: int) -> dict:
             metadata_frame_count_is_estimate=True, verifier="FFmpeg sequential decode to null (no duplicate frames)")
 
 
-def run(job_id: str) -> None:
-    global _active
-    clock = time.perf_counter()
-    state = get(job_id)
+def process_video(state: dict, path: Path, index, settings: ScanSettings, checkpoint, representative=None) -> None:
+    """One sequential source; caller owns persistence, errors and worker slot.
+
+    Batch and single uploads share exactly the same scan and count loop.
+    A batch representative callback retains just one frame per batch identity.
+    """
     cap = None
-    counts = {}
+    counts = {row["person_id"]: row for row in state["people"]}
+    max_duration = state.get("input_limits", {}).get("max_duration_seconds", MAX_DURATION)
     try:
-        settings = ScanSettings.model_validate(state["scan_settings"])
-        index, state["model"] = identity_snapshot()
-        _checkpoint(state, clock)
-        cap = open_capture(video_path(state))
+        cap = open_capture(path)
         if not cap.isOpened():
             raise MediaError("Video can no longer be opened. Try MP4/H.264 or AVI/MJPEG.")
         next_frame, capture_time = 0, 0.0
@@ -503,14 +516,14 @@ def run(job_id: str) -> None:
             ok, image = cap.read()
             if not ok or image is None:
                 state["decode_phase"] = "verifying_eof"
-                _checkpoint(state, clock)
-                state["decode_audit"] = verify_eof(video_path(state), state["decoded_frames"])
+                checkpoint()
+                state["decode_audit"] = verify_eof(path, state["decoded_frames"])
                 if state["decode_audit"]["error"] and not _cancel.is_set():
                     raise MediaError(state["decode_audit"]["error"])
                 break
             frame_index = state["decoded_frames"]
-            if frame_index >= MAX_DURATION * state["media"]["fps"]:
-                raise MediaError("Decoded nominal duration exceeds the 30 minute limit. Partial results retained.")
+            if frame_index >= max_duration * state["media"]["fps"]:
+                raise MediaError(f"Decoded nominal duration exceeds the {max_duration / 60:g} minute limit. Partial results retained.")
             # PTS is observational metadata only; v3 selection remains index/FPS.
             pts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000 if hasattr(cap, "get") else None
             if pts is not None and math.isfinite(pts) and pts >= 0:
@@ -519,8 +532,8 @@ def run(job_id: str) -> None:
                 state["decoded_timestamp_last_seconds"] = pts
                 state["decoded_timestamp_max_gap_seconds"] = max(state.get("decoded_timestamp_max_gap_seconds", 0),
                     pts - previous_pts if previous_pts is not None else 0)
-                if pts - state["decoded_timestamp_first_seconds"] > MAX_DURATION:
-                    raise MediaError("Decoded timestamp duration exceeds the 30 minute limit. Partial results retained.")
+                if pts - state["decoded_timestamp_first_seconds"] > max_duration:
+                    raise MediaError(f"Decoded timestamp duration exceeds the {max_duration / 60:g} minute limit. Partial results retained.")
             if image.size == 0 or image.shape[0] * image.shape[1] > MAX_PIXELS:
                 raise MediaError("Invalid frame or changing resolution exceeds limits. Partial results retained.")
             state["decoded_frames"] += 1
@@ -560,20 +573,32 @@ def run(job_id: str) -> None:
             # for each identity, reusing this detection's bbox and matcher score.
             for face, match in zip(faces, matches):
                 if match.person_id is not None:
-                    save_representative(state, counts[match.person_id], face, match, image, frame_index, timestamp)
+                    (representative or save_representative)(state, counts[match.person_id], face, match, image, frame_index, timestamp)
             next_frame, capture_time = next_capture(frame_index, capture_time, work_seconds, state["media"]["fps"], settings)
-            _checkpoint(state, clock)
+            checkpoint()
         state["status"] = "cancelled" if _cancel.is_set() else "completed"
         if state["status"] == "completed":
             state["actual_max_samples_zero_work"] = maximum_sample_count(state["decoded_frames"], state["media"]["fps"], settings)
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def run(job_id: str) -> None:
+    global _active
+    clock = time.perf_counter()
+    state = get(job_id)
+    try:
+        settings = ScanSettings.model_validate(state["scan_settings"])
+        index, state["model"] = identity_snapshot()
+        _checkpoint(state, clock)
+        process_video(state, video_path(state), index, settings, lambda: _checkpoint(state, clock))
     except MediaError as exc:
         state.update(status="failed", error=str(exc))
     except Exception:
         logger.exception("Local video experiment failed")
         state.update(status="failed", error="Video processing failed. Partial results retained. Check backend log and try a supported video.")
     finally:
-        if cap is not None:
-            cap.release()
         with _lock:
             state.update(finished_at=now(), processing_seconds=round(time.perf_counter() - clock, 6), decode_phase="stopped")
             try:
@@ -586,7 +611,7 @@ def public(state: dict, *, detail: bool = True) -> dict:
     result["can_start"] = state["status"] == "ready"
     result["can_cancel"] = state["status"] in ACTIVE
     result["can_delete"] = state["status"] not in ACTIVE | {"uploading"}
-    result["partial"] = state["status"] in {"running", "cancelling", "cancelled", "interrupted", "failed"}
+    result["partial"] = state["status"] in {"running", "cancelling", "cancelled", "interrupted", "failed", "completed_with_errors"}
     result["unique_matched_people"] = len(state["people"])
     result["decoded_frames_not_inferred"] = max(0, state["decoded_frames"] - state["sampled_frames"])
     samples = state["samples"]
@@ -617,6 +642,9 @@ def public(state: dict, *, detail: bool = True) -> dict:
         person["manual_verdict"] = review.get("verdict", "Not reviewed") if example and review.get("example_key") == example.get("example_key") else "Not reviewed"
         person["preview_message"] = ("No valid representative frame is available for this match." if state.get("preview_version") else "Preview unavailable for this older run")
         person["review_meaning"] = "shown example only; does not verify every detection"
+    if state.get("kind") == "drive_batch":
+        from app.services.drive_video_batch import decorate_public
+        decorate_public(result, state, detail=detail)
     if not detail:
         result.pop("samples")
         result.pop("people")
@@ -627,6 +655,9 @@ def _csv_text(value) -> str:
     return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
 
 def to_csv(state: dict) -> str:
+    if state.get("kind") == "drive_batch":
+        from app.services.drive_video_batch import to_csv as batch_csv
+        return batch_csv(state)
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     writer.writerow(["record_type", "key", "value", "identity_key", "name", "detection_count",

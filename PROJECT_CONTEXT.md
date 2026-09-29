@@ -1,5 +1,32 @@
 # Reconize Project Context
 
+## Main video Drive batches - 2026-09-29
+
+Local Video Experiment now supports named admin-only sequential Drive batches
+alongside local uploads. Link-only listing now adds drive.readonly consent to
+the existing OAuth project/account; drive.file writers and other Picker flows
+remain unchanged. Folder links list paginated direct children, including MKV
+with generic MIME; shared-folder/Shared Drive/resource-key requests use Drive
+metadata only. Unselectable files retain explicit reasons. New Drive inputs
+allow 16 GiB / 12 hours each, sequentially, with 1 GiB disk reserve; local uploads
+retain 512 MiB / 30 minutes. No Legacy/Event
+pipeline, Drive mutation, recognition/attendance write or model configuration change.
+Per-video checkpoints aggregate once; one strongest valid representative full
+frame per batch identity includes source filename. Verdict covers that example
+only. Temporary source downloads are deleted on terminal paths and startup;
+retained results/previews/reviews remain private. Older single results/CSV stay
+unchanged. The video page now selects a created batch immediately, persists its
+ID in the experiment query parameter, and recovers status on reload/reopen
+without another Start. Downloading rows tolerate private source metadata being
+absent; Start/polling errors stay visible instead of clearing the React page.
+The white-screen correction changed frontend/tests/docs only; the existing
+user batch and backend worker were inspected read-only and left running.
+See docs/drive-video-batches.md and CURRENT_TASK.md for verification,
+manual readonly consent setup and Git publication status. Main backend must launch from
+backend because configured DB/storage paths are relative. Existing Main Picker
+requires GOOGLE_PICKER_API_KEY and GOOGLE_CLOUD_PROJECT_NUMBER configuration
+for other features; video batches no longer require Picker confirmation.
+
 ## 1. Project Overview
 
 Reconize is a local-first event management and face-recognition system.
