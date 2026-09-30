@@ -84,6 +84,8 @@ class VideoCase(unittest.TestCase):
         self.patch(video, "identity_snapshot", lambda: (self.index, self.model.copy()))
         self.patch(video, "detect", lambda image: [])
         self.patch(video, "scan_clock", lambda: 0.0)
+        from video_scheduler_fixture import install
+        install(self)
         # Google construction is a hard failure even if an accidental coupling
         # gets introduced in a later change.
         from app.services import google_drive_folder_service, google_drive_oauth_service
@@ -94,12 +96,25 @@ class VideoCase(unittest.TestCase):
     def no_google(self, *_a, **_kw):
         raise AssertionError("Real Google Drive forbidden in synthetic tests")
 
+    def test_frozen_enrollment_survives_restart_without_new_database_read(self):
+        from app.services import video_scheduler as scheduler
+        state = self.upload()
+        scheduler.freeze(state['id'])
+        with patch.object(video, 'identity_snapshot', side_effect=AssertionError('Do not refresh enrollment')):
+            restored = scheduler.load_index(state['id'])
+        matches = restored.match_batch(np.stack([embedding(0), embedding(1)]), .45)
+        self.assertEqual([m.person_id for m in matches], ['a', 'b'])
+        self.assertEqual([m.full_name for m in matches], ['Same Name', 'Same Name'])
+        self.assertNotIn('enrollment', json.dumps(video.public(state)))
+
     def patch(self, obj, name, value):
         p = patch.object(obj, name, value)
         p.start()
         self.addCleanup(p.stop)
 
     def drain(self):
+        from video_scheduler_fixture import drain
+        drain()
         video._cancel.set()
         deadline = time.monotonic()+10
         while video._active is not None and time.monotonic()<deadline:
@@ -186,11 +201,18 @@ class VideoCase(unittest.TestCase):
         status,_,_=self.call("?filename=x.avi","POST",b"",{"Content-Type":"application/octet-stream"})
         self.assertEqual(status,400)
         self.assertEqual(self.call("?filename=x.avi","POST",b"x",{"Content-Type":"video/avi"})[0],415)
-        self.assertEqual(self.call("?filename=x.avi","POST",b"",{
-            "Content-Type":"application/octet-stream","Content-Length":str(video.MAX_BYTES+1)})[0],413)
-        with patch.object(video,"MAX_BYTES",10):
+        # No fixed size ceiling: a declared 64 GiB upload is refused only because
+        # this (patched) disk cannot hold it beside the reserve.
+        with patch.object(video.shutil, "disk_usage", lambda path: SimpleNamespace(free=10 * 1024**3)):
+            status, raw, _ = self.call("?filename=x.avi","POST",b"",{
+                "Content-Type":"application/octet-stream","Content-Length":str(64 * 1024**3)})
+            self.assertEqual(status, 507)
+            self.assertIn(b"Not enough free disk space for x.avi", raw)
+        # Undeclared length: space runs out mid-stream; the partial file is removed.
+        with patch.object(video.shutil, "disk_usage", lambda path: SimpleNamespace(free=video.DISK_RESERVE + 8)):
             self.assertEqual(self.call("?filename=x.avi","POST",headers={"Content-Type":"application/octet-stream"},
-                chunks=[b"123456",b"789012"])[0],413)
+                chunks=[b"123456",b"789012"])[0],507)
+        self.assertEqual(video.claimed_disk_bytes(), 0, "every claim is released")
         self.assertEqual(video.list_jobs(),[])
         self.assertEqual(list(video.ROOT.iterdir()),[])
 
@@ -589,7 +611,7 @@ class VideoCase(unittest.TestCase):
     def test_cancel_during_eof_verification_preserves_complete_samples(self):
         state=self.upload()
         entered,release=threading.Event(),threading.Event()
-        def verify(*args):
+        def verify(*args, **kwargs):
             entered.set(); self.assertTrue(release.wait(5))
             return dict(outcome="cancelled",verified_frame_count=None,error=None)
         with patch.object(video,"verify_eof",verify):

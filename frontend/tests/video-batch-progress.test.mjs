@@ -7,7 +7,7 @@ import ts from "typescript";
 import * as settings from "../src/api/scanSettings.ts";
 const ID = "a".repeat(32), API = "/api/local-video-experiment";
 const account = { display_name: "Synthetic", email: "fake@example.test", account_id: "fake-account" };
-const limits = { max_bytes: 16 * 1024**3, max_duration_seconds: 43200, max_files: 32, disk_reserve_bytes: 1024**3, containers: [".mkv"] };
+const limits = { max_duration_seconds: 43200, max_files: 32, disk_reserve_bytes: 1024**3, containers: [".mkv"] };
 const files = Array.from({ length: 7 }, (_, i) => ({ file_id: "video_0000" + (i + 1), filename: "cam0" + (i + 1) + ".mkv", bytes: 1024**3, supported: true, mime_type: "application/x-unknown" }));
 function fixture() {
   return { id: ID, kind: "drive_batch", filename: "Seven synthetic cameras", status: "running", created_at: "2026-01-01T00:00:00Z",
@@ -22,7 +22,7 @@ function fixture() {
       unknown_detections: 0, frames_with_unknown: 0, verified_total_frames: null, progress_percent: 0, processing_seconds: 0,
       actual_video_detection_hz: null, people: [], samples: [] })) };
 }
-function sharedApi() { return { job: null, starts: 0, requests: [], startError: null, malformed: false, pollError: false }; }
+function sharedApi() { return { job: null, jobs: [], starts: 0, requests: [], startError: null, malformed: false, pollError: false }; }
 async function mount(shared = sharedApi(), query = "") {
   const contexts = new Map(), effects = [], timers = new Map(), exports = new Map();
   let current, dirty = true, tree, nextTimer = 0, visited, params = new URLSearchParams(query);
@@ -44,24 +44,27 @@ async function mount(shared = sharedApi(), query = "") {
     ApiError: class extends Error {},
     async apiGet(path) {
       shared.requests.push({ method: "GET", path });
+      if (path === API + "/execution") return shared.execution ?? { options: [{ value: "auto", label: "Auto" }, { value: "cpu", label: "CPU" }], max_workers: 2, active_workers: 0, inference_limit: 1 };
       if (path.startsWith(API + "/drive/status")) return { connected: true, read_access: true, account, limits };
-      if (path === API) return { experiments: shared.job ? [{ ...shared.job, videos: undefined }] : [] };
-      if (path === API + "/" + ID) {
+      if (path === API) return { experiments: (shared.jobs.length ? shared.jobs : shared.job ? [shared.job] : []).map(job => ({ ...job, videos: undefined })) };
+      if (path === API + "/" + shared.job?.id || shared.jobs.some(job => path === API + "/" + job.id)) {
         if (shared.pollError) { shared.pollError = false; throw Error("Status request interrupted; retrying."); }
-        return structuredClone(shared.job);
+        return structuredClone(shared.jobs.find(job => path === API + "/" + job.id) ?? shared.job);
       }
       throw Error("Unexpected read: " + path);
     },
     async apiPostJson(path, body) {
       shared.requests.push({ method: "POST", path, body });
+      if (path === API + "/execution") return { max_workers: body.max_workers };
       if (path.endsWith("/drive/folder")) return { folder_id: "folder_12345", folder_name: "Seven cameras", account, files, limits, outcome: "videos", subfolder_count: 0, message: "Seven supported videos." };
       if (path.endsWith("/drive/batches")) {
         shared.starts++; if (shared.startError) throw Error(shared.startError);
-        shared.job = fixture(); return shared.malformed ? { status: "running" } : structuredClone(shared.job);
+        shared.job = fixture(); shared.job.id = shared.starts === 1 ? ID : "b".repeat(32); shared.jobs.push(shared.job);
+        return shared.malformed ? { status: "running" } : structuredClone(shared.job);
       }
       throw Error("Unexpected write: " + path);
     },
-    async apiDelete(path) { shared.requests.push({ method: "DELETE", path }); shared.job = null; },
+    async apiDelete(path) { shared.requests.push({ method: "DELETE", path }); shared.jobs = shared.jobs.filter(job => path !== API + "/" + job.id); shared.job = null; },
     downloadFile() {},
   };
   const jsx = (type, props) => ({ type, props });
@@ -140,7 +143,7 @@ test("poll failures keep visible progress and retry; processing and partial erro
   assert.match(ui.text(), /Status request interrupted/); assert.match(ui.text(), /Status: running/);
   Object.assign(ui.shared.job.videos[0], { status: "failed", error: "Synthetic unsupported codec; partial results kept." });
   Object.assign(ui.shared.job.videos[1], { status: "running", progress_percent: 25, media: { fps: 15, frame_count: 100, duration_seconds: 6.667 }, sampled_frames: 2 });
-  await ui.tick(); assert.match(ui.text(), /Synthetic unsupported codec/); assert.match(ui.text(), /25\.0\s*% estimated decode progress/);
+  await ui.tick(); await ui.tick(); assert.match(ui.text(), /Synthetic unsupported codec/); assert.match(ui.text(), /25\.0\s*% estimated decode progress/);
   assert.doesNotMatch(ui.text(), /Status request interrupted/); assert.equal(ui.shared.starts, 1); ui.dispose();
 });
 test("Start rejected before creation displays an actionable error with no progress job or duplicate", async () => {
@@ -159,4 +162,58 @@ test("explicit failed batch URL recovers partial error state; Delete does not re
   const ui = await mount(shared, "experiment=" + ID); assert.match(ui.text(), /Synthetic download interrupted/);
   assert.equal(shared.starts, 0); await ui.click("Delete"); assert.equal(shared.job, null); assert.doesNotMatch(ui.text(), /Status: failed/);
   assert.equal(shared.starts, 0); ui.dispose();
+});
+
+test("worker ceiling comes from the backend (not a fixed 4) and work is shown by stage", async () => {
+  const shared = sharedApi();
+  shared.execution = { options: [{ value: "auto", label: "Auto" }], max_workers: 2, max_workers_limit: 12, default_workers: 2,
+    active_workers: 5, downloading_workers: 2, processing_workers: 3, inference_in_flight: 1, inference_limit: 1,
+    queued_sources: 9, queued_batches: 1, reserved_download_bytes: 20 * 1024 ** 3 };
+  const ui = await mount(shared);
+  const field = () => ui.nodes().find(n => n.props["aria-label"] === "Simultaneous video workers");
+  assert.equal(field().props.max, 12);
+  await ui.input("Simultaneous video workers", "8"); await ui.click("Apply worker limit");
+  assert.equal(shared.requests.find(r => r.path.endsWith("/execution") && r.method === "POST").body.max_workers, 8);
+  const status = ui.text();
+  assert.match(status, /1–\s*12/); assert.match(status, /2 downloading, 3 decoding\/recognizing/);
+  assert.match(status, /GPU inference: 1 of 1 at a time/); assert.match(status, /Queued: 9 videos, 1 batches waiting/);
+  assert.match(status, /20\.00 GiB/); assert.match(status, /measured default 2/);
+  await ui.input("Simultaneous video workers", "13");
+  assert.equal(ui.nodes().find(n => n.type === "button" && n.props.children === "Apply worker limit").props.disabled, true);
+  ui.dispose();
+  // An older backend that reports no ceiling keeps the former limit of 4.
+  const legacy = await mount();
+  assert.equal(legacy.nodes().find(n => n.props["aria-label"] === "Simultaneous video workers").props.max, 4);
+  legacy.dispose();
+});
+
+test("Clear all after a batch started only clears the draft; the running batch continues", async () => {
+  const ui = await mount(); await ui.start();
+  assert.match(ui.text(), /Status: running/);
+  const before = ui.shared.requests.length;
+  await ui.click("Select all supported"); await ui.click("Clear all");
+  assert.match(ui.text(), /0 selected/);
+  assert.equal(ui.nodes().find(n => n.type === "button" && /Start selected/.test(n.props.children?.toString?.() ?? "")) !== undefined, true);
+  assert.equal(ui.shared.requests.slice(before).some(r => r.method !== "GET" || /cancel|delete|folder/.test(r.path)), false,
+    "no Drive listing, cancel or delete request");
+  assert.equal(ui.shared.starts, 1); assert.match(ui.text(), /Status: running/);
+  ui.dispose();
+});
+
+test("device and bounded worker controls allow a second seven-video batch while first runs; both links survive reload", async () => {
+  const ui = await mount();
+  await ui.input("Video processing device", "cpu");
+  await ui.input("Simultaneous video workers", "3"); await ui.click("Apply worker limit");
+  assert.equal(ui.shared.requests.find(r => r.path.endsWith('/execution') && r.method === 'POST').body.max_workers, 3);
+  await ui.start(); await ui.start();
+  assert.equal(ui.shared.starts, 2);
+  assert.equal(ui.shared.jobs.length, 2);
+  assert.notEqual(ui.shared.jobs[0].id, ui.shared.jobs[1].id);
+  assert.ok(ui.shared.requests.filter(r => r.path.endsWith('/drive/batches')).every(r => r.body.device === 'cpu'));
+  ui.shared.job.status = 'queued'; ui.shared.job.queue_position = 2;
+  const shared = ui.shared, query = ui.query(); ui.dispose();
+  const reload = await mount(shared, query);
+  assert.match(reload.text(), /Status: queued/);
+  assert.match(reload.text(), /Queue turn 2/);
+  assert.equal(shared.starts, 2); reload.dispose();
 });

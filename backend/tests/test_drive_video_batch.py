@@ -7,6 +7,7 @@ import io
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import threading
@@ -44,9 +45,11 @@ class DriveBatchTests(unittest.TestCase):
         self.patch(video, "_active", None)
         self.patch(video, "_cancel", threading.Event())
         self.patch(video, "scan_clock", lambda: 0.0)
-        self.patch(video, "verify_eof", lambda path, count: dict(outcome="normal_eof", verified_frame_count=count, error=None))
+        self.patch(video, "verify_eof", lambda path, count, **kwargs: dict(outcome="normal_eof", verified_frame_count=count, error=None))
         self.patch(video, "identity_snapshot", lambda: (self.matcher(), copy.deepcopy(MODEL)))
         self.patch(video, "detect", self.faces)
+        from video_scheduler_fixture import install
+        install(self, fake_index=True)
         self.items, self.payloads, self.downloads = {}, {}, []
         self.visible = None
         self.broken = set()
@@ -67,6 +70,8 @@ class DriveBatchTests(unittest.TestCase):
         item = patch.object(obj, name, value); item.start(); self.addCleanup(item.stop); return item
 
     def drain(self):
+        from video_scheduler_fixture import drain
+        drain()
         video._cancel.set()
         deadline = time.monotonic() + 10
         while video._active is not None and time.monotonic() < deadline: time.sleep(.01)
@@ -180,6 +185,37 @@ class DriveBatchTests(unittest.TestCase):
         self.assertEqual(state, before, "Aggregation never increments old totals")
         self.clean(state)
 
+    def test_weaker_or_equal_matches_write_no_batch_state(self):
+        changes, writes = [], []
+        real_save, real_write = video.save_representative, video._write
+
+        def from_representative():
+            frame = sys._getframe(2)
+            while frame:
+                if frame.f_code.co_name == "representative": return True
+                frame = frame.f_back
+            return False
+
+        def save(context, row, *args):
+            before = row.get("preview"); real_save(context, row, *args)
+            if row.get("preview") is not before: changes.append(row["person_id"])
+
+        def write(state):
+            if from_representative(): writes.append(state["id"])
+            return real_write(state)
+
+        with patch.object(video, "save_representative", save), patch.object(video, "_write", write):
+            state = self.start()
+        self.assertEqual(state["status"], "completed", state["error"])
+        self.assertEqual([p["detection_count"] for p in state["people"]], [21, 21])
+        self.assertEqual(changes.count("person-b"), 1, "Equal scores: only the first sighting becomes the example")
+        # One publish plus one state write per real preview change — never per matched face.
+        self.assertEqual(len(writes), 2 * len(changes))
+        self.assertLess(len(changes), state["matched_face_detections"])
+        beta = state["people"][1]
+        self.assertEqual((beta["preview"]["source_filename"], beta["preview"]["frame_number"]), ("cam01.avi", 1))
+        self.clean(state)
+
     def test_csv_verdict_preview_and_per_source_rows_remain_after_download_deletion(self):
         state = self.start()
         visible = video.public(state)
@@ -211,14 +247,37 @@ class DriveBatchTests(unittest.TestCase):
         self.assertEqual(state["status"], "completed_with_errors")
         self.assertEqual((state["sampled_frames"], state["matched_face_detections"]), (18, 54))
         self.assertEqual(state["videos"][2]["status"], "failed")
+        # A dropped connection (an OSError from the transfer) is reported as a
+        # network loss for that file, never as a disk/storage problem.
+        self.assertIn("Network connection to Google Drive was lost while downloading cam03.avi", state["videos"][2]["error"])
+        self.assertNotIn("disk space and storage permissions", state["videos"][2]["error"])
         self.assertEqual(video.public(state)["completed_videos"], 6)
         self.assertEqual(len(self.downloads), 7)
         self.clean(state)
 
+    def test_local_write_failure_is_reported_as_storage_and_partial_removed(self):
+        real_open = Path.open
+        def failing_open(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            if mode == "xb" and path.name.startswith("source"):
+                class Failing:
+                    def __enter__(self): return self
+                    def __exit__(self, *exc): handle.close(); return False
+                    def write(self, chunk): raise OSError(28, "No space left on device")
+                return Failing()
+            return handle
+        with patch.object(Path, "open", failing_open):
+            state = self.start(["video_00001"])
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("Cannot save the temporary copy of cam01.avi", state["videos"][0]["error"])
+        self.assertNotIn("Network connection", state["videos"][0]["error"])
+        self.clean(state)
+        self.assertEqual(video.claimed_disk_bytes(), 0)
+
     def test_decode_failure_keeps_partial_counts_and_continues(self):
         actual = video.process_video
-        def fail_source(source, path, index, settings, checkpoint, representative):
-            actual(source, path, index, settings, checkpoint, representative)
+        def fail_source(source, path, index, settings, checkpoint, representative, **kwargs):
+            actual(source, path, index, settings, checkpoint, representative, **kwargs)
             if source["filename"] == "cam03.avi": raise video.MediaError("Synthetic damaged tail: partial frame results retained")
         with patch.object(video, "process_video", fail_source): state = self.start()
         self.assertEqual(state["status"], "completed_with_errors")
@@ -230,7 +289,8 @@ class DriveBatchTests(unittest.TestCase):
         actual = drive.download
         def cancel_third(item, parent, account, path, cancelled, progress):
             if item["file_id"] == "video_00003":
-                path.write_bytes(b"partial"); video._cancel.set()
+                path.write_bytes(b"partial")
+                video.cancel(path.parent.parent.parent.name)
                 raise drive.DownloadCancelled("Synthetic cancel")
             return actual(item, parent, account, path, cancelled, progress)
         with patch.object(drive, "download", cancel_third): state = self.start()
@@ -243,7 +303,8 @@ class DriveBatchTests(unittest.TestCase):
     def test_cancellation_during_inference_keeps_complete_frame_and_no_backlog(self):
         actual = self.faces
         def faces(image):
-            video._cancel.set(); return actual(image)
+            video.cancel(next(s['id'] for s in video.list_jobs() if s['status'] == 'running'))
+            return actual(image)
         with patch.object(video, "detect", faces): state = self.start()
         self.assertEqual(state["status"], "cancelled")
         self.assertEqual(state["sampled_frames"], 1)
@@ -253,6 +314,10 @@ class DriveBatchTests(unittest.TestCase):
 
     def test_restart_cleanup_never_downloads_or_duplicates_or_restarts(self):
         state = self.start()
+        # The original legacy recovery contract remains unchanged.
+        from app.services.video_scheduler import shutdown
+        shutdown()
+        state.pop('scheduler_version', None)
         state["status"] = "running"
         state["videos"][5].update(status="running")
         state["videos"][6].update(status="pending", people=[], sampled_frames=0, decoded_frames=0, matched_face_detections=0, unknown_detections=0)
@@ -307,7 +372,7 @@ class DriveBatchTests(unittest.TestCase):
         with patch.object(drive.shutil, "disk_usage", lambda path: SimpleNamespace(free=0)):
             state = self.start(["video_00001"])
         self.assertEqual(state["status"], "failed")
-        self.assertIn("Insufficient local disk", state["videos"][0]["error"])
+        self.assertIn("Not enough free disk space for cam01.avi", state["videos"][0]["error"])
         self.assertEqual(self.downloads, [])
         self.clean(state)
 
@@ -383,7 +448,7 @@ class DriveBatchTests(unittest.TestCase):
         self.items["video_00001"]["parents"] = ["other_folder"]
         self.assertEqual(self.call("/drive/batches", "POST", body)[0], 400)
         self.items["video_00001"]["parents"] = [PARENT]
-        self.items["video_00001"]["size"] = str(drive.MAX_BYTES + 1)
+        self.items["video_00001"]["size"] = "0"
         self.assertEqual(self.call("/drive/batches", "POST", body)[0], 400)
         self.assertEqual(self.downloads, [])
 
@@ -408,15 +473,20 @@ class DriveBatchTests(unittest.TestCase):
         self.assertNotIn("Picker", result["message"])
         self.assertEqual(self.downloads, [], "Listing cannot download or start inference")
 
-    def test_large_long_drive_input_limits_do_not_change_local_upload_limits(self):
-        self.items["video_00001"].update(size=str(2 * 1024**3))
-        self.items["video_00001"]["videoMediaMetadata"]["durationMillis"] = str(3600 * 1000)
-        result = drive.folder_listing(PARENT)
-        self.assertTrue(result["files"][0]["supported"])
-        self.assertEqual((video.MAX_BYTES, video.MAX_DURATION), (512 * 1024**2, 1800))
-        self.assertEqual((result["limits"]["max_bytes"], result["limits"]["max_duration_seconds"]), (16 * 1024**3, 12 * 3600))
-        with self.assertRaisesRegex(drive.DriveVideoError, "16 GiB"):
-            drive.validate_video({**self.items["video_00001"], "size": str(drive.MAX_BYTES + 1)}, PARENT)
+    def test_large_long_drive_input_has_no_fixed_size_ceiling(self):
+        # 40 GiB and 2^40+1 bytes: metadata only, no huge file is created.
+        for size in (40 * 1024**3, 2**40 + 1):
+            self.items["video_00001"].update(size=str(size))
+            self.items["video_00001"]["videoMediaMetadata"]["durationMillis"] = str(3600 * 1000)
+            result = drive.folder_listing(PARENT)
+            listed = next(f for f in result["files"] if f["file_id"] == "video_00001")
+            self.assertTrue(listed["supported"], listed.get("error"))
+            self.assertEqual(listed["bytes"], size)
+            self.assertIsInstance(listed["bytes"], int)
+        self.assertNotIn("max_bytes", result["limits"])
+        self.assertFalse(hasattr(drive, "MAX_BYTES") or hasattr(video, "MAX_BYTES"), "no byte ceiling constant remains")
+        self.assertEqual((video.MAX_DURATION, result["limits"]["max_duration_seconds"]), (1800, 12 * 3600))
+        self.assertEqual(result["limits"]["disk_reserve_bytes"], video.DISK_RESERVE)
         too_long = copy.deepcopy(self.items["video_00001"])
         too_long["videoMediaMetadata"]["durationMillis"] = str((drive.MAX_DURATION + 1) * 1000)
         with self.assertRaisesRegex(drive.DriveVideoError, "12 hours"):
@@ -424,7 +494,7 @@ class DriveBatchTests(unittest.TestCase):
 
     def test_all_rejected_files_visible_with_specific_reasons_not_fake_empty(self):
         self.items["video_00001"].update(name="notes.pdf", mimeType="application/pdf")
-        self.items["video_00002"].update(size=str(drive.MAX_BYTES + 1))
+        self.items["video_00002"].update(size="not-a-number")
         self.items["video_00003"]["videoMediaMetadata"]["durationMillis"] = str((drive.MAX_DURATION + 1) * 1000)
         self.items["video_00004"]["capabilities"] = {"canDownload": False}
         self.items["video_00005"]["size"] = "0"
@@ -433,7 +503,7 @@ class DriveBatchTests(unittest.TestCase):
         result = drive.folder_listing(PARENT)
         self.assertEqual((result["outcome"], len(result["files"]), result["supported_count"]), ("unsupported", 7, 0))
         errors = " ".join(f["error"] for f in result["files"])
-        for reason in ("16 GiB", "12 hours", "disabled downloading", "zero", "pixel limit", "shortcuts", "Supported containers"):
+        for reason in ("unavailable or zero", "12 hours", "disabled downloading", "zero", "pixel limit", "shortcuts", "Supported containers"):
             self.assertIn(reason, errors)
         self.assertEqual(self.downloads, [])
 
@@ -506,8 +576,13 @@ class DriveBatchTests(unittest.TestCase):
         self.assertEqual(len(list((video.directory(state["id"]) / "previews").iterdir())), 2)
         records = list(csv.DictReader(io.StringIO(video.to_csv(state))))
         metadata = {r["key"]: r["value"] for r in records if r["record_type"] == "metadata"}
-        self.assertEqual(metadata["input_max_bytes"], str(drive.MAX_BYTES))
+        self.assertNotIn("input_max_bytes", metadata)
+        self.assertIn("free disk space", metadata["input_size_limit"])
         self.assertEqual(metadata["input_max_duration_seconds"], str(drive.MAX_DURATION))
+        # A batch created under the former ceiling keeps its recorded limit.
+        old = copy.deepcopy(state); old["input_limits"]["max_bytes"] = 16 * 1024**3
+        old_meta = {r["key"]: r["value"] for r in csv.DictReader(io.StringIO(video.to_csv(old))) if r["record_type"] == "metadata"}
+        self.assertEqual(old_meta["input_max_bytes"], str(16 * 1024**3))
         self.clean(state)
 
     def test_synthetic_mkv_vfr_and_truncated_batch_keep_names_previews_and_csv(self):

@@ -10,14 +10,24 @@ import VideoBatchSources, { type VideoSourceResult } from "../components/VideoBa
 import { DEFAULT_SCAN_SETTINGS, scanSettingsError, type ScanSettings } from "../api/scanSettings";
 
 const API = "/api/local-video-experiment";
-const ACTIVE = ["running", "cancelling"];
+const ACTIVE = ["queued", "running", "cancelling"];
+// Used only until the backend reports its own ceiling (older backends did not).
+const LEGACY_WORKER_CEILING = 4;
 type Person = MatchedPerson;
+interface Execution {
+  options: { value: string; label: string }[]; max_workers: number; active_workers: number; inference_limit: number;
+  max_workers_limit?: number; default_workers?: number; downloading_workers?: number; processing_workers?: number;
+  inference_in_flight?: number; queued_sources?: number; queued_batches?: number; reserved_download_bytes?: number;
+  unavailable?: Record<string, string>; gpu?: { utilization_percent: number; used_vram_mib: number; total_vram_mib: number } | null;
+}
 interface Sample {
   frame_index: number; timestamp_seconds: number; faces: number;
   matched_people: number; unknown_detections: number;
   capture_time_seconds?: number; scan_work_seconds?: number;
 }
 interface Experiment {
+  requested_provider?: string; actual_provider?: string; queue_position?: number | null; active_workers?: number;
+  waiting_reason?: string; stage_seconds?: Record<string, number>;
   kind?: "drive_batch"; batch_name?: string; videos?: VideoSourceResult[];
   total_videos?: number; finished_videos?: number; completed_videos?: number; failed_videos?: number;
   temporary_downloads_cleaned?: boolean;
@@ -83,6 +93,10 @@ export default function LocalVideoExperiment() {
   const [sourceMode, setSourceMode] = useState<"local" | "drive">("local");
   const [scanSettings, setScanSettings] = useState<ScanSettings>({ ...DEFAULT_SCAN_SETTINGS });
   const [isAdmin, setIsAdmin] = useState(false);
+  const [device, setDevice] = useState("auto");
+  const [workerLimit, setWorkerLimit] = useState(2);
+  const [execution, setExecution] = useState<Execution | null>(null);
+  const workerCeiling = execution?.max_workers_limit ?? LEGACY_WORKER_CEILING;
   const [list, setList] = useState<Experiment[]>([]);
   const [selected, setSelected] = useState<Experiment | null>(null);
   const [reviewPerson, setReviewPerson] = useState<Person | null>(null);
@@ -105,8 +119,26 @@ export default function LocalVideoExperiment() {
     const data = await apiGet(API);
     if (!Array.isArray(data?.experiments)) throw new Error("Unable to read the experiment list. Refresh this page; no new batch was started.");
     setList(data.experiments as Experiment[]); setIsAdmin(true);
+    if (data.scheduler) setExecution(old => old ? { ...old, ...data.scheduler } : old);
   }, []);
   useEffect(() => { void loadList().catch(err => setError(message(err))); }, [loadList]);
+  useEffect(() => {
+    if (!isAdmin) return;
+    void apiGet(API + "/execution").then(value => { setExecution(value); setWorkerLimit(value.max_workers); })
+      .catch(err => setError(message(err)));
+  }, [isAdmin]);
+  const anyActive = list.some(exp => ACTIVE.includes(exp.status));
+  useEffect(() => {
+    if (!anyActive) return;
+    let disposed = false;
+    let timer: number;
+    async function refreshQueue() {
+      try { await loadList(); } catch (err) { if (!disposed) setError(message(err)); }
+      if (!disposed) timer = window.setTimeout(refreshQueue, 1500);
+    }
+    timer = window.setTimeout(refreshQueue, 1500);
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, [anyActive, loadList]);
   useEffect(() => {
     // Reopen an explicit result, otherwise recover the active/latest Drive
     // batch. This reads existing status only: never call Start on recovery.
@@ -148,7 +180,6 @@ export default function LocalVideoExperiment() {
 
   async function upload() {
     if (!file || busy) return;
-    if (file.size > 512 * 1024 * 1024) { setError("Video exceeds 512 MiB upload limit."); return; }
     setBusy(true); setUploading(true); setError(""); setUploadPercent(0);
     try {
       const fresh = await uploadVideo(file, setUploadPercent);
@@ -178,7 +209,7 @@ export default function LocalVideoExperiment() {
     }
     setBusy(true); setError("");
     try {
-      setSelected(experimentResponse(await apiPostJson(API + "/" + selected.id + "/" + kind, kind === "start" ? scanSettings : {})));
+      setSelected(experimentResponse(await apiPostJson(API + "/" + selected.id + "/" + kind, kind === "start" ? { ...scanSettings, device } : {})));
       setClock(Date.now()); await loadList();
     } catch (err) { setError(message(err)); }
     finally { setBusy(false); }
@@ -212,13 +243,41 @@ export default function LocalVideoExperiment() {
         Counts measure sampled-frame detections, not camera passages or recognition accuracy.
       </div>
       {error && <p role="alert" className="mb-3 text-sm text-red-600">{error}</p>}
+      {isAdmin && <Card className="mb-4">
+        <h2 className="font-semibold">Video processing device and queue</h2>
+        <label className="my-2 block">Device for the next experiment
+          <select aria-label="Video processing device" value={device} disabled={busy} onChange={e => setDevice(e.target.value)} className="ml-2 rounded border p-2">
+            {(execution?.options ?? [{ value: "auto", label: "Auto (verify on Start)" }]).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+        </label>
+        <p className="text-xs">Frozen on Start. Auto verifies CUDA, otherwise CPU. An explicit GPU choice fails if unavailable. Existing runs keep their device.</p>
+        <label className="my-2 block">Global simultaneous video workers (1–{workerCeiling})
+          <input aria-label="Simultaneous video workers" className="ml-2 w-20 rounded border p-2" type="number" min={1} max={workerCeiling} step={1} value={workerLimit} onChange={e => setWorkerLimit(Number(e.target.value))} />
+        </label>
+        <Button disabled={!Number.isInteger(workerLimit) || workerLimit < 1 || workerLimit > workerCeiling || busy} onClick={() => {
+          void apiPostJson(API + "/execution", { max_workers: workerLimit }).then(value => setExecution(old => old ? { ...old, max_workers: value.max_workers } : old)).catch(err => setError(message(err)));
+        }}>Apply worker limit</Button>
+        <p className="mt-2 text-xs">Current limit: {execution?.max_workers ?? "loading"}
+          {execution?.default_workers != null && <> (measured default {execution.default_workers}; up to {workerCeiling}, one per logical CPU)</>}.
+          More workers are not automatically faster: they share one GPU inference at a time.</p>
+        <p role="status" aria-label="Video work in progress" className="mt-1 text-xs">
+          {execution?.downloading_workers != null
+            ? <>Active video workers: {execution.active_workers} ({execution.downloading_workers} downloading, {execution.processing_workers} decoding/recognizing).
+              {" "}GPU inference: {execution.inference_in_flight ?? 0} of {execution.inference_limit} at a time.
+              {" "}Queued: {execution.queued_sources ?? 0} videos, {execution.queued_batches ?? 0} batches waiting for a worker.</>
+            : <>Active video workers: {list.reduce((sum, exp) => sum + (exp.active_workers ?? 0), 0)}.</>}
+          {execution?.reserved_download_bytes ? <> Disk reserved for transfers still in progress: {(execution.reserved_download_bytes / 1024 ** 3).toFixed(2)} GiB.</> : null}</p>
+        <p className="mt-1 text-xs">Downloads, decoding and output overlap within this cap; model inference stays globally serialized. Lowering the limit lets existing workers finish. Queued batches survive refresh/restart; interrupted videos retain partial results without automatic replay.</p>
+        {execution?.unavailable && Object.entries(execution.unavailable).map(([key, reason]) => <p className="text-xs" key={key}>{reason}</p>)}
+        {execution?.gpu && <p className="mt-2 text-xs">Machine-wide GPU: {execution.gpu.utilization_percent}% utilization; {execution.gpu.used_vram_mib} / {execution.gpu.total_vram_mib} MiB VRAM. Includes other apps and workflows; refreshed while batches are active.</p>}
+      </Card>}
       <Card className="mb-4">
         <div className="mb-4 flex gap-2" role="group" aria-label="Video input source">
           <Button aria-pressed={sourceMode === "local"} disabled={busy} onClick={() => setSourceMode("local")}>Local video upload</Button>
           <Button aria-pressed={sourceMode === "drive"} disabled={busy} onClick={() => setSourceMode("drive")}>Google Drive batch</Button>
         </div>
-        {sourceMode === "drive" && isAdmin ? <DriveVideoBatchPanel settings={scanSettings} onSettings={setScanSettings}
-          disabled={busy || list.some(exp => ACTIVE.includes(exp.status))} onStarted={state => {
+        {sourceMode === "drive" && isAdmin ? <DriveVideoBatchPanel settings={scanSettings} onSettings={setScanSettings} device={device}
+          disabled={busy} onStarted={state => {
             const fresh = experimentResponse(state);
             selectionRequest.current++; recovered.current = true; setSelected(fresh); setClock(Date.now()); setError("");
             setSearchParams({ experiment: fresh.id }, { replace: true });
@@ -230,7 +289,7 @@ export default function LocalVideoExperiment() {
           className="block w-full text-sm" />
         <p className="my-2 text-xs text-gray-600">
           MP4, MOV, AVI, MKV, WebM, M4V; codec must decode with OpenCV/FFmpeg.
-          Maximum 512 MiB, 30 minutes, 4K pixels, 1-120 FPS.
+          No fixed file-size limit: the server needs free disk space for the whole file plus a 1 GiB reserve and space held by other active videos. Maximum 30 minutes, 4K pixels, 1-120 FPS.
           File selection does nothing. Upload validates media; Start experiment runs recognition.
         </p>
         <Button disabled={!file || busy} onClick={upload}>Upload video</Button>
@@ -245,7 +304,7 @@ export default function LocalVideoExperiment() {
           <h2 className="mb-2 font-semibold">Video experiments</h2>
           {!list.length && <p className="text-sm text-gray-500">No video experiments yet.</p>}
           <ul className="space-y-1">
-            {list.map(exp => <li key={exp.id}><button disabled={busy} onClick={() => void select(exp.id)}
+            {list.map(exp => <li key={exp.id}>{exp.queue_position != null && <span className="text-xs">Queue turn {exp.queue_position}; {exp.active_workers ?? 0} active workers</span>}<button disabled={busy} onClick={() => void select(exp.id)}
               className={"w-full break-words rounded-lg px-3 py-2 text-left text-sm " + (selected?.id === exp.id ? "bg-indigo-50 text-indigo-700" : "hover:bg-gray-50")}>
               <div className="font-medium">{exp.filename}</div>
               {exp.kind === "drive_batch" && <div className="text-xs">Drive batch | {exp.total_videos} videos</div>}
@@ -273,13 +332,17 @@ export default function LocalVideoExperiment() {
             <Button onClick={() => void download()}>Download CSV</Button>
           </div>
           {batch && <p className="mb-2 text-sm">Batch: {selected.finished_videos} / {selected.total_videos} videos stopped; {selected.completed_videos} completed, {selected.failed_videos} failed.
-            {" "}{selected.temporary_downloads_cleaned ? "Temporary downloads removed." : "One temporary source may be in use; removed when it stops."} Original Drive files unchanged.</p>}
+            {" "}{selected.temporary_downloads_cleaned ? "Temporary downloads removed." : "Bounded temporary sources may be in use; each removed when it stops."} Original Drive files unchanged.</p>}
+          {selected.waiting_reason && <p role="status">{selected.waiting_reason}</p>}
           <p className="text-sm">Progress: {selected.progress_percent.toFixed(1)}% {selected.progress_is_estimate && (batch ? "(estimate across download and decode phases)" : "(estimate against reported metadata)")} | {selected.decoded_frames} decoded frames
             {selected.verified_total_frames != null && " / " + selected.verified_total_frames + " verified total"}</p>
           {selected.decode_phase === "verifying_eof" && <p role="status" className="text-sm">Verifying readable EOF with independent decoder; recognition results preserved. Cancel remains available.</p>}
           {selected.decode_audit?.outcome === "normal_eof" && selected.media?.frame_count !== selected.verified_total_frames && <p className="text-sm text-amber-800">Clean EOF confirmed. Reported frame count differs from actual decoded frames; metadata does not prove missing or corrupt frames.</p>}
           <progress aria-label="Experiment processing progress" max={100} value={selected.progress_percent} className="my-2 block w-full" />
           <dl className="grid grid-cols-2 gap-2 text-sm">
+            {selected.requested_provider && <><dt>Requested / actual provider</dt><dd>{selected.requested_provider} / {selected.actual_provider}</dd>
+            <dt>Queue turn / active video workers</dt><dd>{selected.queue_position ?? "finished"} / {selected.active_workers ?? 0}</dd></>}
+            {selected.stage_seconds && Object.entries(selected.stage_seconds).map(([stage, value]) => <div className="contents" key={stage}><dt>{stage.replaceAll("_", " ")}</dt><dd>{seconds(value)} (sum of worker time)</dd></div>)}
             <dt>Frame selection rule</dt><dd>{selected.can_start ? "Selected controls apply on Start; no scan has run" : selected.scan_settings ? "max(scan finish + wait, scan start + 1/target); latest virtual-camera frame" :
               selected.sampling_hz === null ? "Previous scan work + 400 ms; latest distinct frame" : selected.sampling_hz + " sample/s (earlier experiment)"}</dd>
             {selected.scan_settings && <>

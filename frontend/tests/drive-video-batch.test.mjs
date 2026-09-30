@@ -7,7 +7,7 @@ import * as settingsModule from "../src/api/scanSettings.ts";
 const compiled = ts.transpileModule(readFileSync(new URL("../src/components/DriveVideoBatchPanel.tsx", import.meta.url), "utf8"),
   { compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX } }).outputText;
 const account = { display_name: "Synthetic Account", email: "synthetic@example.test", account_id: "fake-account" };
-const limits = { max_bytes: 16 * 1024 ** 3, max_duration_seconds: 12 * 3600, max_files: 32, disk_reserve_bytes: 1024 ** 3, containers: [".mkv", ".avi"] };
+const limits = { max_duration_seconds: 12 * 3600, max_files: 32, disk_reserve_bytes: 1024 ** 3, containers: [".mkv", ".avi"] };
 const files = Array.from({ length: 7 }, (_, i) => ({ file_id: "video_0000" + (i + 1), filename: "cam0" + (i + 1) + (i ? ".avi" : ".mkv"),
   bytes: i ? 1024 : 2 * 1024 ** 3, supported: true, duration_seconds: i ? 1.2 : 3600, mime_type: i ? "video/x-msvideo" : "application/x-unexpected" }));
 async function setup({ connected = true, readAccess = true, scanSettings = settingsModule.DEFAULT_SCAN_SETTINGS,
@@ -52,7 +52,7 @@ async function setup({ connected = true, readAccess = true, scanSettings = setti
 test("link-only seven checkboxes include generic-MIME MKV and larger file; Start freezes defaults once", async () => {
   const ui = await setup();
   assert.match(ui.text(), /synthetic@example.test/);
-  assert.match(ui.text(), /16\s+GiB/); assert.match(ui.text(), /12\s+hours/);
+  assert.doesNotMatch(ui.text(), /16\s+GiB/); assert.match(ui.text(), /No fixed file-size limit/); assert.match(ui.text(), /12\s+hours/);
   await ui.input("Google Drive folder link", "https://drive.google.com/drive/folders/folder_12345");
   await ui.click("List videos");
   assert.equal(ui.all().filter(n => n.props.type === "checkbox").length, 7);
@@ -85,14 +85,48 @@ test("old scope requires one-time reconnect; consent callback refreshes and enab
   assert.equal(offline.button("List videos").props.disabled, true);
 });
 test("mixed supported/rejected files remain visible with exact reason; Select all excludes rejected", async () => {
-  const rejected = { file_id: "bad_video_01", filename: "too-big.mkv", supported: false, bytes: 17 * 1024 ** 3, error: "Video exceeds the 16 GiB limit." };
+  const rejected = { file_id: "bad_video_01", filename: "too-long.mkv", supported: false, bytes: 17 * 1024 ** 3, error: "Video duration is 13.00 hours; the per-file Drive limit is 12 hours." };
   const ui = await setup({ entries: [...files, rejected] });
   await ui.input("Google Drive folder link", "folder_12345"); await ui.click("List videos");
   const boxes = ui.all().filter(n => n.props.type === "checkbox");
   assert.equal(boxes.length, 8); assert.equal(boxes.at(-1).props.disabled, true);
-  assert.match(ui.text(), /Video exceeds the 16 GiB limit/);
+  assert.match(ui.text(), /per-file Drive limit is 12 hours/);
+  assert.match(ui.text(), /17\.00 GiB/, "large sizes are shown exactly, in GiB");
   await ui.click("Select all supported");
   assert.equal(ui.all().filter(n => n.props.type === "checkbox" && n.props.checked).length, 7);
+});
+test("Select all, Clear all, then individual picks start only those; listing is reused and a started batch is untouched", async () => {
+  const ui = await setup();
+  const checked = () => ui.all().filter(n => n.props.type === "checkbox" && n.props.checked).map(n => n.props["aria-label"]);
+  const count = () => ui.all().find(n => n.props["aria-label"] === "Selected video count").props.children[0];
+  const toggle = async (name, value) => { ui.all().find(n => n.props["aria-label"] === "Select " + name).props.onChange({ target: { checked: value } }); await ui.flush(); };
+  await ui.input("Google Drive folder link", "https://drive.google.com/drive/folders/folder_12345");
+  await ui.click("List videos");
+  await ui.input("Video batch name", "Picked cameras");
+  assert.equal(ui.button("Clear all").props.disabled, true, "nothing selected yet");
+  await ui.click("Select all supported videos");
+  assert.equal(checked().length, 7); assert.equal(count(), 7);
+  assert.equal(ui.button("Start selected").props.disabled, false);
+  await ui.click("Clear all");
+  assert.deepEqual(checked(), []); assert.equal(count(), 0);
+  assert.equal(ui.button("Start selected").props.disabled, true, "Start needs at least one video");
+  assert.equal(ui.button("Clear all").props.disabled, true);
+  // Link and listing stay: select again without another Drive request.
+  assert.equal(ui.all().find(n => n.props["aria-label"] === "Google Drive folder link").props.value, "https://drive.google.com/drive/folders/folder_12345");
+  assert.equal(ui.all().filter(n => n.props.type === "checkbox").length, 7);
+  await toggle("cam02.avi", true); await toggle("cam05.avi", true); await toggle("cam07.avi", true); await toggle("cam05.avi", false);
+  assert.equal(count(), 2);
+  await ui.click("Start selected videos as one batch");
+  const posts = ui.requests.filter(r => r.path.endsWith("/batches"));
+  assert.equal(posts.length, 1);
+  assert.deepEqual(posts[0].body.file_ids, ["video_00002", "video_00007"]);
+  assert.equal(ui.requests.filter(r => r.path.endsWith("/folder")).length, 1, "Drive was listed once");
+  // After Start, clearing the draft sends nothing: no cancel, no delete, no Drive call.
+  const before = ui.requests.length;
+  await ui.click("Clear all");
+  assert.equal(ui.requests.length, before);
+  assert.equal(ui.requests.some(r => /cancel|delete/i.test(r.path)), false);
+  assert.equal(ui.started.length, 1);
 });
 test("genuinely empty, unsupported-only and no-access results differ and cannot start", async () => {
   const empty = await setup({ entries: [], outcome: "empty" });

@@ -14,6 +14,7 @@ from app.services import drive_video_source as drive, drive_video_batch as batch
 from app.services.scan_settings import ScanSettings
 from app.services import google_drive_oauth_service as oauth
 from app.api.scan_settings import ScanSettingsRoute
+from app.services import video_devices
 
 router = APIRouter(prefix="/api/local-video-experiment/drive", tags=["local-video-drive"], route_class=ScanSettingsRoute)
 
@@ -30,6 +31,7 @@ class BatchRequest(BaseModel):
     file_ids: list[str] = Field(min_length=1, max_length=drive.MAX_FILES)
     account_id: str = Field(min_length=1, max_length=200)
     scan_settings: ScanSettings = Field(default_factory=ScanSettings)
+    device: video_devices.Device = "auto"
 
 @router.get("/status")
 def status(refresh: bool = False, user: User = Depends(require_admin)):
@@ -69,8 +71,8 @@ def folder(body: FolderRequest, user: User = Depends(require_admin)):
 @router.post("/batches", status_code=201)
 def create(body: BatchRequest, user: User = Depends(require_admin)):
     try:
-        return video.public(batch.create(body.name, body.folder_link, body.file_ids, body.account_id, body.scan_settings))
+        return video.public(batch.create(body.name, body.folder_link, body.file_ids, body.account_id, body.scan_settings, body.device))
     except video.Busy as exc:
         raise HTTPException(409, str(exc))
-    except (drive.DriveVideoError, video.MediaError) as exc:
+    except (drive.DriveVideoError, video.MediaError, video_devices.DeviceError) as exc:
         raise HTTPException(400, str(exc))

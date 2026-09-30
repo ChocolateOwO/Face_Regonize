@@ -1,6 +1,6 @@
-"""Sequential Drive input for Local Video Experiment, never Event/Legacy Drive.
+"""Drive batch records for Local Video Experiment, never Event/Legacy Drive.
 
-One temporary source at a time; one retained preview per batch identity.
+Bounded source workers managed by video_scheduler; one preview per identity.
 Checkpoints contain source results. Aggregation is replacement, not increments;
 terminal/interrupted batches never restart or retry their completed sources.
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import csv
 import io
+import json
 import logging
 import shutil
 import time
@@ -76,14 +77,12 @@ def recover(state: dict) -> None:
         refresh_totals(state)
     video._write(state)
 
-def create(name: str, link: str, keys: list[str], account_id: str, settings: ScanSettings) -> dict:
+def create(name: str, link: str, keys: list[str], account_id: str, settings: ScanSettings, device: str = "auto") -> dict:
     label = name.strip()
     if not label or len(label) > 120 or any(ord(c) < 32 or ord(c) == 127 for c in label):
         raise drive.DriveVideoError("Give the batch a name of 1–120 characters without control characters.")
     parent, account, selected = drive.selected_files(link, keys, account_id)
     with video._lock:
-        if video._active is not None:
-            raise video.Busy("Wait for the active video experiment to stop before starting a Drive batch.")
         state = video.allocate("drive-batch.mp4")
         state.update(kind="drive_batch", filename=label, batch_name=label, status="ready",
             folder_id=parent, drive_account=account, selected_files=copy.deepcopy(selected),
@@ -98,101 +97,7 @@ def create(name: str, link: str, keys: list[str], account_id: str, settings: Sca
                 source_file=copy.deepcopy(item), preview_version=1)
             state["videos"].append(source)
         video._write(state)
-        return video.start(state["id"], settings)
-
-def run(job_id: str) -> None:
-    clock = time.perf_counter()
-    state = video.get(job_id)
-    current = None
-    try:
-        settings = ScanSettings.model_validate(state["scan_settings"])
-        if not video._cancel.is_set():
-            index, state["model"] = video.identity_snapshot()
-            video._checkpoint(state, clock)
-            for source in state["videos"]:
-                if video._cancel.is_set():
-                    break
-                if source["status"] != "pending":
-                    # Defense in depth: no source is ever processed twice.
-                    continue
-                current = source
-                source_clock = time.perf_counter()
-                state["current_video_key"] = source["source_video_key"]
-                source.update(status="downloading", started_at=video.now(), model=copy.deepcopy(state["model"]))
-                def checkpoint():
-                    source["processing_seconds"] = round(time.perf_counter() - source_clock, 6)
-                    refresh_totals(state)
-                    video._checkpoint(state, clock)
-                checkpoint()
-                try:
-                    cleanup(job_id)
-                    folder = downloads_dir(job_id)
-                    folder.mkdir()
-                    state["temporary_downloads_cleaned"] = False
-                    path = folder / ("source" + Path(source["filename"]).suffix.lower())
-                    def progress(written):
-                        source["downloaded_bytes"] = written
-                        checkpoint()
-                    checksum = drive.download(source["source_file"], state["folder_id"], state["drive_account"]["account_id"],
-                        path, video._cancel.is_set, progress)
-                    if video._cancel.is_set():
-                        raise drive.DownloadCancelled("Cancelled after download; local video removed.")
-                    media = video.probe(path, max_duration=source.get("input_limits", {}).get("max_duration_seconds", video.MAX_DURATION))
-                    media.update(**checksum, expected_samples=None,
-                        max_samples=video.maximum_sample_count(media["frame_count"], media["fps"], settings),
-                        virtual_capture_fps_limit=settings.camera_fps,
-                        effective_available_fps_limit=min(settings.camera_fps, media["fps"]))
-                    source.update(status="running", media=media)
-                    scan_clock_start = time.perf_counter()
-                    def representative(context, row, face, match, image, frame_index, timestamp):
-                        refresh_totals(state)
-                        target = next(p for p in state["people"] if p["person_id"] == row["person_id"])
-                        video.save_representative(context, target, face, match, image, frame_index, timestamp)
-                    checkpoint()
-                    video.process_video(source, path, index, settings, checkpoint, representative)
-                    source["recognition_processing_seconds"] = round(time.perf_counter() - scan_clock_start, 6)
-                except drive.DownloadCancelled as exc:
-                    source.update(status="cancelled", error=str(exc))
-                except (drive.DriveVideoError, video.MediaError) as exc:
-                    source.update(status="cancelled" if video._cancel.is_set() else "failed", error=str(exc))
-                except Exception:
-                    logger.exception("Drive video batch source processing failed")
-                    source.update(status="failed", error="Video processing failed. Partial results retained; check backend log and create a new batch.")
-                finally:
-                    cleanup(job_id)
-                    state["temporary_downloads_cleaned"] = True
-                    source.update(finished_at=video.now(), decode_phase="stopped")
-                    checkpoint()
-                current = None
-        for source in state["videos"]:
-            if source["status"] == "pending":
-                source.update(status="not_processed", error="Cancelled before this video started.")
-        completed = sum(s["status"] == "completed" for s in state["videos"])
-        failed = sum(s["status"] == "failed" for s in state["videos"])
-        state["status"] = ("cancelled" if video._cancel.is_set() else "completed_with_errors" if failed and completed
-            else "failed" if failed else "completed")
-        if failed:
-            state["error"] = f"{failed} of {len(state['videos'])} videos failed. Completed and partial source results are preserved; see source errors. No automatic retry."
-    except Exception:
-        logger.exception("Drive video batch stopped")
-        state.update(status="failed", error="Batch stopped before all videos finished. Partial results retained; check storage, model availability and backend log. Create a new batch to retry explicitly.")
-        for source in state["videos"]:
-            if source["status"] in {"pending", "downloading", "running"}:
-                source.update(status="failed" if source is current else "not_processed", error="Batch stopped; this source was not completed.")
-    finally:
-        try:
-            cleanup(job_id)
-            state["temporary_downloads_cleaned"] = True
-        except Exception:
-            state.update(status="failed", temporary_downloads_cleaned=False,
-                error="Temporary download cleanup failed. Results retained. Check storage permissions; Delete this stopped experiment to remove its local files.")
-        with video._lock:
-            refresh_totals(state)
-            state.update(finished_at=video.now(), current_video_key=None, processing_seconds=round(time.perf_counter() - clock, 6))
-            try:
-                video._write(state)
-            finally:
-                video._active = None
+        return video.start(state["id"], settings, device)
 
 def decorate_public(result: dict, state: dict, *, detail: bool) -> None:
     sources = [video.public(s, detail=detail) for s in state["videos"]]
@@ -236,7 +141,7 @@ def to_csv(state: dict) -> str:
         "manual_verdict", "review_meaning", "preview_frame_number", "preview_timestamp_seconds", "preview_match_score",
         "source_video_key", "source_filename", "status", "source_fps", "reported_frame_count_estimate", "decoded_frame_count", "verified_total_frames",
         "sampled_frame_count", "detected_face_detections", "matched_face_detections", "unknown_face_detections", "processing_seconds",
-        "actual_video_detection_hz", "duration_seconds_nominal", "error"]
+        "actual_video_detection_hz", "duration_seconds_nominal", "error", "requested_provider", "actual_provider", "stage_seconds"]
     writer.writerow(headers)
     def write(**fields):
         writer.writerow([video._csv_text(fields.get(key, "")) if fields.get(key) is not None else "" for key in headers])
@@ -258,8 +163,15 @@ def to_csv(state: dict) -> str:
         source_order="filename casefold, then Drive file ID; earliest source order and frame break equal-score ties",
         started_at=state["started_at"], finished_at=state["finished_at"], error=state["error"])
     if state.get("input_limits"):
-        metadata.update(input_max_bytes=state["input_limits"]["max_bytes"],
-            input_max_duration_seconds=state["input_limits"]["max_duration_seconds"])
+        limits = state["input_limits"]
+        if "max_bytes" in limits:  # batches created under the former 16 GiB ceiling
+            metadata.update(input_max_bytes=limits["max_bytes"])
+        else:
+            metadata.update(input_size_limit="none per file; free disk space minus other active transfers minus "
+                f"{limits.get('disk_reserve_bytes', 0)} reserve bytes")
+        metadata.update(input_max_duration_seconds=limits["max_duration_seconds"])
+    from app.services.video_scheduler import csv_metadata
+    metadata.update(csv_metadata(state))
     for key, value in metadata.items():
         write(record_type="metadata", key=key, value=value)
     for source in visible["videos"]:
@@ -268,7 +180,8 @@ def to_csv(state: dict) -> str:
             source_fps=media.get("fps"), reported_frame_count_estimate=media.get("frame_count"), decoded_frame_count=source["decoded_frames"],
             verified_total_frames=source["verified_total_frames"], sampled_frame_count=source["sampled_frames"], detected_face_detections=source["detected_face_detections"],
             matched_face_detections=source["matched_face_detections"], unknown_face_detections=source["unknown_detections"], processing_seconds=source["processing_seconds"],
-            actual_video_detection_hz=source["actual_video_detection_hz"], duration_seconds_nominal=media.get("duration_seconds"), error=source["error"])
+            actual_video_detection_hz=source["actual_video_detection_hz"], duration_seconds_nominal=media.get("duration_seconds"), error=source["error"],
+            requested_provider=source.get("requested_provider"), actual_provider=source.get("actual_provider"), stage_seconds=json.dumps(source.get("stage_seconds", {}), sort_keys=True))
         for row in source["people"]:
             write(record_type="video_person", source_video_key=source["source_video_key"], source_filename=source["filename"],
                 identity_key=row["identity_key"], name=row["name"], detection_count=row["detection_count"],

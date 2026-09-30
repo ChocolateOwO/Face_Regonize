@@ -16,9 +16,9 @@ from app.services import local_video_experiment as video
 
 MAX_FILES = 32
 MAX_LIST_FILES = 1000
-MAX_BYTES = 16 * 1024 ** 3
 MAX_DURATION = 12 * 3600
-DISK_RESERVE = 1024 ** 3
+# No per-file byte ceiling; downloads are bounded by the shared disk budget.
+DISK_RESERVE = video.DISK_RESERVE
 CHUNK_BYTES = 4 * 1024 * 1024
 FIELDS = "id,name,mimeType,size,parents,trashed,driveId,resourceKey,modifiedTime,version,md5Checksum,capabilities(canDownload),videoMediaMetadata"
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -33,7 +33,7 @@ class DownloadCancelled(DriveVideoError):
     pass
 
 def limits() -> dict:
-    return dict(max_bytes=MAX_BYTES, max_duration_seconds=MAX_DURATION, max_files=MAX_FILES,
+    return dict(max_duration_seconds=MAX_DURATION, max_files=MAX_FILES,
         disk_reserve_bytes=DISK_RESERVE, max_pixels=video.MAX_PIXELS, max_fps=video.MAX_FPS,
         containers=sorted(video.EXTENSIONS))
 
@@ -135,8 +135,6 @@ def validate_video(data: dict, parent: str) -> dict:
         size = 0
     if size <= 0:
         raise DriveVideoError("Video size is unavailable or zero. Upload a complete video file with a known size.")
-    if size > MAX_BYTES:
-        raise DriveVideoError(f"Video is {size / 1024**3:.2f} GiB; the per-file Drive limit is 16 GiB.")
     if data.get("capabilities", {}).get("canDownload") is False:
         raise DriveVideoError("The video owner disabled downloading. Ask the owner to allow downloads.")
     info = data.get("videoMediaMetadata") or {}
@@ -229,11 +227,13 @@ def selected_files(link: str, keys: list[str], expected_account: str) -> tuple[s
     selected = [{**validate_video(metadata(service, key, {parent: resource}), parent), "parent_resource_key": resource} for key in keys]
     return parent, account, sorted(selected, key=lambda f: (f["filename"].casefold(), f["file_id"]))
 
-def download(item: dict, parent: str, expected_account: str, path: Path, cancelled, progress) -> dict:
+def download(item: dict, parent: str, expected_account: str, path: Path, cancelled, progress, claim_key=None) -> dict:
     """One bounded sequential download. Caller deletes .part/media in finally.
 
     No automatic retries. File version/size/checksum revalidated before media.
-    The writer enforces size/disk bounds even for misleading HTTP metadata.
+    The writer enforces the reported size and the shared disk budget (free
+    space minus other transfers' remaining bytes minus the reserve), before
+    the transfer and for every chunk, even for misleading HTTP metadata.
     """
     service, account = connect()
     check_account(account, expected_account)
@@ -242,21 +242,39 @@ def download(item: dict, parent: str, expected_account: str, path: Path, cancell
     for field in ("bytes", "version", "md5", "modified_time"):
         if current.get(field) != item.get(field):
             raise DriveVideoError("Drive video changed since selection. Reload the folder and create a new batch; this video was not processed.")
-    if shutil.disk_usage(path.parent).free < item["bytes"] + DISK_RESERVE:
-        raise DriveVideoError("Insufficient local disk space for this video plus 1 GiB reserve. Free space and start a new batch.")
+    key = claim_key if claim_key is not None else ("download", str(path))
+    total = int(item["bytes"])
+
+    def budget(remaining: int) -> None:
+        try:
+            video.claim_disk(key, remaining, item.get("filename") or "this video", path.parent)
+        except video.MediaError as exc:
+            raise DriveVideoError(str(exc)) from None
+
+    budget(total)
     digest, md5, written = hashlib.sha256(), hashlib.md5(), 0
+    label = item.get("filename") or "this video"
     try:
-        with path.open("xb") as output:
+        try:
+            output = path.open("xb")
+        except OSError:
+            raise DriveVideoError(f"Cannot create the temporary file for {label}. Check local storage permissions.") from None
+        with output:
             class BoundedWriter:
                 def write(self, chunk):
                     nonlocal written
                     if cancelled():
                         raise DownloadCancelled("Download cancelled; partial local download removed.")
-                    if written + len(chunk) > item["bytes"] or written + len(chunk) > MAX_BYTES:
-                        raise DriveVideoError("Drive download exceeded its reported size or 16 GiB limit.")
-                    if shutil.disk_usage(path.parent).free < len(chunk) + DISK_RESERVE:
-                        raise DriveVideoError("Local disk space ran low during download. Free space and create a new batch.")
-                    output.write(chunk)
+                    if written + len(chunk) > total:
+                        raise DriveVideoError("Drive download exceeded its reported size. Partial download removed; reload the folder and create a new batch.")
+                    # The file already holds `written` bytes, so only the rest
+                    # (including this chunk) still has to fit.
+                    budget(total - written)
+                    try:
+                        output.write(chunk)
+                    except OSError:
+                        # A local write failure is a storage problem...
+                        raise DriveVideoError(f"Cannot save the temporary copy of {label}. Check local disk space and storage permissions.") from None
                     digest.update(chunk); md5.update(chunk); written += len(chunk)
                     return len(chunk)
             request = resource_request(service.files().get_media(fileId=item["file_id"], supportsAllDrives=True), resource_keys)
@@ -273,6 +291,15 @@ def download(item: dict, parent: str, expected_account: str, path: Path, cancell
     except DriveVideoError:
         raise
     except OSError:
-        raise DriveVideoError("Cannot save the temporary video. Check local disk space and storage permissions.") from None
+        # ...while connection resets, timeouts and TLS errors are OSErrors
+        # raised by the transfer itself, not by the disk.
+        raise DriveVideoError(f"Network connection to Google Drive was lost while downloading {label} "
+            f"({written / 1024 ** 3:.2f} of {total / 1024 ** 3:.2f} GiB). Partial download removed; "
+            "check the connection and submit this video again. Disk space was not the cause.") from None
     except Exception as exc:
         raise DriveVideoError(explain(exc)) from None
+    finally:
+        # Written bytes are now on disk (or removed by the caller): nothing
+        # left to reserve. A caller-owned claim is released by the caller.
+        if claim_key is None:
+            video.release_disk(key)

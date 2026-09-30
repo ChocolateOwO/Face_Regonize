@@ -6,14 +6,17 @@ import { Button } from "./ui";
 
 const API = "/api/local-video-experiment/drive";
 interface Account { display_name: string; email: string; account_id: string }
-interface Limits { max_bytes: number; max_duration_seconds: number; max_files: number; disk_reserve_bytes: number; containers: string[] }
+interface Limits { max_bytes?: number; max_duration_seconds: number; max_files: number; disk_reserve_bytes: number; containers: string[] }
 interface AccountState { connected: boolean; read_access: boolean; account: Account | null; reason?: string; message?: string; limits?: Limits }
 interface DriveFile { file_id: string; filename: string; bytes: number | string; mime_type?: string; supported: boolean; error?: string; duration_seconds?: number; width?: number; height?: number; modified_time?: string }
 interface Folder { folder_id: string; folder_name?: string; account: Account; files: DriveFile[]; message: string; outcome: "videos" | "unsupported" | "empty" | "no_files"; subfolder_count: number; limits: Limits }
 const message = (error: unknown) => error instanceof Error ? error.message : "Drive request failed.";
+// Drive sizes arrive as decimal strings; Number is exact far beyond any real video (2^53 bytes).
+const formatBytes = (bytes: number) => bytes >= 1024 ** 3 ? (bytes / 1024 ** 3).toFixed(2) + " GiB" : (bytes / 1024 ** 2).toFixed(1) + " MiB";
 
-export default function DriveVideoBatchPanel({ settings, onSettings, disabled, onStarted }: {
+export default function DriveVideoBatchPanel({ settings, onSettings, disabled, onStarted, device = "auto" }: {
   settings: ScanSettings; onSettings: (value: ScanSettings) => void; disabled: boolean; onStarted: (state: unknown) => void;
+  device?: string;
 }) {
   const [account, setAccount] = useState<AccountState | null>(null);
   const [link, setLink] = useState("");
@@ -85,7 +88,7 @@ export default function DriveVideoBatchPanel({ settings, onSettings, disabled, o
     setBusy(true); setError("");
     try {
       onStarted(await apiPostJson(API + "/batches", { name: name.trim(), folder_link: link, file_ids: selected,
-        account_id: folder.account.account_id, scan_settings: { ...settings } }));
+        account_id: folder.account.account_id, scan_settings: { ...settings }, device }));
     } catch (err) { setError(message(err)); }
     finally { setBusy(false); }
   }
@@ -107,18 +110,22 @@ export default function DriveVideoBatchPanel({ settings, onSettings, disabled, o
         onChange={event => { setLink(event.target.value); setFolder(null); setSelected([]); setError(""); }} placeholder="https://drive.google.com/drive/folders/..." /></label>
     <Button disabled={locked || !link.trim() || !account?.read_access} onClick={() => void list()}>List videos</Button>
     <p className="my-2 text-xs">Direct children only. Subfolders are not scanned. Supported containers: MP4, MOV, AVI, MKV, WebM, M4V. Generic Drive MIME types are allowed; the actual container and codec are checked during processing. Some codecs may be unsupported.</p>
-    {limits && <p className="my-2 text-xs">Maximum {limits.max_files} selected videos, each {(limits.max_bytes / 1024 ** 3).toFixed(0)} GiB, {limits.max_duration_seconds / 3600} hours, 4K pixels, 1–120 FPS. One download/scan at a time; {(limits.disk_reserve_bytes / 1024 ** 3).toFixed(0)} GiB free-space reserve. Original Drive files are never changed.</p>}
+    {limits && <p className="my-2 text-xs">Maximum {limits.max_files} selected videos, each up to {limits.max_duration_seconds / 3600} hours, 4K pixels, 1–120 FPS. No fixed file-size limit: each video is downloaded only when the server has free disk space for its full size, plus the {(limits.disk_reserve_bytes / 1024 ** 3).toFixed(0)} GiB reserve and the space other active videos still need. Global bounded video workers. Original Drive files are never changed.</p>}
     {folder && <>
       <p className="my-2 text-sm" role="status">{folder.message}</p>
       {folder.folder_name && <p className="mb-2 text-sm font-medium">Folder: {folder.folder_name}</p>}
-      <Button disabled={locked || !selectable.length} onClick={() => setSelected(selectable.map(file => file.file_id))}>Select all supported videos ({selectable.length})</Button>
-      <p className="my-2 text-xs">{selected.length} selected. {folder.subfolder_count} subfolders not scanned.</p>
+      <div className="flex flex-wrap gap-2">
+        <Button disabled={locked || !selectable.length} onClick={() => setSelected(selectable.map(file => file.file_id))}>Select all supported videos ({selectable.length})</Button>
+        {/* Draft selection only: never touches Drive files, saved results or a started batch. */}
+        <Button disabled={locked || !selected.length} onClick={() => setSelected([])}>Clear all</Button>
+      </div>
+      <p className="my-2 text-xs" role="status" aria-label="Selected video count">{selected.length} selected. {folder.subfolder_count} subfolders not scanned.</p>
       <div className="my-2 max-h-72 overflow-auto"><table className="w-full text-left text-sm">
         <thead><tr><th>Select</th><th>Filename</th><th>Available details / validation</th></tr></thead>
         <tbody>{folder.files.map(file => <tr key={file.file_id} className="border-t">
           <td className="p-2"><input type="checkbox" aria-label={"Select " + file.filename} checked={selected.includes(file.file_id)} disabled={locked || !file.supported}
             onChange={event => setSelected(values => event.target.checked ? [...values, file.file_id] : values.filter(id => id !== file.file_id))} /></td>
-          <td className="p-2 break-words">{file.filename}</td><td className="p-2">{Number(file.bytes) > 0 ? (Number(file.bytes) / 1024 / 1024).toFixed(1) + " MiB" : "Size unavailable"}
+          <td className="p-2 break-words">{file.filename}</td><td className="p-2">{Number(file.bytes) > 0 ? formatBytes(Number(file.bytes)) : "Size unavailable"}
             {file.duration_seconds ? " | " + file.duration_seconds.toFixed(1) + " s" : ""}{file.width && file.height ? " | " + file.width + "×" + file.height : ""}
             {file.mime_type && <span className="block text-xs">Drive type: {file.mime_type}</span>}
             {file.modified_time && <span className="block text-xs">Modified: {file.modified_time}</span>}{file.error && <span className="block text-red-700">{file.error}</span>}</td>

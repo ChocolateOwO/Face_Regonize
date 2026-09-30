@@ -158,6 +158,14 @@ async def on_startup() -> None:
 
     asyncio.create_task(_retention_loop())
     asyncio.create_task(_update_check_loop())
+    from app.services.video_scheduler import launch
+    launch()
+
+
+@app.on_event("shutdown")
+async def stop_video_scheduler() -> None:
+    from app.services.video_scheduler import shutdown
+    await asyncio.to_thread(shutdown)
 
 
 app.include_router(auth.router)

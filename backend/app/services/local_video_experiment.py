@@ -9,6 +9,7 @@ frames sequentially. Timestamps are nominal index/FPS, not container PTS.
 Each distinct saved frame is inferred at most once; no inference queue.
 """
 from __future__ import annotations
+import collections
 import copy
 import csv
 import hashlib
@@ -38,7 +39,9 @@ from app.services import settings_cache
 from app.services.scan_settings import ScanSettings, next_scan_start
 
 ROOT = BACKEND_DIR / "local_video_experiment_storage"
-MAX_BYTES = 512 * 1024 * 1024
+# No fixed per-file byte ceiling: every transfer is bounded by free disk space
+# minus DISK_RESERVE minus the bytes other active transfers still have to write.
+DISK_RESERVE = 1024 ** 3
 MAX_DURATION = 1800
 MAX_FPS = 120
 MAX_PIXELS = 3840 * 2160
@@ -53,7 +56,7 @@ TIMING_DIFFERENCES = ("Single-camera offline approximation: no browser JPEG/HTTP
     "no multi-camera backlog/503 or original dropped-frame log. Measured inference/matching lock wait "
     "is included. Decode/checkpoint overhead affects wall throughput, not virtual cadence. "
     "Virtual-camera availability is limited by configured camera FPS. Low FPS waits for a distinct available frame; missing/VFR timeline cannot be reconstructed from nominal FPS.")
-ACTIVE = {"running", "cancelling"}
+ACTIVE = {"queued", "running", "cancelling"}
 EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 _lock = threading.RLock()
 _initialized = False
@@ -70,6 +73,36 @@ class MediaError(ValueError):
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+# key -> bytes that transfer still has to write. Shared by Drive downloads and
+# local uploads so no transfer counts on space another one will consume.
+_disk_claims: dict[object, int] = {}
+
+def _gib(value: int) -> str:
+    return f"{value / 1024 ** 3:.2f} GiB"
+
+def claim_disk(key, remaining: int, label: str, where: Path | None = None) -> None:
+    """Record that `key` still needs `remaining` bytes and verify they fit now:
+    free space must cover them, every other active transfer's remaining bytes,
+    and the fixed reserve. Raises MediaError naming the file otherwise."""
+    remaining = max(0, int(remaining))
+    with _lock:
+        others = sum(v for k, v in _disk_claims.items() if k != key)
+        target = where if where is not None and where.exists() else (ROOT if ROOT.exists() else ROOT.parent)
+        free = shutil.disk_usage(target).free
+        if free < remaining + others + DISK_RESERVE:
+            raise MediaError(f"Not enough free disk space for {label}: needs {_gib(remaining)} more, "
+                f"{_gib(others)} is reserved by other active videos and {_gib(DISK_RESERVE)} is kept free; "
+                f"{_gib(free)} is available. Free space, then submit this video again.")
+        _disk_claims[key] = remaining
+
+def release_disk(key) -> None:
+    with _lock:
+        _disk_claims.pop(key, None)
+
+def claimed_disk_bytes() -> int:
+    with _lock:
+        return sum(_disk_claims.values())
 
 def filename(value: str) -> str:
     # Client name is display metadata only. Reject paths, do not basename them.
@@ -89,12 +122,38 @@ def directory(job_id: str) -> Path:
         raise NotFound("Experiment not found")
     return target
 
+# job_id -> ((file id, mtime ns, size), JSON text) of state.json as this process
+# last wrote or read it. Each atomic replace creates a new file, so a stat still
+# detects any change on disk. Reopening a just-replaced file is slow under
+# on-access scanning (measured median 28 ms, up to ~1 s on this storage) and
+# happens while _lock is held, which stalls every other video worker.
+_TEXT_CACHE_LIMIT = 64
+_texts: collections.OrderedDict[str, tuple[tuple[int, int, int], str]] = collections.OrderedDict()
+
+def _identity(path: Path) -> tuple[int, int, int]:
+    info = path.stat()
+    return info.st_ino, info.st_mtime_ns, info.st_size
+
+def _remember(job_id: str, key: tuple[int, int, int], text: str) -> None:
+    _texts[job_id] = (key, text)
+    _texts.move_to_end(job_id)
+    while len(_texts) > _TEXT_CACHE_LIMIT:
+        _texts.popitem(last=False)
+
 def _read(job_id: str) -> dict:
     path = directory(job_id) / "state.json"
     if path.is_symlink():
         raise NotFound("Experiment not found")
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        key = _identity(path)
+        cached = _texts.get(job_id)
+        if cached is not None and cached[0] == key:
+            text = cached[1]
+        else:
+            text = path.read_text(encoding="utf-8")
+            if _identity(path) == key:
+                _remember(job_id, key, text)
+        state = json.loads(text)
         if state["id"] != job_id:
             raise NotFound("Experiment not found")
         return state
@@ -104,11 +163,16 @@ def _read(job_id: str) -> dict:
 def _write(state: dict) -> dict:
     path = directory(state["id"])
     temp = path / ".state.writing"
-    temp.write_text(json.dumps(state, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    text = json.dumps(state, ensure_ascii=False, allow_nan=False)
+    temp.write_text(text, encoding="utf-8")
     deadline = time.monotonic() + 3
     while True:
         try:
             os.replace(temp, path / "state.json")
+            try:
+                _remember(state["id"], _identity(path / "state.json"), text)
+            except OSError:
+                _texts.pop(state["id"], None)  # next read goes to disk
             return copy.deepcopy(state)
         except PermissionError:
             if time.monotonic() >= deadline:
@@ -127,9 +191,19 @@ def initialize() -> None:
                     state = _read(path.name)
                 except NotFound:
                     continue
+                if state.get("scheduler_version"):
+                    from app.services.video_scheduler import recover
+                    recover(state)
+                    continue
                 if state.get("kind") == "drive_batch":
                     from app.services.drive_video_batch import recover
                     recover(state)
+                if state["status"] == "uploading":
+                    # An upload cut off by the restart left partial bytes only.
+                    try:
+                        video_path(state).unlink(missing_ok=True)
+                    except (OSError, NotFound):
+                        logger.exception("Could not remove partial upload of %s", state["id"])
                 if state["status"] in ACTIVE | {"uploading"}:
                     state.update(status="interrupted", finished_at=now(),
                         error="Backend restarted. Partial results preserved; upload a new experiment to run again.")
@@ -221,7 +295,9 @@ def save_representative(state: dict, row: dict, face, match, image, frame_index:
         old_score = previous.get("match_score")
         # A comparable match supersedes an unscored example. Unscored matches
         # never displace a scored example; equal scores retain earliest order.
-        if score is None or (old_score is not None and score <= old_score):
+        new_order = (state.get("source_order", 0), frame_index)
+        old_order = (previous.get("source_order", 0), previous["frame_index"])
+        if (old_score is not None and (score is None or score < old_score)) or (score == old_score and new_order >= old_order):
             return
     scale = min(1.0, PREVIEW_MAX_SIDE / max(width, height))
     out_width, out_height = max(1, round(width * scale)), max(1, round(height * scale))
@@ -247,7 +323,7 @@ def save_representative(state: dict, row: dict, face, match, image, frame_index:
         image_sha256=hashlib.sha256(encoded.tobytes()).hexdigest(),
         example_key=hashlib.sha256(encoded.tobytes() + json.dumps([frame_index, x1, y1, x2, y2, score]).encode()).hexdigest()[:32])
     if state.get("source_video_key"):
-        row["preview"].update(source_filename=state["filename"], source_video_key=state["source_video_key"])
+        row["preview"].update(source_filename=state["filename"], source_video_key=state["source_video_key"], source_order=state.get("source_order", 0))
         row["preview"]["example_key"] = hashlib.sha256((row["preview"]["example_key"] + state["source_video_key"]).encode()).hexdigest()[:32]
 
 
@@ -359,10 +435,11 @@ def complete_upload(job_id: str, size: int, sha256: str, media: dict) -> dict:
         return _write(state)
 
 def remove(job_id: str) -> None:
+    from app.services.video_scheduler import is_working
     initialize()
     with _lock:
         state = _read(job_id)
-        if state["status"] in ACTIVE or _active == job_id:
+        if state["status"] in ACTIVE or _active == job_id or is_working(job_id):
             raise Busy("Cancel and wait for processing to stop before Delete.")
         # Resolved target verified by directory(); never any other storage.
         shutil.rmtree(directory(job_id))
@@ -391,39 +468,16 @@ def detect(image):
     from app.face_recognition.engine import detect_faces
     return detect_faces(image)
 
-def start(job_id: str, settings: ScanSettings | dict | None = None) -> dict:
-    global _active
+def start(job_id: str, settings: ScanSettings | dict | None = None, device: str = "auto") -> dict:
+    from app.services.video_scheduler import enqueue
     settings = settings if isinstance(settings, ScanSettings) else ScanSettings.model_validate({} if settings is None else settings)
-    initialize()
-    with _lock:
-        state = _read(job_id)
-        if _active is not None or state["status"] != "ready":
-            raise Busy("Only one local video experiment can run; only a ready upload can start.")
-        _active = job_id
-        _cancel.clear()
-        state.update(status="running", started_at=now(), sampling_hz=SAMPLE_HZ, sampling_method=METHOD,
-            post_scan_delay_seconds=settings.post_scan_delay_seconds, historical_reference=HISTORICAL_COMMIT,
-            timing_differences=TIMING_DIFFERENCES, scan_work_seconds=0.0,
-            scan_settings=settings.model_dump(), preview_version=1)
-        worker = run
-        if state.get("kind") == "drive_batch":
-            from app.services.drive_video_batch import run as worker
-        else:
-            state["media"].update(expected_samples=None,
-                max_samples=maximum_sample_count(state["media"]["frame_count"], state["media"]["fps"], settings),
-                virtual_capture_fps_limit=settings.camera_fps,
-                effective_available_fps_limit=min(settings.camera_fps, state["media"]["fps"]))
-        _write(state)
-        try:
-            threading.Thread(target=worker, args=(job_id,), name="local-video-experiment", daemon=True).start()
-        except Exception:
-            _active = None
-            state.update(status="failed", error="Could not start worker.", finished_at=now())
-            _write(state)
-            raise
-        return state
+    return enqueue(job_id, settings, device)
+
 
 def cancel(job_id: str) -> dict:
+    if get(job_id).get("scheduler_version"):
+        from app.services.video_scheduler import cancel as scheduler_cancel
+        return scheduler_cancel(job_id)
     with _lock:
         state = get(job_id)
         if state["status"] in ACTIVE:
@@ -444,7 +498,7 @@ def scan_clock() -> float:
     return time.perf_counter()
 
 
-def verify_eof(path: Path, decoded_frames: int) -> dict:
+def verify_eof(path: Path, decoded_frames: int, cancelled=None) -> dict:
     """Independent sequential decode to null; OpenCV cannot distinguish EOF/errors.
 
     No images are exported and no recognition is repeated. Passthrough timing
@@ -469,7 +523,7 @@ def verify_eof(path: Path, decoded_frames: int) -> dict:
         aborted = None
         try:
             while process.poll() is None:
-                if _cancel.is_set():
+                if (cancelled or _cancel.is_set)():
                     aborted = "cancelled"
                     break
                 if time.monotonic() > deadline or progress.tell() > 2 * 1024 * 1024 or diagnostics.tell() > 2 * 1024 * 1024:
@@ -498,13 +552,15 @@ def verify_eof(path: Path, decoded_frames: int) -> dict:
             metadata_frame_count_is_estimate=True, verifier="FFmpeg sequential decode to null (no duplicate frames)")
 
 
-def process_video(state: dict, path: Path, index, settings: ScanSettings, checkpoint, representative=None) -> None:
+def process_video(state: dict, path: Path, index, settings: ScanSettings, checkpoint, representative=None, *, cancelled=None, detector=None) -> None:
     """One sequential source; caller owns persistence, errors and worker slot.
 
     Batch and single uploads share exactly the same scan and count loop.
     A batch representative callback retains just one frame per batch identity.
     """
     cap = None
+    is_cancelled = cancelled or _cancel.is_set
+    stages = state.setdefault("stage_seconds", {})
     counts = {row["person_id"]: row for row in state["people"]}
     max_duration = state.get("input_limits", {}).get("max_duration_seconds", MAX_DURATION)
     try:
@@ -512,13 +568,17 @@ def process_video(state: dict, path: Path, index, settings: ScanSettings, checkp
         if not cap.isOpened():
             raise MediaError("Video can no longer be opened. Try MP4/H.264 or AVI/MJPEG.")
         next_frame, capture_time = 0, 0.0
-        while not _cancel.is_set():
+        while not is_cancelled():
+            decode_start = time.perf_counter()
             ok, image = cap.read()
+            stages["decode_seconds"] = stages.get("decode_seconds", 0) + time.perf_counter() - decode_start
             if not ok or image is None:
                 state["decode_phase"] = "verifying_eof"
                 checkpoint()
-                state["decode_audit"] = verify_eof(path, state["decoded_frames"])
-                if state["decode_audit"]["error"] and not _cancel.is_set():
+                verify_start = time.perf_counter()
+                state["decode_audit"] = (verify_eof(path, state["decoded_frames"], cancelled=is_cancelled) if cancelled else verify_eof(path, state["decoded_frames"]))
+                stages["eof_verification_seconds"] = time.perf_counter() - verify_start
+                if state["decode_audit"]["error"] and not is_cancelled():
                     raise MediaError(state["decode_audit"]["error"])
                 break
             frame_index = state["decoded_frames"]
@@ -539,12 +599,14 @@ def process_video(state: dict, path: Path, index, settings: ScanSettings, checkp
             state["decoded_frames"] += 1
             if frame_index != next_frame:
                 continue
-            if _cancel.is_set():
+            if is_cancelled():
                 break
             # In-flight inference finishes safely; its complete frame is saved.
             scan_start = scan_clock()
-            faces = detect(image)
+            faces = (detector or detect)(image)
+            match_start = time.perf_counter()
             matches = index.match_batch(np.stack([f.embedding for f in faces]), state["model"]["threshold"]) if faces else []
+            stages["matching_seconds"] = stages.get("matching_seconds", 0) + time.perf_counter() - match_start
             if len(matches) != len(faces):
                 raise RuntimeError("Matcher result count mismatch")
             work_seconds = max(0.0, scan_clock() - scan_start)
@@ -571,12 +633,16 @@ def process_video(state: dict, path: Path, index, settings: ScanSettings, checkp
                 capture_time_seconds=round(capture_time, 9), scan_work_seconds=round(work_seconds, 9)))
             # Count all matches above; persist only one deterministic example
             # for each identity, reusing this detection's bbox and matcher score.
+            preview_start = time.perf_counter()
             for face, match in zip(faces, matches):
                 if match.person_id is not None:
                     (representative or save_representative)(state, counts[match.person_id], face, match, image, frame_index, timestamp)
             next_frame, capture_time = next_capture(frame_index, capture_time, work_seconds, state["media"]["fps"], settings)
+            stages["preview_seconds"] = stages.get("preview_seconds", 0) + time.perf_counter() - preview_start
+            checkpoint_start = time.perf_counter()
             checkpoint()
-        state["status"] = "cancelled" if _cancel.is_set() else "completed"
+            stages["checkpoint_seconds"] = stages.get("checkpoint_seconds", 0) + time.perf_counter() - checkpoint_start
+        state["status"] = "cancelled" if is_cancelled() else "completed"
         if state["status"] == "completed":
             state["actual_max_samples_zero_work"] = maximum_sample_count(state["decoded_frames"], state["media"]["fps"], settings)
     finally:
@@ -584,33 +650,14 @@ def process_video(state: dict, path: Path, index, settings: ScanSettings, checkp
             cap.release()
 
 
-def run(job_id: str) -> None:
-    global _active
-    clock = time.perf_counter()
-    state = get(job_id)
-    try:
-        settings = ScanSettings.model_validate(state["scan_settings"])
-        index, state["model"] = identity_snapshot()
-        _checkpoint(state, clock)
-        process_video(state, video_path(state), index, settings, lambda: _checkpoint(state, clock))
-    except MediaError as exc:
-        state.update(status="failed", error=str(exc))
-    except Exception:
-        logger.exception("Local video experiment failed")
-        state.update(status="failed", error="Video processing failed. Partial results retained. Check backend log and try a supported video.")
-    finally:
-        with _lock:
-            state.update(finished_at=now(), processing_seconds=round(time.perf_counter() - clock, 6), decode_phase="stopped")
-            try:
-                _write(state)
-            finally:
-                _active = None
-
 def public(state: dict, *, detail: bool = True) -> dict:
     result = copy.deepcopy(state)
+    if state.get("scheduler_version"):
+        from app.services.video_scheduler import decorate
+        decorate(result, state)
     result["can_start"] = state["status"] == "ready"
     result["can_cancel"] = state["status"] in ACTIVE
-    result["can_delete"] = state["status"] not in ACTIVE | {"uploading"}
+    result["can_delete"] = state["status"] not in ACTIVE | {"uploading"} and not result.get("active_workers")
     result["partial"] = state["status"] in {"running", "cancelling", "cancelled", "interrupted", "failed", "completed_with_errors"}
     result["unique_matched_people"] = len(state["people"])
     result["decoded_frames_not_inferred"] = max(0, state["decoded_frames"] - state["sampled_frames"])
@@ -701,6 +748,8 @@ def to_csv(state: dict) -> str:
         "finished_at": state["finished_at"] or "", "error": state["error"] or "",
         "review_meaning": "manual verdict applies only to one shown representative example; no whole-run accuracy",
         "count_meaning": "detection_count = sampled frames containing identity, at most once per frame; no passage count or accuracy"}
+    from app.services.video_scheduler import csv_metadata
+    metadata.update(csv_metadata(state))
     for key, value in metadata.items():
         writer.writerow(["metadata", key, _csv_text(value), "", "", "", "", "", "", "", "", "", ""])
     for row in public(state)["people"]:
