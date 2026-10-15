@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { apiGet, apiPostJson } from "../api/client";
 import { type ScanSettings, scanSettingsError } from "../api/scanSettings";
 import ScanSettingsFields from "./ScanSettingsFields";
+import { DEFAULT_RENDER_CHOICE, RenderOptions, renderBody, type RenderChoice } from "./VideoRenderControls";
 import { Button } from "./ui";
 
 const API = "/api/local-video-experiment/drive";
@@ -14,9 +15,10 @@ const message = (error: unknown) => error instanceof Error ? error.message : "Dr
 // Drive sizes arrive as decimal strings; Number is exact far beyond any real video (2^53 bytes).
 const formatBytes = (bytes: number) => bytes >= 1024 ** 3 ? (bytes / 1024 ** 3).toFixed(2) + " GiB" : (bytes / 1024 ** 2).toFixed(1) + " MiB";
 
-export default function DriveVideoBatchPanel({ settings, onSettings, disabled, onStarted, device = "auto" }: {
+export default function DriveVideoBatchPanel({ settings, onSettings, disabled, onStarted, device = "auto",
+  render = DEFAULT_RENDER_CHOICE, onRender = () => {} }: {
   settings: ScanSettings; onSettings: (value: ScanSettings) => void; disabled: boolean; onStarted: (state: unknown) => void;
-  device?: string;
+  device?: string; render?: RenderChoice; onRender?: (value: RenderChoice) => void;
 }) {
   const [account, setAccount] = useState<AccountState | null>(null);
   const [link, setLink] = useState("");
@@ -88,7 +90,7 @@ export default function DriveVideoBatchPanel({ settings, onSettings, disabled, o
     setBusy(true); setError("");
     try {
       onStarted(await apiPostJson(API + "/batches", { name: name.trim(), folder_link: link, file_ids: selected,
-        account_id: folder.account.account_id, scan_settings: { ...settings }, device }));
+        account_id: folder.account.account_id, scan_settings: { ...settings }, device, ...renderBody(render) }));
     } catch (err) { setError(message(err)); }
     finally { setBusy(false); }
   }
@@ -133,6 +135,7 @@ export default function DriveVideoBatchPanel({ settings, onSettings, disabled, o
     </>}
     <label className="mt-3 block text-sm">Batch name<input aria-label="Video batch name" className="my-1 block w-full rounded border p-2" maxLength={120} value={name} disabled={locked} onChange={event => setName(event.target.value)} /></label>
     <ScanSettingsFields value={settings} onChange={onSettings} disabled={locked} video />
+    <RenderOptions value={render} onChange={onRender} disabled={locked} drive />
     <Button disabled={locked || !name.trim() || !selected.length || selected.length > (limits?.max_files ?? 32) || !folder || !account?.read_access || !!scanSettingsError(settings)} onClick={() => void start()}>
       {busy ? "Working…" : "Start selected videos as one batch"}</Button>
     <p className="mt-2 text-xs text-gray-600">Listing and selection do not download or recognize. Start freezes these settings for every source. Temporary videos are deleted after each source; counts and one preview per matched person remain.</p>

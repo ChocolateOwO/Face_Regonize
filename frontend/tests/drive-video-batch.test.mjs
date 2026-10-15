@@ -34,6 +34,7 @@ async function setup({ connected = true, readAccess = true, scanSettings = setti
     if (name === "../api/client") return api;
     if (name === "../api/scanSettings") return settingsModule;
     if (name === "./ScanSettingsFields") return { default: "Fields" };
+    if (name === "./VideoRenderControls") return {RenderOptions:"RenderOptions",RenderStatus:"RenderStatus",RenderLater:"RenderLater",DEFAULT_RENDER_CHOICE:{enabled:false,keep_audio:true,detector:"plain"},renderBody:c=>c&&c.enabled?{render:{...c}}:{},renderIsActive:r=>!!r&&["queued","running"].includes(r.status)};
     if (name === "./ui") return { Button: "Button" };
     throw Error(name);
   }, exports);

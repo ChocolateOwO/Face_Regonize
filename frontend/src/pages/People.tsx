@@ -13,6 +13,7 @@ interface Person {
   email: string | null;
   image_path: string;
   is_demo: boolean;
+  call_as?: string | null;
   created_at: string;
   updated_at: string;
   detection_count: number;
@@ -124,6 +125,7 @@ export default function People() {
                         <div className="font-medium text-gray-900">
                           {p.first_name} {p.last_name}
                         </div>
+                        {p.call_as && <div className="text-xs text-gray-500">เรียกว่า {p.call_as}</div>}
                         {p.is_demo && <Badge>Demo Data</Badge>}
                       </div>
                     </Link>

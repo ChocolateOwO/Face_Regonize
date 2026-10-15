@@ -13,6 +13,7 @@ from app.services import local_video_experiment as video
 from app.services.scan_settings import ScanSettings, RANGES
 from app.api.scan_settings import ScanSettingsRoute
 from app.services import video_scheduler, video_devices
+from app.services import video_render, video_render_media, video_render_overlay
 
 router = APIRouter(prefix="/api/local-video-experiment", tags=["local-video-experiment"], route_class=ScanSettingsRoute)
 UPLOAD_CHECK_BYTES = 8 * 1024 * 1024
@@ -99,6 +100,30 @@ def execution(user: User = Depends(require_admin)):
 def configure_execution(body: video_scheduler.WorkerSettings, user: User = Depends(require_admin)):
     return video_scheduler.configure(body)
 
+def _modes(key: str, gpu: dict, gpu_name: str, cpu_name: str, auto: str) -> list[dict]:
+    ok, reason = gpu[key]
+    return [{"value": "auto", "label": "Auto", "available": True, "detail": auto},
+            {"value": "gpu", "label": f"GPU ({gpu_name})", "available": ok, "detail": None if ok else reason},
+            {"value": "cpu", "label": f"CPU ({cpu_name})", "available": True, "detail": None}]
+
+@router.get("/render/capabilities")
+def render_capabilities(user: User = Depends(require_admin)):
+    """What a tagged-video render can use on this machine right now."""
+    fonts = video_render_overlay.load_fonts()
+    ffmpeg = bool(video_render_media.find_tool("ffmpeg") and video_render_media.find_tool("ffprobe"))
+    gpu = video_render_media.gpu_modes()
+    return {"available": ffmpeg, "ffmpeg_found": ffmpeg,
+        "message": None if ffmpeg else "FFmpeg (ffmpeg and ffprobe) was not found. Install FFmpeg or set RECONIZE_FFMPEG to render tagged videos.",
+        "detectors": [{"value": key, "label": label} for key, label in video_render.DETECTORS.items()],
+        "default_detector": "plain", "font": fonts.description, "thai_labels": fonts.thai,
+        "decoder_modes": _modes("decoder", gpu, "NVDEC", "OpenCV FFmpeg", "CPU: measured no slower than NVDEC, and it uses no extra VRAM"),
+        "encoder_modes": _modes("encoder", gpu, "h264_nvenc", "libx264",
+                                video_render_media.ENCODER_LABELS[video_render_media.ENCODER_ORDER[0]] + " first, then "
+                                + video_render_media.ENCODER_LABELS[video_render_media.ENCODER_ORDER[1]] + " if it cannot encode that video"),
+        "mode_note": "GPU runs on the GPU or the render stops with the reason; it never falls back to the CPU. Auto picks the faster measured path.",
+        "timing": "source timestamps are preserved; no frames are duplicated or dropped",
+        "panel_width": video_render_overlay.PANEL_W}
+
 @router.get("/{job_id}")
 def detail(job_id: str, user: User = Depends(require_admin)):
     return video.public(load(job_id))
@@ -108,10 +133,11 @@ def start(job_id: str, body: video_devices.VideoSettings | None = Body(default=N
     load(job_id)
     try:
         body = body or video_devices.VideoSettings()
-        return video.public(video.start(job_id, ScanSettings.model_validate(body.model_dump(exclude={"device"})), body.device))
+        return video.public(video.start(job_id, ScanSettings.model_validate(body.model_dump(exclude={"device", "render"})), body.device,
+                                        body.render.model_dump() if body.render else None))
     except video.Busy as exc:
         raise HTTPException(409, str(exc))
-    except video_devices.DeviceError as exc:
+    except (video_devices.DeviceError, video.MediaError) as exc:
         raise HTTPException(400, str(exc))
 
 @router.post("/{job_id}/cancel")
@@ -137,6 +163,57 @@ def download_video(job_id: str, user: User = Depends(require_admin)):
     if not path.is_file():
         raise HTTPException(404, "Experiment video not found")
     return FileResponse(path, filename=state["filename"], media_type="application/octet-stream",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+def _render_record(state: dict, source_key: str) -> dict:
+    source = video_scheduler.render_entry(state, source_key)
+    record = (source or {}).get("render")
+    if not record:
+        raise HTTPException(404, "No tagged video for this source.")
+    return {"source": source, "record": record}
+
+@router.post("/{job_id}/render")
+def render_later(job_id: str, body: video_render.RenderSettings, user: User = Depends(require_admin)):
+    """Render the tagged video of a retained LOCAL upload after its run."""
+    load(job_id)
+    try:
+        settings = {**body.model_dump(), "enabled": True}
+        return video.public(video_scheduler.request_render(job_id, settings))
+    except video.Busy as exc:
+        raise HTTPException(409, str(exc))
+    except (video.MediaError, video.NotFound) as exc:
+        raise HTTPException(400, str(exc))
+
+@router.post("/{job_id}/sources/{source_key}/render/cancel")
+def render_cancel(job_id: str, source_key: str, user: User = Depends(require_admin)):
+    _render_record(load(job_id), source_key)
+    return video.public(video_scheduler.cancel_render(job_id, source_key))
+
+@router.delete("/{job_id}/sources/{source_key}/render")
+def render_delete(job_id: str, source_key: str, user: User = Depends(require_admin)):
+    _render_record(load(job_id), source_key)
+    try:
+        return video.public(video_scheduler.delete_render(job_id, source_key))
+    except video.Busy as exc:
+        raise HTTPException(409, str(exc))
+    except video.NotFound as exc:
+        raise HTTPException(404, str(exc))
+
+@router.get("/{job_id}/sources/{source_key}/render.mp4")
+def render_download(job_id: str, source_key: str, user: User = Depends(require_admin)):
+    """One tagged video per source: a Drive batch of seven videos has seven
+    separate links (video-001 ... video-007); a local upload uses 'local'."""
+    found = _render_record(load(job_id), source_key)
+    if found["record"]["status"] != "completed":
+        raise HTTPException(409, "The tagged video for this source is not finished.")
+    try:
+        path = video_render.output_path(job_id, source_key)
+    except (video.MediaError, video.NotFound):
+        raise HTTPException(404, "Tagged video not found")
+    if not path.is_file():
+        raise HTTPException(404, "Tagged video not found")
+    stem = found["source"].get("filename", source_key).rsplit(".", 1)[0] or source_key
+    return FileResponse(path, filename=f"{stem}_tagged.mp4", media_type="video/mp4",
         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 @router.get("/{job_id}/report.csv")

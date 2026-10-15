@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { apiPostJson } from "../api/client";
+import { endFileSession } from "./fileSession";
 
 interface AuthState {
   username: string | null;
@@ -20,6 +21,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   function logout() {
+    endFileSession();
     localStorage.removeItem("token");
     localStorage.removeItem("username");
     setUsername(null);

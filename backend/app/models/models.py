@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
+from sqlalchemy import event, insert
 from sqlmodel import Field, SQLModel
 
 
@@ -35,6 +36,9 @@ class Person(SQLModel, table=True):
     is_demo: bool = Field(default=False)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
+    # How a voice/robot client should address this person (e.g. "พี่บอส").
+    # Entered by an admin; NULL means "use the name". Never inferred.
+    call_as: Optional[str] = None
 
 
 class Upload(SQLModel, table=True):
@@ -51,6 +55,12 @@ class Upload(SQLModel, table=True):
     faces_total: int = 0
     faces_matched: int = 0
     faces_unknown: int = 0
+    # Where this frame came from: "kiosk" (/api/recognition/upload),
+    # "node_event" (/api/node/event, a CCTV Local Agent) or "node_central"
+    # (/api/node/recognize-central). NULL = written before this was recorded;
+    # reported honestly as unknown, never guessed from the filename.
+    source_kind: Optional[str] = None
+    source_node_id: Optional[str] = None
 
 
 class FaceDetection(SQLModel, table=True):
@@ -63,6 +73,28 @@ class FaceDetection(SQLModel, table=True):
     bbox: str  # "x1,y1,x2,y2"
     detected_at: datetime = Field(default_factory=datetime.now)
     status: str = Field(default="unknown")  # matched | unknown
+    # Write-order cursor for incremental history readers. Assigned on insert
+    # from HistorySequence (below), never reused; NULL for rows written before
+    # it existed. `id` is a random uuid and must not be used as an order.
+    seq: Optional[int] = Field(default=None, index=True)
+
+
+class HistorySequence(SQLModel, table=True):
+    """Counter for FaceDetection.seq. SQLite AUTOINCREMENT guarantees a new
+    number is always larger than any ever issued, even after rows (or all
+    history) are deleted. Allocation happens inside the same write
+    transaction as the FaceDetection insert, and SQLite has a single writer,
+    so seq order is commit order."""
+
+    __table_args__ = {"sqlite_autoincrement": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+
+@event.listens_for(FaceDetection, "before_insert")
+def _assign_history_seq(mapper, connection, target) -> None:
+    if target.seq is None:
+        result = connection.execute(insert(HistorySequence.__table__))
+        target.seq = result.inserted_primary_key[0]
 
 
 class Activity(SQLModel, table=True):

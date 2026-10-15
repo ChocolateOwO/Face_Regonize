@@ -468,10 +468,10 @@ def detect(image):
     from app.face_recognition.engine import detect_faces
     return detect_faces(image)
 
-def start(job_id: str, settings: ScanSettings | dict | None = None, device: str = "auto") -> dict:
+def start(job_id: str, settings: ScanSettings | dict | None = None, device: str = "auto", render: dict | None = None) -> dict:
     from app.services.video_scheduler import enqueue
     settings = settings if isinstance(settings, ScanSettings) else ScanSettings.model_validate({} if settings is None else settings)
-    return enqueue(job_id, settings, device)
+    return enqueue(job_id, settings, device, render)
 
 
 def cancel(job_id: str) -> dict:

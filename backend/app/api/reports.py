@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from app.auth.deps import get_current_user
+from app.auth.deps import get_api_client, get_current_user
 from app.database.db import get_session
 from app.models.models import Activity, Attendance, FaceDetection, Person, Upload, User
 
@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 
 
 @router.get("/dashboard")
-def dashboard(session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+def dashboard(session: Session = Depends(get_session), user: User = Depends(get_api_client)):
     today_start = datetime.combine(date.today(), time.min)
     registered_total = session.exec(select(func.count()).select_from(Person)).one()
     uploaded_images_total = session.exec(select(func.count()).select_from(Upload)).one()

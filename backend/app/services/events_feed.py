@@ -15,21 +15,29 @@ import threading
 
 _lock = threading.Lock()
 _subscribers: set[asyncio.Queue] = set()
+# Subscribers that ALSO asked for live-presence messages (?include=presence).
+# Presence is opt-in: every page on the ordinary feed reloads on each message
+# and the robot's parser expects only matched events, so neither may receive
+# a message type it never asked for.
+_presence_subscribers: set[asyncio.Queue] = set()
 _loop: asyncio.AbstractEventLoop | None = None
 
 
-def subscribe() -> asyncio.Queue:
+def subscribe(presence: bool = False) -> asyncio.Queue:
     global _loop
     queue: asyncio.Queue = asyncio.Queue(maxsize=50)
     with _lock:
         _loop = asyncio.get_running_loop()
         _subscribers.add(queue)
+        if presence:
+            _presence_subscribers.add(queue)
     return queue
 
 
 def unsubscribe(queue: asyncio.Queue) -> None:
     with _lock:
         _subscribers.discard(queue)
+        _presence_subscribers.discard(queue)
 
 
 def publish(event: dict) -> None:
@@ -39,6 +47,19 @@ def publish(event: dict) -> None:
     with _lock:
         subscribers = list(_subscribers)
         loop = _loop
+    _deliver(subscribers, loop, event)
+
+
+def publish_presence(event: dict) -> None:
+    """A live-presence message (services/presence_service.py): delivered only
+    to subscribers that opted in, never to the ordinary feed."""
+    with _lock:
+        subscribers = list(_presence_subscribers)
+        loop = _loop
+    _deliver(subscribers, loop, event)
+
+
+def _deliver(subscribers: list, loop, event: dict) -> None:
     if not subscribers or loop is None:
         return
 

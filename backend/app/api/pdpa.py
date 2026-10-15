@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
-from app.auth.deps import get_current_user
+from app.auth.deps import ADMIN_ROLE, get_current_user, get_station_user
 from app.database.db import get_session
 from app.models.models import ConsentRecord, Person, User
 
@@ -30,11 +30,16 @@ def _latest_per_person(session: Session, person_ids: list[str] | None = None) ->
 
 
 @router.post("/record")
-def record_consent(body: RecordConsentBody, session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+def record_consent(body: RecordConsentBody, session: Session = Depends(get_session), user: User = Depends(get_station_user)):
+    """The kiosk records a participant's own answer (source "kiosk"); an admin
+    may record an override (source "admin"). A non-admin station account may
+    only record kiosk answers."""
     if body.choice not in ("consented", "declined"):
         raise HTTPException(400, "choice must be 'consented' or 'declined'")
     if body.source not in ("kiosk", "admin"):
         raise HTTPException(400, "source must be 'kiosk' or 'admin'")
+    if body.source == "admin" and user.role != ADMIN_ROLE:
+        raise HTTPException(403, "Only an admin may record an admin consent override.")
     created = []
     for person_id in body.person_ids:
         if not session.get(Person, person_id):

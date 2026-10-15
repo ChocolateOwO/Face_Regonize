@@ -8,13 +8,14 @@ import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
-from app.auth.deps import get_current_user
+from app.auth.deps import get_api_client, is_machine
 from app.database.db import engine, get_session
 from app.face_recognition.engine import bbox_to_str, detect_faces, get_active_provider, resize_for_detection, MODEL_NAME
 from app.face_recognition.index import recognition_index
 from app.api.activities import get_current_activity_id
 from app.models.models import Activity, Attendance, FaceDetection, Upload, User
 from app.services import events_feed, settings_cache, storage_service
+from app.services.person_address import call_as_for
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/recognition", tags=["recognition"])
@@ -63,7 +64,7 @@ def _resolve_activity(session: Session, requested: str | None) -> str:
     return get_current_activity_id(session)
 
 
-def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, threshold: float, faces, matches, scaled_bboxes, new_person_ids: set[str], activity_id: str = "") -> None:
+def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, threshold: float, faces, matches, scaled_bboxes, new_person_ids: set[str], activity_id: str = "", feed_node_id: str = "kiosk", source_kind: str = "kiosk") -> None:
     """Runs AFTER the recognition response has already been sent to the
     client — image storage, thumbnailing, and every DB write happen here so
     none of it adds latency to the identity result. Opens its own session
@@ -90,10 +91,13 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
             faces_total=len(faces),
             faces_matched=matched_count,
             faces_unknown=unknown_count,
+            source_kind=source_kind,
+            source_node_id=feed_node_id,
         )
         session.add(upload)
         session.commit()
         session.refresh(upload)
+        addresses = call_as_for(session, (m[0] for m in matches))
 
         for face, (person_id, _first, full_name, participant_id, score), bbox in zip(faces, matches, scaled_bboxes):
             status = "matched" if person_id else "unknown"
@@ -129,20 +133,20 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
 
             if person_id:
                 # Same live-events feed the CCTV/mobile nodes already publish
-                # to (api/nodes.py) — the kiosk was the one recognition path
-                # that never fed it, so a person scanning at the kiosk never
-                # showed up on anything watching this feed (People's
-                # last_detected, Attendees, Dashboard). node_id is a constant
-                # "kiosk" tag rather than a real station id: the kiosk never
-                # registers itself as a node, and consumers of this feed only
-                # care THAT a detection happened, not which kiosk.
+                # to (api/nodes.py). This is the ONLY publish for a frame that
+                # went through run_recognition(): the kiosk's /upload passes
+                # the constant "kiosk" tag (the kiosk never registers itself
+                # as a node), /api/node/recognize-central passes its real
+                # node_id. Publishing here, after the write, means `checkin`
+                # describes the Attendance row that actually exists.
                 events_feed.publish({
-                    "node_id": "kiosk",
+                    "node_id": feed_node_id,
                     "participant_id": participant_id,
                     "name": full_name,
                     "activity_id": activity_id or None,
                     "checkin": checkin,
                     "at": datetime.now().isoformat(),
+                    "call_as": addresses.get(person_id),
                 })
     t_db = time.perf_counter()
     logger.info(
@@ -161,6 +165,10 @@ def run_recognition(
     user_id: str,
     activity_id: str | None,
     debug: bool | None,
+    persist: bool = True,
+    feed_node_id: str = "kiosk",
+    source_kind: str = "kiosk",
+    observed: dict | None = None,
 ) -> dict:
     """The recognize-and-checkin core, shared by every entry point that hands
     Central a frame to identify: the kiosk's own /upload route below, AND
@@ -171,6 +179,17 @@ def run_recognition(
     independently-maintained copy is exactly how the two paths would
     eventually disagree. /upload's behaviour and response shape are
     byte-for-byte unchanged by this extraction; it is a straight house move.
+
+    persist=False is the observe-only mode: decode, detect, match and answer,
+    nothing else. No activity lookup, no attendance read, no background task
+    - so no image/thumbnail, Upload, FaceDetection, Attendance or live-feed
+    event. Matched entries say checkin_status "not_recorded" and the response
+    carries "persisted": false, so an observed identity can never be mistaken
+    for a recorded check-in. The default (persist=True) response is unchanged.
+
+    observed, when a caller passes a dict, receives the decoded image size
+    ({"w", "h"}) - the size the response's pixel boxes refer to. It is not
+    part of the response.
     """
     t0 = time.perf_counter()
     t_read = time.perf_counter()
@@ -179,6 +198,8 @@ def run_recognition(
     if img is None:
         raise HTTPException(400, "Could not decode the uploaded image.")
     t_decode = time.perf_counter()
+    if observed is not None:
+        observed.update(w=int(img.shape[1]), h=int(img.shape[0]))
 
     working_img, scale = resize_for_detection(img)
     t_resize = time.perf_counter()
@@ -208,16 +229,18 @@ def run_recognition(
     # once against different activities; the app-wide current activity is the
     # fallback for a kiosk that pins nothing. Resolved once per request so the
     # synchronous decision and the background write cannot disagree.
-    activity_id = _resolve_activity(session, activity_id)
     checkin_status: dict[str, str] = {}
     new_person_ids: set[str] = set()
-    for person_id, *_ in matches:
-        if person_id and person_id not in checkin_status:
-            already = _checked_in_today(session, person_id, activity_id)
-            checkin_status[person_id] = "already_checked_in" if already else "new"
-            if not already:
-                new_person_ids.add(person_id)
+    if persist:
+        activity_id = _resolve_activity(session, activity_id)
+        for person_id, *_ in matches:
+            if person_id and person_id not in checkin_status:
+                already = _checked_in_today(session, person_id, activity_id)
+                checkin_status[person_id] = "already_checked_in" if already else "new"
+                if not already:
+                    new_person_ids.add(person_id)
     t_checkin = time.perf_counter()
+    addresses = call_as_for(session, (m[0] for m in matches))
 
     results = []
     scaled_bboxes = []
@@ -237,7 +260,8 @@ def run_recognition(
                 "participant_id": participant_id,
                 "first_name": first_name,
                 "name": full_name,
-                "checkin_status": checkin_status[person_id],  # "new" | "already_checked_in"
+                "call_as": addresses.get(person_id),
+                "checkin_status": checkin_status[person_id] if persist else "not_recorded",  # "new" | "already_checked_in" | "not_recorded"
             })
         else:
             unknown_count += 1
@@ -253,6 +277,8 @@ def run_recognition(
         "threshold_used": threshold,
         "results": results,
     }
+    if not persist:
+        response["persisted"] = False
 
     show_debug = debug if debug is not None else settings_cache.get_debug_mode()
     if show_debug:
@@ -276,7 +302,8 @@ def run_recognition(
             "registered_faces_indexed": recognition_index.size(),
         }
 
-    background_tasks.add_task(_persist_recognition, file_bytes, filename, user_id, threshold, faces, matches, scaled_bboxes, new_person_ids, activity_id)
+    if persist:
+        background_tasks.add_task(_persist_recognition, file_bytes, filename, user_id, threshold, faces, matches, scaled_bboxes, new_person_ids, activity_id, feed_node_id, source_kind)
 
     return response
 
@@ -287,8 +314,9 @@ def recognize(
     photo: UploadFile = File(...),
     debug: bool | None = None,
     activity_id: str | None = Form(None),
+    persist: bool = True,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_api_client),
 ):
     """Recognize-first, persist-second: everything up to the return in
     run_recognition() is in-memory only (no DB query, no DB write, no disk
@@ -296,11 +324,17 @@ def recognize(
     + comparison allow. Storage and history bookkeeping happen in a
     background task afterward. Thin wrapper around run_recognition() — see
     its docstring for why this is shared rather than duplicated.
+
+    ?persist=false (query) recognizes without saving or checking in anyone.
+    A machine account (robot) may only use persist=false: it observes, it is
+    never a check-in station.
     """
+    if is_machine(user) and persist:
+        raise HTTPException(403, "Machine accounts may only call this with persist=false.")
     file_bytes = photo.file.read()
     filename = photo.filename or "upload.jpg"
     return run_recognition(
         file_bytes, filename,
         background_tasks=background_tasks, session=session,
-        user_id=user.id, activity_id=activity_id, debug=debug,
+        user_id=user.id, activity_id=activity_id, debug=debug, persist=persist,
     )

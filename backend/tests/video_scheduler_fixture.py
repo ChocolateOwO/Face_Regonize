@@ -3,6 +3,7 @@ from app.services import local_video_experiment as video, video_scheduler as sch
 
 def _clear():
     scheduler._indices.clear(); scheduler._tokens.clear(); scheduler._stages.clear(); scheduler._previews.clear()
+    scheduler._render_tokens.clear()
     video._disk_claims.clear()
 
 def install(case, *, fake_index=False):
@@ -13,6 +14,7 @@ def install(case, *, fake_index=False):
     case.patch(devices, 'session', lambda device: None)
     case.patch(devices, 'PROVIDERS', {'cpu': 'FakeProvider'})
     case.patch(devices, 'detect', lambda image, device, timings: video.detect(image))
+    case.patch(devices, 'detect_tiled', lambda image, device, timings, before_call=None: video.detect(image))
     if fake_index:
         case.patch(scheduler, 'freeze', lambda job_id: video.identity_snapshot())
 

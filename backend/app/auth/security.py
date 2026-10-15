@@ -22,6 +22,19 @@ def create_access_token(user_id: str, username: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
+# A file-read token: stored in an HttpOnly cookie scoped to /api/files so
+# <img>/<a> previews (which cannot send an Authorization header) are
+# authenticated. It authorizes reading stored files ONLY - deps rejects it as
+# an API token - and never outlives the session token it was issued from.
+FILE_SCOPE = "files"
+FILE_COOKIE = "reconize_files"
+
+
+def create_file_token(user_id: str, expires_at: datetime) -> str:
+    payload = {"sub": user_id, "scope": FILE_SCOPE, "exp": expires_at}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
 def decode_access_token(token: str) -> dict | None:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])

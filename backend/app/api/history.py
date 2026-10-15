@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
-from app.auth.deps import get_current_user
+from app.auth.deps import get_api_client, get_current_user
 from app.database.db import get_session
 from app.models.models import FaceDetection, Person, Upload, User
 
@@ -29,9 +29,16 @@ def recognition_history(
     date_to: str | None = None,
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
+    after_seq: int | None = None,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_api_client),
 ):
+    """Paged history, newest first (unchanged). With `after_seq`, cursor mode
+    instead: rows written after that sequence number, oldest first, at most
+    page_size of them; pass the returned `next_after_seq` to continue. `page`
+    is ignored in cursor mode. Rows written before sequence numbers existed
+    have seq null and never appear in cursor mode. `latest_seq` (both modes)
+    is where a new reader starts so it only sees what happens next."""
     page = max(page, 1)
     if page_size not in ALLOWED_PAGE_SIZES:
         page_size = DEFAULT_PAGE_SIZE
@@ -63,9 +70,15 @@ def recognition_history(
             Upload.filename.ilike(like),
         ))
 
+    if after_seq is not None:
+        stmt = stmt.where(FaceDetection.seq > after_seq)
     total = session.exec(select(func.count()).select_from(stmt.subquery())).one()
+    latest_seq = session.exec(select(func.max(FaceDetection.seq))).one()
 
-    paged = stmt.order_by(FaceDetection.detected_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    if after_seq is not None:
+        paged = stmt.order_by(FaceDetection.seq).limit(page_size)
+    else:
+        paged = stmt.order_by(FaceDetection.detected_at.desc()).offset((page - 1) * page_size).limit(page_size)
     rows = session.exec(paged).all()
 
     out = []
@@ -81,8 +94,16 @@ def recognition_history(
             "confidence": d.confidence,
             "status": d.status,
             "detected_at": d.detected_at,
+            "seq": d.seq,
+            "node_id": upload.source_node_id if upload else None,
+            "source": (upload.source_kind if upload else None) or "unknown",
+            "call_as": person.call_as if person else None,
         })
-    return {"items": out, "total": total, "page": page, "page_size": page_size}
+    response = {"items": out, "total": total, "page": page, "page_size": page_size, "latest_seq": latest_seq}
+    if after_seq is not None:
+        response["page"] = 1
+        response["next_after_seq"] = out[-1]["seq"] if out else after_seq
+    return response
 
 
 @router.delete("")

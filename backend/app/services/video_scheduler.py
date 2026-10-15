@@ -19,6 +19,7 @@ import numpy as np
 import psutil
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.services import local_video_experiment as video, video_devices as devices
+from app.services import inference_priority, video_render as render
 from app.services.scan_settings import ScanSettings
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ _stop = threading.Event()
 _workers = {}  # (job_id, source_key) -> thread
 _stages = {}   # (job_id, source_key) -> 'downloading' | 'processing'
 _tokens = {}
+_render_tokens = {}  # (job_id, source_key) -> Event: cancel just that tagged-video render
 _indices = {}
 # job_id -> {person_id: saved preview}. Mirrors the batch's persisted previews
 # (this process is their only writer) so a weaker match costs no state I/O.
@@ -113,7 +115,8 @@ def telemetry():
         stages = list(_stages.values())
         return {**config(), 'max_workers_limit': worker_ceiling(), 'default_workers': DEFAULT_WORKERS,
                 'active_workers': len(_workers), 'downloading_workers': stages.count('downloading'),
-                'processing_workers': stages.count('processing'), 'queued_sources': queued_sources,
+                'processing_workers': stages.count('processing'), 'rendering_workers': stages.count('rendering'),
+                'queued_sources': queued_sources,
                 'queued_batches': queued_batches, 'inference_limit': 1, 'inference_in_flight': devices.in_flight(),
                 'pending_limit': MAX_PENDING, 'reserved_download_bytes': video.claimed_disk_bytes(),
                 'disk_reserve_bytes': video.DISK_RESERVE,
@@ -150,8 +153,36 @@ def load_index(job_id):
         for i, key in enumerate(payload['ids'])])
     return index
 
-def enqueue(job_id, settings, requested='auto'):
+def names_snapshot(job_id) -> dict:
+    """person_id -> (display name, participant_id) from the frozen enrollment
+    snapshot of this experiment; never the live database or index internals."""
+    path = video.directory(job_id) / 'enrollment.json'
+    if path.is_symlink() or not path.is_file():
+        raise video.MediaError('Frozen enrollment snapshot is unavailable.')
+    payload = json.loads(path.read_text('utf-8'))
+    return {key: (payload['full'][i] or payload['first'][i] or '', payload['participant'][i] or '')
+            for i, key in enumerate(payload['ids'])}
+
+def render_entry(state, source_key):
+    """The dict that carries a source's `render` record: the experiment itself
+    for a local upload ('local'), or the matching Drive source."""
+    if state.get('kind') == 'drive_batch':
+        return next((s for s in state['videos'] if s['source_video_key'] == source_key), None)
+    return state if source_key == 'local' else None
+
+def _settle_renders(state):
+    """A source that did not finish recognition can never be rendered: say so
+    instead of leaving its render queued forever."""
+    for source in state.get('videos', [state]):
+        entry = source.get('render')
+        if entry and entry['status'] in render.ACTIVE and source['status'] in {'failed', 'cancelled', 'interrupted', 'not_processed'}:
+            entry.update(status='not_rendered', finished_at=video.now(),
+                         error='Recognition did not complete for this source, so no tagged video was made.')
+
+def enqueue(job_id, settings, requested='auto', render_settings=None):
     video.initialize()
+    if render_settings and render_settings.get('enabled'):
+        render.check_modes(render_settings)
     actual = devices.resolve(requested)
     with video._lock:
         state = video._read(job_id)
@@ -172,6 +203,12 @@ def enqueue(job_id, settings, requested='auto'):
             requested_device=requested, actual_device=actual, requested_provider='Auto' if requested == 'auto' else devices.PROVIDERS[requested],
             actual_provider=devices.PROVIDERS[actual], model=model, scan_settings=settings.model_dump(), preview_version=1,
             worker_limit_at_submission=config()['max_workers'], post_scan_delay_seconds=settings.post_scan_delay_seconds)
+        if render_settings and render_settings.get('enabled'):
+            # Frozen with the run. Kept apart from scan_settings and the counts,
+            # so the CSV and every recognition number are the same with or without it.
+            state['render_settings'] = dict(render_settings)
+            for source in state.get('videos', [state]):
+                source['render'] = render.new_status(render_settings)
         _indices[job_id] = index
         _tokens[job_id] = threading.Event()
         if state.get('kind') != 'drive_batch':
@@ -184,8 +221,31 @@ def enqueue(job_id, settings, requested='auto'):
     _wake.set()
     return state
 
+def _recover_renders(state):
+    """After a restart no render is running. Partial files go; a render that
+    was running, or queued for a source that already finished, is recorded as
+    interrupted (never resumed automatically). A render still queued for a
+    source that has not been processed yet stays queued and runs with it."""
+    changed = False
+    try:
+        folder = video.directory(state['id']) / 'renders'
+        if folder.is_dir() and not folder.is_symlink():
+            for partial in folder.glob('*.partial.mp4'):
+                partial.unlink(missing_ok=True)
+    except (OSError, video.NotFound):
+        logger.exception('Could not remove partial renders of %s', state.get('id'))
+    for source in state.get('videos', [state]):
+        entry = source.get('render')
+        if entry and entry['status'] in render.ACTIVE and (entry['status'] == 'running' or source['status'] not in {'pending', 'queued', 'downloading', 'running'}):
+            entry.update(status='interrupted', finished_at=video.now(),
+                         error='Backend stopped during rendering; the partial file was removed. Recognition results are unaffected.')
+            changed = True
+    return changed
+
 def recover(state):
     from app.services import drive_video_batch as batch
+    if _recover_renders(state) and state['status'] not in video.ACTIVE:
+        video._write(state)
     if state.get('kind') == 'drive_batch':
         try:
             batch.cleanup(state['id'])
@@ -211,14 +271,18 @@ def recover(state):
     else:
         state.update(status='cancelled' if cancelling else 'interrupted', finished_at=video.now(),
                      error='Backend stopped; partial results retained. No automatic replay of this video.')
+    _settle_renders(state)
     video._write(state)
 
 def finish_if_done(state):
+    _settle_renders(state)
     if state.get('kind') != 'drive_batch':
         return
     sources = state['videos']
     if any(s['status'] in {'pending', 'downloading', 'running'} for s in sources):
         return
+    if any((s.get('render') or {}).get('status') in render.ACTIVE for s in sources):
+        return  # recognition is done; tagged videos are still being written
     errors = sum(s['status'] in {'failed', 'interrupted'} for s in sources)
     completed = sum(s['status'] == 'completed' for s in sources)
     state['status'] = ('cancelled' if state['status'] == 'cancelling' or state['status'] == 'cancelled' else
@@ -241,8 +305,67 @@ def cancel(job_id):
             state.update(status='cancelled', finished_at=video.now())
             _indices.pop(job_id, None)
             _tokens.pop(job_id, None)
+        _settle_renders(state)
         video._write(state)
         _wake.set()
+        return state
+
+def request_render(job_id, settings: dict):
+    """Queue a tagged-video render of a RETAINED local upload after its run.
+    Drive sources are deleted after processing, so they render only when the
+    choice was made before Start."""
+    video.initialize()
+    render.check_modes(settings)
+    with video._lock:
+        state = video._read(job_id)
+        if state.get('kind') == 'drive_batch':
+            raise video.Busy('Drive videos are removed locally after processing. Choose "Render tagged video" before starting a Drive batch.')
+        if state['status'] != 'completed':
+            raise video.Busy('Only an experiment whose recognition has completed can be rendered later. Start it and wait for it to finish.')
+        if not state.get('scheduler_version') or not (video.directory(job_id) / 'enrollment.json').is_file():
+            raise video.Busy('This older run has no frozen enrollment snapshot. Upload the video as a new experiment to render it.')
+        if not video.video_path(state).is_file():
+            raise video.Busy('The uploaded video is no longer stored for this experiment.')
+        if (state.get('render') or {}).get('status') in render.ACTIVE or (job_id, 'local') in _workers:
+            raise video.Busy('A tagged video is already queued or being written for this experiment.')
+        if render.output_path(job_id, 'local').exists():
+            raise video.Busy('Delete the existing tagged video before rendering again.')
+        state['render_settings'] = dict(settings)
+        state['render'] = render.new_status(settings)
+        video._write(state)
+    launch()
+    _wake.set()
+    return state
+
+def cancel_render(job_id, source_key):
+    with video._lock:
+        state = video._read(job_id)
+        entry = (render_entry(state, source_key) or {}).get('render')
+        if not entry or entry['status'] not in render.ACTIVE:
+            return state
+        if (job_id, source_key) in _workers:
+            # The worker owns this record; it stops at the next frame and writes the outcome.
+            _render_tokens.setdefault((job_id, source_key), threading.Event()).set()
+        else:
+            entry.update(status='cancelled', finished_at=video.now(), error='Rendering was cancelled before it started.')
+            video._write(state)
+        _wake.set()
+        return state
+
+def delete_render(job_id, source_key):
+    with video._lock:
+        state = video._read(job_id)
+        source = render_entry(state, source_key)
+        entry = (source or {}).get('render')
+        if not entry:
+            raise video.NotFound('No tagged video for this source.')
+        if entry['status'] in render.ACTIVE or (job_id, source_key) in _workers:
+            raise video.Busy('Cancel and wait for rendering to stop before deleting its output.')
+        path = render.output_path(job_id, source_key)
+        path.unlink(missing_ok=True)
+        render.partial_path(path).unlink(missing_ok=True)
+        entry.update(status='deleted', output_bytes=None, deleted_at=video.now())
+        video._write(state)
         return state
 
 def launch():
@@ -322,6 +445,72 @@ def tick():
                 break
             if not admitted:
                 break
+        # Later renders of retained local uploads take any worker slot still free.
+        for _ in range(config()['max_workers'] - len(_workers)):
+            waiting = sorted((s for s in video.list_jobs() if s.get('scheduler_version') and s.get('kind') != 'drive_batch'
+                              and s['status'] == 'completed' and (s.get('render') or {}).get('status') == 'queued'
+                              and (s['id'], 'local') not in _workers), key=lambda s: (s['render'].get('requested_at') or '', s['id']))
+            if not waiting or psutil.virtual_memory().available < 1024**3:
+                break
+            key = (waiting[0]['id'], 'local')
+            worker = threading.Thread(target=run_render_only, args=(key,), name=f'render-{key[0][:6]}', daemon=True)
+            _workers[key] = worker
+            _stages[key] = 'rendering'
+            try: worker.start()
+            except Exception:
+                _workers.pop(key); _stages.pop(key, None)
+                raise
+
+def _render(job_id, source_key, source, parent, path, cancelled, report):
+    """Run one tagged-video render and return its final record. Inference goes
+    through the experiment's frozen device, identity snapshot and threshold."""
+    record = source['render']
+    # The record keeps what was ASKED for under *_mode; its 'decoder'/'encoder'
+    # keys are what a run actually used and must not be read back as a request.
+    settings = dict(detector=record.get('detector', 'plain'), keep_audio=record.get('keep_audio', True),
+                    decoder=record.get('decoder_mode', 'auto'), encoder=record.get('encoder_mode', 'auto'))
+    device = parent['actual_device']
+    index = _indices.get(job_id) or load_index(job_id)
+    devices.session(device)
+    if settings.get('detector') == 'tiled':
+        detect = lambda frame, timings: devices.detect_tiled(frame, device, timings, inference_priority.yield_to_interactive)
+    else:
+        detect = lambda frame, timings: devices.detect(frame, device, timings)
+    media = source.get('media') or {}
+    return render.render_source(
+        source_path=path, final_path=render.output_path(job_id, source_key), settings=settings, names=names_snapshot(job_id),
+        index=index, threshold=(parent.get('model') or {})['threshold'], detect=detect, nominal_fps=media.get('fps') or 0,
+        expected_frames=int(media.get('frame_count') or 0), duration_seconds=float(media.get('duration_seconds') or 0),
+        cancelled=cancelled, report=report, label=source.get('filename') or source_key)
+
+def run_render_only(key):
+    """A later render of a retained local upload. Touches only state['render']."""
+    job_id, source_key = key
+    token = _render_tokens.setdefault(key, threading.Event())
+    record = {}
+    def report(fields):
+        record.update(fields)
+        with video._lock:
+            state = video._read(job_id)
+            state.setdefault('render', {}).update(fields)
+            video._write(state)
+    try:
+        state = video.get(job_id)
+        record.update(state['render'])
+        final = _render(job_id, source_key, state, state, video.video_path(state), lambda: token.is_set() or _stop.is_set(), report)
+        if final.get('status') == 'cancelled' and _stop.is_set() and not token.is_set():
+            report(dict(status='interrupted', error='Backend stopped during rendering; the partial file was removed. Recognition results are unaffected.'))
+    except Exception as exc:
+        logger.exception('Tagged-video render could not start: %s', job_id)
+        try:
+            report(dict(status='failed', finished_at=video.now(),
+                        error=str(exc) if isinstance(exc, (video.MediaError, devices.DeviceError)) else 'Rendering could not start; see the backend log.'))
+        except Exception:
+            logger.exception('Could not record render failure')
+    finally:
+        with video._lock:
+            _workers.pop(key, None); _stages.pop(key, None); _render_tokens.pop(key, None)
+        _wake.set()
 
 def run_source(key, source, token):
     from app.services import drive_video_batch as batch, drive_video_source as drive
@@ -334,8 +523,11 @@ def run_source(key, source, token):
     source['stage_seconds'] = {}
     stages = source['stage_seconds']
     cancelled = lambda: token.is_set() or _stop.is_set()
+    # Set once recognition has finished: from then on this worker is only
+    # rendering, and recognition's own timings must stay exactly as they ended.
+    recognition = {}
     def publish():
-        source['processing_seconds'] = base_seconds + time.perf_counter() - clock
+        source['processing_seconds'] = recognition.get('seconds', base_seconds + time.perf_counter() - clock)
         with video._lock:
             state = video._read(job_id)
             if is_batch:
@@ -343,7 +535,8 @@ def run_source(key, source, token):
                 batch.refresh_totals(state)
                 state['stage_seconds'] = {name: sum(s.get('stage_seconds', {}).get(name, 0) for s in state['videos'])
                                          for name in {k for s in state['videos'] for k in s.get('stage_seconds', {})}}
-                state['processing_seconds'] = max(0, (video.datetime.now(video.timezone.utc) - video.datetime.fromisoformat(state['started_at'])).total_seconds())
+                if not recognition:
+                    state['processing_seconds'] = max(0, (video.datetime.now(video.timezone.utc) - video.datetime.fromisoformat(state['started_at'])).total_seconds())
                 state['temporary_downloads_cleaned'] = not any(batch.downloads_dir(job_id).rglob('source.*')) if batch.downloads_dir(job_id).exists() else True
                 finish_if_done(state)
             else:
@@ -413,10 +606,31 @@ def run_source(key, source, token):
         publish()
         video.process_video(source, path, index, settings, publish, representative,
             cancelled=cancelled, detector=lambda image: devices.detect(image, parent['actual_device'], stages))
+        if (source.get('render') or {}).get('status') == 'queued' and source['status'] == 'completed':
+            # Recognition is final here. The tagged video is an extra pass over
+            # the same file, made now because a Drive download is deleted as
+            # soon as this worker lets go of it.
+            recognition.update(seconds=base_seconds + time.perf_counter() - clock, finished_at=video.now())
+            source.update(finished_at=recognition['finished_at'], decode_phase='stopped')
+            with video._lock:
+                _stages[key] = 'rendering'
+            render_token = _render_tokens.setdefault(key, threading.Event())
+            def report(fields):
+                source['render'].update(fields)
+                publish()
+            publish()
+            final = _render(job_id, source_key, source, parent, path, lambda: cancelled() or render_token.is_set(), report)
+            if final.get('status') == 'cancelled' and _stop.is_set() and not token.is_set() and not render_token.is_set():
+                source['render'].update(status='interrupted', error='Backend stopped during rendering; the partial file was removed. Recognition results are unaffected.')
     except Exception as exc:
         logger.exception('Video source stopped: %s/%s', job_id, source_key)
-        source.update(status='cancelled' if token.is_set() else 'interrupted' if _stop.is_set() else 'failed',
-            error=str(exc) if isinstance(exc, (video.MediaError, drive.DriveVideoError, devices.DeviceError)) else 'Video worker failed. Partial results retained; inspect backend log. No automatic retry.')
+        if recognition:
+            # Recognition had already completed; only the tagged video failed.
+            source['render'].update(status='failed', finished_at=video.now(),
+                error=str(exc) if isinstance(exc, (video.MediaError, devices.DeviceError)) else 'Rendering failed; recognition results are unaffected. See the backend log.')
+        else:
+            source.update(status='cancelled' if token.is_set() else 'interrupted' if _stop.is_set() else 'failed',
+                error=str(exc) if isinstance(exc, (video.MediaError, drive.DriveVideoError, devices.DeviceError)) else 'Video worker failed. Partial results retained; inspect backend log. No automatic retry.')
     finally:
         try:
             if folder and folder.exists():
@@ -429,7 +643,8 @@ def run_source(key, source, token):
                         parent_folder.rmdir()
             if _stop.is_set() and not token.is_set() and source['status'] == 'cancelled':
                 source.update(status='interrupted', error='Backend stopped at a safe checkpoint; source is not replayed automatically.')
-            source.update(finished_at=video.now(), decode_phase='stopped')
+            source.update(finished_at=recognition.get('finished_at') or video.now(), decode_phase='stopped')
+            _settle_renders(source)
             publish()
         except Exception:
             logger.exception('Video cleanup/checkpoint failed')
@@ -451,7 +666,7 @@ def run_source(key, source, token):
                 video._write(state)
         finally:
             with video._lock:
-                _workers.pop(key, None); _stages.pop(key, None)
+                _workers.pop(key, None); _stages.pop(key, None); _render_tokens.pop(key, None)
                 if is_batch:
                     video.release_disk(claim_key(job_id, source))
                 state = video._read(job_id)

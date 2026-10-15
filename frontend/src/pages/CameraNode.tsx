@@ -9,6 +9,7 @@ import {
   type CameraDevice,
 } from "../api/cameras";
 import { Badge, Button, Card, Input, PageHeader } from "../components/ui";
+import { reportObservation, type AgentScan } from "../nodeObservation";
 
 /**
  * A camera station. Two genuinely different shapes live on this one page:
@@ -921,7 +922,7 @@ function MultiCameraStation({
     const blob: Blob | null = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
     if (!blob || !internal.active) return;
 
-    let data: { faces_total: number; matches: { participant_id: string; name: string; confidence: number }[] };
+    let data: AgentScan;
     try {
       const form = new FormData();
       form.append("photo", blob, "scan.jpg");
@@ -946,6 +947,10 @@ function MultiCameraStation({
     // recognized, and BEFORE the recognition/attendance step below so the
     // card's headline number never waits on Central.
     updateFaceCount(cameraId, internal, data.faces_total);
+    // Live presence (who is in front of THIS camera right now, unknown faces
+    // included). Not awaited and never retried: it cannot delay the scan
+    // loop, the preview or the attendance report below.
+    reportObservation(apiPostJson, internal.cameraId, data);
 
     const recognized = data.matches;
     // Task 1E — reuses THIS SAME recognition result for the Live Feed /

@@ -31,6 +31,7 @@ async function renderSelected(state){
   if(name==="../components/ScanSettingsFields")return {__esModule:true,default:"Fields"};
   if(name==="../components/DriveVideoBatchPanel")return {__esModule:true,default:"DriveVideoBatchPanel"};
   if(name==="../components/VideoBatchSources")return {__esModule:true,default:"VideoBatchSources"};
+  if(name==="../components/VideoRenderControls")return {RenderOptions:"RenderOptions",RenderStatus:"RenderStatus",RenderLater:"RenderLater",DEFAULT_RENDER_CHOICE:{enabled:false,keep_audio:true,detector:"plain"},renderBody:c=>c&&c.enabled?{render:{...c}}:{},renderIsActive:r=>!!r&&["queued","running"].includes(r.status)};
   if(name==="../api/scanSettings")return settings;
   if(name==="../api/client")return {apiGet:async path=>path.endsWith(state.id)?state:{experiments:[state]},ApiError:class extends Error{}};
   throw Error(name);

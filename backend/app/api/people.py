@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
-from app.auth.deps import get_current_user
+from app.auth.deps import get_current_user, require_admin
 from app.database.db import get_session
 from app.face_recognition.engine import detect_faces
 from app.face_recognition.enrollment import EnrollmentFaceError, select_primary_enrollment_face
@@ -15,6 +16,7 @@ from app.services.index_sync import apply_index_change
 from app.services.import_service import bump_high_water_if_greater, next_auto_id_start
 from app.models.models import Attendance, ConsentRecord, FaceDetection, Person, User
 from app.services import storage_service
+from app.services.person_address import CallAsError, normalize_call_as
 
 router = APIRouter(prefix="/api/people", tags=["people"])
 
@@ -36,6 +38,7 @@ def _person_out(session: Session, p: Person, summary: tuple[int, datetime | None
         "original_image_url": p.original_image_url,
         "det_score": p.det_score,
         "is_demo": p.is_demo,
+        "call_as": p.call_as,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
         "detection_count": detection_count,
@@ -218,6 +221,30 @@ def update_person(
     session.commit()
     session.refresh(p)
     apply_index_change(session, lambda: recognition_index.upsert(p), what="update participant")
+    return _person_out(session, p)
+
+
+class CallAsBody(BaseModel):
+    call_as: str | None = None
+
+
+@router.put("/{person_id}/call-as")
+def set_call_as(person_id: str, body: CallAsBody, session: Session = Depends(get_session),
+                user: User = Depends(require_admin)):
+    """How a voice client should address this person (e.g. "พี่บอส"). Its own
+    endpoint so the full-form PUT above - which resets omitted fields - can
+    never wipe it. Empty or null clears it (the name is used instead)."""
+    p = session.get(Person, person_id)
+    if not p:
+        raise HTTPException(404, "Person not found")
+    try:
+        p.call_as = normalize_call_as(body.call_as)
+    except CallAsError as e:
+        raise HTTPException(422, str(e)) from e
+    p.updated_at = datetime.now()
+    session.add(p)
+    session.commit()
+    session.refresh(p)
     return _person_out(session, p)
 
 

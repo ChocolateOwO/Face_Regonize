@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials
+from sqlmodel import Session
 
+from app.auth.deps import bearer_scheme, get_station_user, is_machine
+from app.auth.security import FILE_COOKIE, FILE_SCOPE, decode_access_token
 from app.config import STORAGE_PATH
+from app.database.db import get_session
+from app.models.models import User
 from app.services.photo_thumbnail_service import ensure_thumbnail, is_thumbnail_path
 
 router = APIRouter(prefix="/api/files", tags=["files"])
@@ -30,8 +36,30 @@ def _cache_control(path: str) -> str:
     return _IMMUTABLE if is_thumbnail_path(path) else _REVALIDATE
 
 
+def file_reader(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    session: Session = Depends(get_session),
+) -> User:
+    """Stored participant/event images are personal data: a signed-in human
+    is required. Browsers authenticate <img>/<a> requests with the file-read
+    cookie set at login; API clients may send their normal Bearer token.
+    Machine accounts are refused either way."""
+    if credentials is not None:
+        return get_station_user(credentials, session)
+    payload = decode_access_token(request.cookies.get(FILE_COOKIE, ""))
+    if payload is None or payload.get("scope") != FILE_SCOPE:
+        raise HTTPException(401, "Sign in to view stored files.")
+    user = session.get(User, payload.get("sub"))
+    if user is None:
+        raise HTTPException(401, "Sign in to view stored files.")
+    if is_machine(user):
+        raise HTTPException(403, "Machine accounts cannot read stored files.")
+    return user
+
+
 @router.get("/{path:path}")
-def get_file(path: str):
+def get_file(path: str, user: User = Depends(file_reader)):
     resolved = (STORAGE_PATH / path).resolve()
     if not str(resolved).startswith(str(STORAGE_PATH.resolve())):
         raise HTTPException(400, "Invalid path")

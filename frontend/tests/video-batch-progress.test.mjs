@@ -84,6 +84,7 @@ async function mount(shared = sharedApi(), query = "") {
       if (name.endsWith("/VideoMatchPreview")) return { __esModule: true, default: "Preview" };
       if (name.endsWith("/DriveVideoBatchPanel")) return load("components/DriveVideoBatchPanel.tsx");
       if (name.endsWith("/VideoBatchSources")) return load("components/VideoBatchSources.tsx");
+      if (name.endsWith("/VideoRenderControls")) return load("components/VideoRenderControls.tsx");
       throw Error(name);
     }, result);
     return result;
@@ -118,7 +119,7 @@ async function mount(shared = sharedApi(), query = "") {
   async function click(label) { const button = find(label); assert.ok(button, label); assert.ok(!button.props.disabled, label + " disabled"); await button.props.onClick(); await flush(); }
   async function input(label, value) { const node = nodes(tree).find(n => n.props["aria-label"] === label); assert.ok(node, label); node.props.onChange({ target: { value } }); await flush(); }
   async function start() { await click("Google Drive batch"); await input("Google Drive folder link", "folder_12345"); await click("List videos");
-    assert.equal(nodes(tree).filter(n => n.props.type === "checkbox").length, 7);
+    assert.equal(nodes(tree).filter(n => n.props.type === "checkbox" && String(n.props["aria-label"]).startsWith("Select ")).length, 7);
     await click("Select all supported"); await input("Video batch name", "Seven synthetic cameras"); await click("Start selected videos"); }
   return { shared, start, click, input, dispose, flush, query: () => params.toString(),
     text: () => text(tree).replace(/\s+/g, " "), nodes: () => nodes(tree),

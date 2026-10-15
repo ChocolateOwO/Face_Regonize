@@ -38,18 +38,18 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from app.api.recognition import _checked_in_today, _resolve_activity, run_recognition
-from app.auth.deps import get_current_user
-from app.auth.security import decode_access_token
+from app.auth.deps import get_api_client, get_current_user, get_station_user, is_machine, token_user
 from app.config import NODE_RECORDINGS_DIR, STORAGE_PATH
-from app.database.db import get_session
+from app.database.db import engine as db_engine, get_session
 from app.face_recognition.index import recognition_index
 from app.models.models import (
     Activity,
@@ -61,7 +61,8 @@ from app.models.models import (
     Upload,
     User,
 )
-from app.services import events_feed, node_registry, storage_service
+from app.services import events_feed, node_registry, presence_service, storage_service
+from app.services.person_address import call_as_for
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/node", tags=["nodes"])
@@ -89,7 +90,7 @@ class NodeRegisterBody(BaseModel):
 
 @router.post("/register")
 def register_node(body: NodeRegisterBody, session: Session = Depends(get_session),
-                  user: User = Depends(get_current_user)):
+                  user: User = Depends(get_station_user)):
     """Create or update this node's durable identity. Safe to call again on
     every page load — that is how identity survives a refresh (§18)."""
     node_id = body.node_id.strip()
@@ -145,7 +146,7 @@ class HeartbeatBody(BaseModel):
 
 
 @router.post("/heartbeat")
-def heartbeat(body: HeartbeatBody, user: User = Depends(get_current_user)):
+def heartbeat(body: HeartbeatBody, user: User = Depends(get_station_user)):
     """Cheap, frequent, and deliberately writes NOTHING to the database (§20)
     — see node_registry.py for why presence lives in memory only."""
     node = node_registry.touch(
@@ -160,7 +161,7 @@ def heartbeat(body: HeartbeatBody, user: User = Depends(get_current_user)):
 
 
 @router.get("/status")
-def node_status(session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+def node_status(session: Session = Depends(get_session), user: User = Depends(get_api_client)):
     """Every node this backend has heard from, online or not (§20). Merges
     live presence (memory) with durable config (database) for display."""
     configs = {c.node_id: c for c in session.exec(select(CameraNode)).all()}
@@ -224,7 +225,7 @@ def node_event(
     body: str = Form(...),          # JSON-encoded NodeEventBody — multipart needs this alongside the file
     image: UploadFile | None = File(None),
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_station_user),
 ):
     """A Windows Local Agent reports a recognition RESULT it already computed
     locally. Central's job here is exactly §34: validate the participant,
@@ -262,6 +263,7 @@ def node_event(
         filename=f"{source_label} event", image_path=image_path,
         processing_status="completed", faces_total=max(len(payload.matches), len(matched_people)),
         faces_matched=len(matched_people), faces_unknown=0,
+        source_kind="node_event", source_node_id=payload.node_id,
     )
     session.add(upload)
     session.commit()
@@ -290,6 +292,7 @@ def node_event(
             "person_id": person.id, "participant_id": person.participant_id,
             "name": f"{person.first_name} {person.last_name}".strip() or person.first_name,
             "confidence": m.confidence, "checkin": "already" if already else "new",
+            "call_as": person.call_as,
         })
 
     node_registry.touch(payload.node_id, faces_seen=len(payload.matches))
@@ -297,10 +300,119 @@ def node_event(
         events_feed.publish({
             "node_id": payload.node_id, "participant_id": s["participant_id"],
             "name": s["name"], "activity_id": activity_id, "checkin": s["checkin"],
-            "at": datetime.now().isoformat(),
+            "at": datetime.now().isoformat(), "call_as": s["call_as"],
         })
 
     return {"results": seen, "activity_id": activity_id}
+
+
+# ---------------------------------------------------------------------------
+# Live presence: who is in front of one camera right now (memory only)
+# ---------------------------------------------------------------------------
+
+class ObservedFace(BaseModel):
+    bbox: list[float] = Field(min_length=4, max_length=4)  # [x1, y1, x2, y2] in pixels of the scanned frame
+    participant_id: str | None = Field(None, max_length=64)  # None = a face nobody was matched to
+    confidence: float | None = None
+
+
+class NodeObservationBody(BaseModel):
+    node_id: str = Field(min_length=1, max_length=128)
+    image_w: int = Field(gt=0, le=16384)
+    image_h: int = Field(gt=0, le=16384)
+    faces: list[ObservedFace] = Field(default_factory=list, max_length=presence_service.MAX_FACES)
+    # A random id the station page keeps for its browser tab. Part of what
+    # binds a node to one reporter (presence_service.claim).
+    reporter_id: str | None = Field(None, max_length=64)
+
+
+def _registered_mode(session: Session, node_id: str) -> str | None:
+    """The inference mode a node registered with ("local" | "central"), or
+    None when no such node has registered."""
+    return session.exec(select(CameraNode.inference_mode).where(CameraNode.node_id == node_id)).first()
+
+
+def _report_presence(node_id: str, image_w: int, image_h: int, faces: list[dict]) -> dict:
+    """Store one observation in memory and tell opted-in feed subscribers
+    when the unknown-face situation at this node changed."""
+    event = presence_service.record(node_id, image_w, image_h, faces)
+    if event:
+        events_feed.publish_presence(event)
+    return event
+
+
+@router.post("/observation")
+def node_observation(body: NodeObservationBody, request: Request, session: Session = Depends(get_session),
+                     user: User = Depends(get_station_user)):
+    """A station reports what its Local Agent saw in ONE scan: every face,
+    matched or not, with its box. This is what lets Central answer "who is at
+    this camera right now" for a node whose inference runs on the station.
+
+    Nothing is saved: no Upload, FaceDetection, Attendance, history row or
+    image, and no matched event on the feed - attendance still travels by
+    /event exactly as before. The observation is held in memory for at most
+    presence_service.MAX_WINDOW_SECONDS and is gone after a restart.
+
+    Which node the faces are attributed to is checked as far as this system
+    can: the node must have registered as a Local-Agent node, its station
+    page must be online (heartbeat), and while one reporter is reporting for
+    it nobody else can (presence_service.claim) - so two stations given the
+    same node name cannot mix their faces, and a live camera cannot be
+    written to by another client. There are no per-node credentials: a
+    signed-in account can still report for a node nobody is reporting for.
+
+    A participant id Central does not know (the agent's cached index is
+    stale) is counted as an unknown face rather than trusted.
+    """
+    node_id = body.node_id.strip()
+    mode = _registered_mode(session, node_id) if node_id else None
+    if mode is None:
+        raise HTTPException(404, "This node has not registered yet.")
+    if mode != "local":
+        raise HTTPException(409, "This node sends its frames to Central, so its presence comes from those scans, not from a station report.")
+    live = node_registry.status_one(node_id)
+    if not live or not live["online"]:
+        raise HTTPException(409, "This node is not online. Its station page must be open and connected before it can report.")
+    reporter = "|".join((user.id, request.client.host if request.client else "", body.reporter_id or ""))
+    try:
+        presence_service.claim(node_id, reporter)
+    except presence_service.ReporterConflict:
+        raise HTTPException(409, "Another station is already reporting for this node. Two stations must not use the same node name.")
+    wanted = sorted({f.participant_id for f in body.faces if f.participant_id})
+    people = {p.participant_id: p for p in session.exec(select(Person).where(Person.participant_id.in_(wanted))).all()} if wanted else {}
+    faces = []
+    for face in body.faces:
+        person = people.get(face.participant_id) if face.participant_id else None
+        entry: dict = {"box": presence_service.normalized_box(face.bbox, body.image_w, body.image_h)}
+        if person:
+            entry.update(participant_id=person.participant_id, person_id=person.id,
+                         name=f"{person.first_name} {person.last_name}".strip() or person.first_name,
+                         confidence=face.confidence)
+        faces.append(entry)
+    _report_presence(node_id, body.image_w, body.image_h, faces)
+    unknown = sum(1 for f in faces if not f.get("participant_id"))
+    return {"accepted": True, "node_id": node_id, "faces": len(faces), "unknown": unknown}
+
+
+@router.get("/{node_id}/present")
+def node_present(node_id: str, seconds: int = presence_service.DEFAULT_WINDOW_SECONDS,
+                 session: Session = Depends(get_session), user: User = Depends(get_api_client)):
+    """Who is in front of this node's camera right now - for a greeting.
+
+    Built only from live observations of the last `seconds` (1-30, clamped;
+    default 10). A node that has not reported inside the window - or any
+    node after a backend restart - answers with empty lists; presence is
+    never reconstructed from recognition history.
+
+    faces_now / unknown_now describe the newest observation. people lists
+    everyone matched inside the window, largest face first, each with the
+    box and confidence of their most recent sighting.
+    """
+    result = presence_service.present(node_id, seconds)
+    addresses = call_as_for(session, (p["person_id"] for p in result["people"]))
+    for person in result["people"]:
+        person["call_as"] = addresses.get(person.pop("person_id"))
+    return result
 
 
 @router.post("/recognize-central")
@@ -309,32 +421,48 @@ def recognize_central(
     node_id: str = Form(...),
     photo: UploadFile = File(...),
     activity_id: str | None = Form(None),
+    persist: bool = True,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_station_user),
 ):
     """Mobile/iPad recognition (§25-29): the SAME recognition-and-checkin
     core the kiosk uses (run_recognition), reused rather than reimplemented —
-    the only difference is the filename tag, which is how the existing
-    Upload history already distinguishes a source (camera_recognition.py
-    does the same thing with f"{camera_name} live" for the ffmpeg cameras).
+    the only difference is the filename tag ("{node_id}_scan.jpg"), which is
+    how the existing Upload history distinguishes this source.
     Central performs the inference; the phone never runs InsightFace itself.
+
+    The live-feed event is published once, by run_recognition's background
+    save, tagged with this node_id. (This handler used to publish its own
+    copy as well, so every match reached the feed twice: once as this node
+    and once as "kiosk".)
+
+    ?persist=false (query) only recognizes: nothing is saved, nobody is
+    checked in, nothing is published and the node's presence is not touched.
+
+    A recorded scan from a registered node also updates that node's live
+    presence (memory only - see node_present).
     """
     file_bytes = photo.file.read()
+    observed: dict = {}
     result = run_recognition(
         file_bytes, f"{node_id}_scan.jpg",
         background_tasks=background_tasks, session=session,
         user_id=user.id, activity_id=activity_id, debug=False,
+        persist=persist, feed_node_id=node_id, source_kind="node_central",
+        observed=observed,
     )
-    node_registry.touch(node_id, faces_seen=result.get("faces_total", 0), inference_mode="central")
-    resolved_activity = _resolve_activity(session, activity_id)
-    for r in result.get("results", []):
-        if r.get("status") == "matched":
-            events_feed.publish({
-                "node_id": node_id, "participant_id": r.get("participant_id"),
-                "name": r.get("name") or r.get("first_name"), "activity_id": resolved_activity,
-                "checkin": "new" if r.get("checkin_status") == "new" else "already",
-                "at": datetime.now().isoformat(),
-            })
+    if persist:
+        node_registry.touch(node_id, faces_seen=result.get("faces_total", 0), inference_mode="central")
+        # Only for a node that registered as a Central-inference node: a scan
+        # posted under a Local-Agent camera's name cannot overwrite what that
+        # camera's own station reports.
+        if observed and _registered_mode(session, node_id) == "central":
+            _report_presence(node_id, observed["w"], observed["h"], [
+                {"box": presence_service.normalized_box(r["bbox"], observed["w"], observed["h"]),
+                 **({"participant_id": r["participant_id"], "person_id": r["person_id"], "name": r["name"],
+                     "confidence": r["confidence"]} if r["status"] == "matched" else {})}
+                for r in result.get("results", [])
+            ])
     return result
 
 
@@ -357,7 +485,7 @@ class RecordingStartBody(BaseModel):
 
 @router.post("/recording/start")
 def start_node_recording(body: RecordingStartBody, session: Session = Depends(get_session),
-                         user: User = Depends(get_current_user)):
+                         user: User = Depends(get_station_user)):
     row = NodeRecording(
         node_id=body.node_id, node_name=body.node_name or body.node_id,
         activity_id=body.activity_id, activity_name=_activity_name(session, body.activity_id),
@@ -374,7 +502,7 @@ def stop_node_recording(
     recording_id: str = Form(...),
     clip: UploadFile = File(...),
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_station_user),
 ):
     row = session.get(NodeRecording, recording_id)
     if not row:
@@ -452,10 +580,12 @@ class _SignalHub:
 _signal_hub = _SignalHub()
 
 
-def _ws_user(token: str | None) -> bool:
-    if not token:
-        return False
-    return decode_access_token(token) is not None
+def _ws_user(token: str | None, *, allow_machine: bool = False) -> bool:
+    """A valid token for a user that still exists. Machine accounts are only
+    let in where allow_machine is set (the events feed), never signaling."""
+    with Session(db_engine) as session:
+        user = token_user(token, session)
+    return user is not None and (allow_machine or not is_machine(user))
 
 
 @router.websocket("/signal")
@@ -480,15 +610,20 @@ async def signal(websocket: WebSocket, room: str, token: str | None = None):
 
 
 @router.websocket("/events-feed")
-async def events_feed_ws(websocket: WebSocket, token: str | None = None):
+async def events_feed_ws(websocket: WebSocket, token: str | None = None, include: str | None = None):
     """Push channel for the CCTV page's global Recent Detections (§44) — a
-    subscriber gets a JSON line every time /event or /recognize-central
-    records a match, instead of the page polling recognition history."""
-    if not _ws_user(token):
+    subscriber gets a JSON line every time the kiosk, /event or
+    /recognize-central records a match, instead of the page polling
+    recognition history.
+
+    ?include=presence additionally delivers live-presence messages
+    ({"type": "presence", ...}: unknown faces appeared at / left a node).
+    Without it a subscriber only ever receives matched events, as before."""
+    if not _ws_user(token, allow_machine=True):
         await websocket.close(code=4401)
         return
     await websocket.accept()
-    queue = events_feed.subscribe()
+    queue = events_feed.subscribe(presence="presence" in (include or "").split(","))
     try:
         while True:
             item = await queue.get()

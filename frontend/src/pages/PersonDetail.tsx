@@ -12,6 +12,7 @@ import {
   Spinner,
 } from "../components/ui";
 import { useLiveEvents } from "../hooks/useLiveEvents";
+import CallAsEditor from "../components/CallAsEditor";
 
 interface ConsentHistoryItem {
   choice: "consented" | "declined";
@@ -38,6 +39,7 @@ interface PersonDetailData {
   original_image_url: string | null;
   det_score: number;
   is_demo: boolean;
+  call_as: string | null;
   created_at: string;
   updated_at: string;
   detection_count: number;
@@ -139,6 +141,7 @@ export default function PersonDetail() {
             <div>
               <strong>Detection confidence at enrollment:</strong> {(data.det_score * 100).toFixed(0)}%
             </div>
+            <CallAsEditor personId={data.id} value={data.call_as} onSaved={(callAs) => setData({ ...data, call_as: callAs })} />
             <div className="pt-2 border-t border-gray-100 mt-2">
               <strong>Image Source:</strong> {data.image_source === "manual" ? "Manual Upload" : data.image_source === "google_drive" ? "Google Drive" : "URL"}
               {data.original_image_url && (

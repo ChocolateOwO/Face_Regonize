@@ -274,7 +274,7 @@ def build_app(agent: Agent) -> FastAPI:
             # accept/route requests is what actually gives every camera a
             # fair, independent turn rather than queuing behind whichever
             # camera's JPEG happened to arrive (and decode) first.
-            faces, matches = await asyncio.to_thread(_decode_and_infer, file_bytes)
+            faces, matches, size = await asyncio.to_thread(_decode_and_infer, file_bytes)
             elapsed_ms = (time.perf_counter() - t0) * 1000
         finally:
             with _waiting_lock:
@@ -293,6 +293,19 @@ def build_app(agent: Agent) -> FastAPI:
             "faces_total": len(faces), "matches": results,
             "recognition_ms": round(elapsed_ms, 1), "node_id": agent.node_id,
             "camera_id": camera_id,  # echoed back only — this agent does not use it for matching
+            # Additive, for Central's live presence (POST /api/node/observation):
+            # EVERY detected face with its pixel box in the scanned frame;
+            # participant_id is null for a face nobody was matched to.
+            # "matches" above is unchanged and still what attendance uses.
+            "image": {"w": size[0], "h": size[1]},
+            "faces": [
+                {
+                    "bbox": [round(float(v), 1) for v in face.bbox],
+                    "participant_id": m.participant_id if m.person_id else None,
+                    "confidence": round(m.score, 4) if m.person_id else None,
+                }
+                for face, m in zip(faces, matches)
+            ],
         }
 
     def _decode_and_infer(file_bytes: bytes):
@@ -305,14 +318,15 @@ def build_app(agent: Agent) -> FastAPI:
         the thread boundary cleanly, so the route function checks for None."""
         img = storage_service.decode_image(file_bytes)
         if img is None:
-            return None, []
+            return None, [], (0, 0)
+        size = (int(img.shape[1]), int(img.shape[0]))
         with _inference_semaphore:
             faces = detect_faces(img)
             matches = []
             if faces:
                 embeddings = np.stack([f.embedding for f in faces])
                 matches = agent.index.match_batch(embeddings, agent.threshold)
-            return faces, matches
+            return faces, matches, size
 
     return app
 
@@ -324,6 +338,9 @@ def main() -> None:
     parser.add_argument("--central", required=True, help="Central Reconize base URL, e.g. http://127.0.0.1:8001")
     parser.add_argument("--username", default="admin")
     parser.add_argument("--password", default="admin123")
+    parser.add_argument("--ask-credentials", action="store_true",
+                        help="ask for the Central user name and password when the agent starts "
+                             "(nothing is echoed or stored) instead of taking them from the command line")
     parser.add_argument("--insecure", action="store_true",
                         help="accept Central's self-signed https certificate without verifying it "
                              "(needed for Reconize's own run_server.py — see the Agent class docstring)")
@@ -345,6 +362,12 @@ def main() -> None:
     get_face_app()
     logger.info("Recognition model loaded (%.0fms) - safe for concurrent cameras from the first request.",
                (time.perf_counter() - t0) * 1000)
+
+    if args.ask_credentials:
+        import getpass
+
+        args.username = input(f"Central user name for {args.central}: ").strip()
+        args.password = getpass.getpass("Password (not shown): ")
 
     agent = Agent(args.node_id, args.central, verify_tls=not args.insecure)
     agent.login(args.username, args.password)

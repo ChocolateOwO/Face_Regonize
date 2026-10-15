@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
-from app.auth.deps import get_current_user
+from app.auth.deps import get_api_client, get_current_user, is_machine
 from app.config import (
     DEFAULT_FACE_DETECTION_CONFIDENCE,
     DEFAULT_FACE_MATCH_THRESHOLD,
@@ -42,10 +42,20 @@ class SettingsUpdate(BaseModel):
     values: dict[str, str]
 
 
+# The only settings a machine account (robot voice service) is shown.
+MACHINE_VISIBLE_SETTINGS = ("camera_label", "app_name", "event_name")
+
+
 @router.get("")
-def get_settings(session: Session = Depends(get_session), user: User = Depends(get_current_user)):
-    stored = {s.key: s.value for s in session.exec(select(Setting)).all()}
+def get_settings(session: Session = Depends(get_session), user: User = Depends(get_api_client)):
+    """The user-editable settings (DEFAULTS' keys) only. The Setting table
+    also stores internal state and integration secrets (e.g. the Google
+    Drive OAuth refresh token); those are never returned here - their own
+    features read them server-side. PUT already accepts only these keys."""
+    stored = {s.key: s.value for s in session.exec(select(Setting).where(Setting.key.in_(list(DEFAULTS)))).all()}
     merged = {**DEFAULTS, **stored}
+    if is_machine(user):
+        return {key: merged[key] for key in MACHINE_VISIBLE_SETTINGS}
     merged["storage_path"] = str(STORAGE_PATH)
     return merged
 

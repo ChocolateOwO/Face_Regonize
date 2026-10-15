@@ -7,6 +7,8 @@ import VideoMatchPreview, { type MatchedPerson } from "../components/VideoMatchP
 import ScanSettingsFields from "../components/ScanSettingsFields";
 import DriveVideoBatchPanel from "../components/DriveVideoBatchPanel";
 import VideoBatchSources, { type VideoSourceResult } from "../components/VideoBatchSources";
+import { DEFAULT_RENDER_CHOICE, RenderLater, RenderOptions, RenderStatus, renderBody, renderIsActive,
+  type RenderChoice, type RenderRecord } from "../components/VideoRenderControls";
 import { DEFAULT_SCAN_SETTINGS, scanSettingsError, type ScanSettings } from "../api/scanSettings";
 
 const API = "/api/local-video-experiment";
@@ -50,7 +52,11 @@ interface Experiment {
   scan_settings?: ScanSettings | null;
   partial: boolean; can_start: boolean; can_cancel: boolean; can_delete: boolean;
   people?: Person[]; samples?: Sample[];
+  render?: RenderRecord | null;
 }
+// A tagged video can still be queued/written after recognition has finished.
+const rendering = (exp: Experiment | null) => !!exp && (renderIsActive(exp.render) || !!exp.videos?.some(v => renderIsActive(v.render)));
+const RENDER_AGAIN = ["deleted", "cancelled", "failed", "interrupted", "not_rendered"];
 
 function experimentResponse(value: unknown): Experiment {
   const state = value as Experiment | null;
@@ -92,6 +98,7 @@ export default function LocalVideoExperiment() {
   const requestedId = searchParams.get("experiment");
   const [sourceMode, setSourceMode] = useState<"local" | "drive">("local");
   const [scanSettings, setScanSettings] = useState<ScanSettings>({ ...DEFAULT_SCAN_SETTINGS });
+  const [renderChoice, setRenderChoice] = useState<RenderChoice>({ ...DEFAULT_RENDER_CHOICE });
   const [isAdmin, setIsAdmin] = useState(false);
   const [device, setDevice] = useState("auto");
   const [workerLimit, setWorkerLimit] = useState(2);
@@ -127,7 +134,7 @@ export default function LocalVideoExperiment() {
     void apiGet(API + "/execution").then(value => { setExecution(value); setWorkerLimit(value.max_workers); })
       .catch(err => setError(message(err)));
   }, [isAdmin]);
-  const anyActive = list.some(exp => ACTIVE.includes(exp.status));
+  const anyActive = list.some(exp => ACTIVE.includes(exp.status) || rendering(exp));
   useEffect(() => {
     if (!anyActive) return;
     let disposed = false;
@@ -160,8 +167,9 @@ export default function LocalVideoExperiment() {
   }, [list, requestedId, setSearchParams]);
   useEffect(() => { resultTitle.current?.scrollIntoView({ block: "start" }); }, [selected?.id]);
   const active = selected != null && ACTIVE.includes(selected.status);
+  const working = active || rendering(selected);
   useEffect(() => {
-    if (!active || !selected) return;
+    if (!working || !selected) return;
     const id = selected.id;
     let disposed = false;
     let timer: number;
@@ -170,13 +178,13 @@ export default function LocalVideoExperiment() {
         const fresh = experimentResponse(await apiGet(API + "/" + id));
         if (disposed || selectedId.current !== id) return;
         setSelected(fresh); setClock(Date.now()); setError("");
-        if (!ACTIVE.includes(fresh.status)) { await loadList(); return; }
+        if (!ACTIVE.includes(fresh.status) && !rendering(fresh)) { await loadList(); return; }
       } catch (err) { if (!disposed) setError(message(err)); }
       if (!disposed) timer = window.setTimeout(poll, 1000);
     }
     timer = window.setTimeout(poll, 500);
     return () => { disposed = true; window.clearTimeout(timer); };
-  }, [active, selected?.id, loadList]);
+  }, [working, selected?.id, loadList]);
 
   async function upload() {
     if (!file || busy) return;
@@ -209,7 +217,7 @@ export default function LocalVideoExperiment() {
     }
     setBusy(true); setError("");
     try {
-      setSelected(experimentResponse(await apiPostJson(API + "/" + selected.id + "/" + kind, kind === "start" ? { ...scanSettings, device } : {})));
+      setSelected(experimentResponse(await apiPostJson(API + "/" + selected.id + "/" + kind, kind === "start" ? { ...scanSettings, device, ...renderBody(renderChoice) } : {})));
       setClock(Date.now()); await loadList();
     } catch (err) { setError(message(err)); }
     finally { setBusy(false); }
@@ -277,6 +285,7 @@ export default function LocalVideoExperiment() {
           <Button aria-pressed={sourceMode === "drive"} disabled={busy} onClick={() => setSourceMode("drive")}>Google Drive batch</Button>
         </div>
         {sourceMode === "drive" && isAdmin ? <DriveVideoBatchPanel settings={scanSettings} onSettings={setScanSettings} device={device}
+          render={renderChoice} onRender={setRenderChoice}
           disabled={busy} onStarted={state => {
             const fresh = experimentResponse(state);
             selectionRequest.current++; recovered.current = true; setSelected(fresh); setClock(Date.now()); setError("");
@@ -323,6 +332,7 @@ export default function LocalVideoExperiment() {
           {selected.error && <p role="alert" className="mb-3 text-sm text-red-600">{selected.error}</p>}
           {selected.can_start && <ScanSettingsFields value={scanSettings} onChange={setScanSettings}
             disabled={busy || !isAdmin} video />}
+          {selected.can_start && !batch && <RenderOptions value={renderChoice} onChange={setRenderChoice} disabled={busy || !isAdmin} />}
           <div className="mb-4 flex flex-wrap gap-2">
             <Button disabled={busy || !isAdmin || !selected.can_start || !!scanSettingsError(scanSettings)} onClick={() => void action("start")}>Start experiment</Button>
             <Button disabled={busy || !selected.can_cancel || selected.status === "cancelling"} onClick={() => void action("cancel")}>
@@ -331,6 +341,12 @@ export default function LocalVideoExperiment() {
             <Button disabled={busy || !selected.can_delete} onClick={() => void remove()}>Delete</Button>
             <Button onClick={() => void download()}>Download CSV</Button>
           </div>
+          {!batch && selected.render && <div className="mb-3 rounded border p-2">
+            <RenderStatus jobId={selected.id} sourceKey="local" filename={selected.filename} record={selected.render}
+              onChanged={state => { setSelected(experimentResponse(state)); setClock(Date.now()); }} /></div>}
+          {!batch && isAdmin && selected.status === "completed" && selected.requested_provider && !renderIsActive(selected.render) &&
+            (!selected.render || RENDER_AGAIN.includes(selected.render.status)) &&
+            <RenderLater jobId={selected.id} disabled={busy} onChanged={state => { setSelected(experimentResponse(state)); setClock(Date.now()); }} />}
           {batch && <p className="mb-2 text-sm">Batch: {selected.finished_videos} / {selected.total_videos} videos stopped; {selected.completed_videos} completed, {selected.failed_videos} failed.
             {" "}{selected.temporary_downloads_cleaned ? "Temporary downloads removed." : "Bounded temporary sources may be in use; each removed when it stops."} Original Drive files unchanged.</p>}
           {selected.waiting_reason && <p role="status">{selected.waiting_reason}</p>}
@@ -393,7 +409,8 @@ export default function LocalVideoExperiment() {
           {selected.model?.enrolled_identities === 0 && <p className="my-2 text-sm text-amber-800">No enrolled identities in snapshot. Detected faces are unmatched.</p>}
           {batch && <>
             <p className="my-3 text-sm">Combined counts sum source results once. They do not deduplicate the same person across cameras or measure passages. First/last timestamps below are minimum/maximum clip-relative timestamps; see each source for its exact range. Equal-score examples keep the earliest source (filename order), then earliest frame.</p>
-            <VideoBatchSources sources={selected.videos ?? []} />
+            <VideoBatchSources sources={selected.videos ?? []} jobId={selected.id}
+              onChanged={state => { setSelected(experimentResponse(state)); setClock(Date.now()); }} />
           </>}
           <h3 className="mb-2 font-semibold">{batch ? "Combined matched people" : "Matched people"}</h3>
           {!(selected.people?.length) && <p className="mb-3 text-sm text-gray-500">

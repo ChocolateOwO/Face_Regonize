@@ -1,4 +1,5 @@
 import { type MatchedPerson } from "./VideoMatchPreview";
+import { RenderStatus, type RenderRecord } from "./VideoRenderControls";
 export interface VideoSourceResult {
   source_video_key: string; filename: string; status: string; error: string | null;
   media: { fps: number; frame_count: number; duration_seconds: number; bytes?: number } | null;
@@ -12,6 +13,8 @@ export interface VideoSourceResult {
   processing_seconds: number; recognition_processing_seconds?: number; actual_video_detection_hz: number | null;
   people?: MatchedPerson[];
   samples?: { frame_index: number; timestamp_seconds: number; faces: number; matched_people: number; unknown_detections: number }[];
+  // Optional tagged video of this source (one file per source, never shared).
+  render?: RenderRecord | null;
 }
 function downloadProgress(source: VideoSourceResult): string {
   const amount = (source.downloaded_bytes / 1024 ** 2).toFixed(1) + " MiB downloaded";
@@ -20,7 +23,9 @@ function downloadProgress(source: VideoSourceResult): string {
     ? amount + " (" + Math.min(100, source.downloaded_bytes / total * 100).toFixed(1) + "%)"
     : amount + " (total unavailable until validation)";
 }
-export default function VideoBatchSources({ sources }: { sources: VideoSourceResult[] }) {
+export default function VideoBatchSources({ sources, jobId, onChanged }: {
+  sources: VideoSourceResult[]; jobId?: string; onChanged?: (state: unknown) => void;
+}) {
   return <section className="my-4">
     <h3 className="mb-2 font-semibold">Results by source video / camera</h3>
     <p className="mb-2 text-xs text-gray-600">Filename identifies the source; no camera identity or shared recording clock is inferred. A failed source retains completed sampled frames. Processing time below includes its download, validation and EOF check.</p>
@@ -31,7 +36,9 @@ export default function VideoBatchSources({ sources }: { sources: VideoSourceRes
         <td className="p-2">{source.status === "running" ? "processing" : source.status}
           {source.status === "downloading" && <span className="block text-xs">{downloadProgress(source)}</span>}
           {source.status === "running" && <span className="block text-xs">{source.progress_percent.toFixed(1)}% estimated decode progress</span>}
-          {source.error && <p role="alert" className="text-xs text-red-700">{source.error}</p>}</td>
+          {source.error && <p role="alert" className="text-xs text-red-700">{source.error}</p>}
+          {source.render && jobId && onChanged && <div className="mt-1 border-t pt-1">
+            <RenderStatus jobId={jobId} sourceKey={source.source_video_key} filename={source.filename} record={source.render} onChanged={onChanged} /></div>}</td>
         <td className="p-2">{source.media ? source.media.fps.toFixed(3) + " FPS / " + source.media.duration_seconds.toFixed(3) + " s (nominal)" : "Available after validation"}</td>
         <td className="p-2">{source.decoded_frames} / {source.sampled_frames}
           <span className="block text-xs">{source.verified_total_frames == null ? "Readable total not verified" : source.verified_total_frames + " verified readable frames"}</span>

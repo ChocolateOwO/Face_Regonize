@@ -5,12 +5,15 @@ import time
 from typing import Literal
 import numpy as np
 from app.services.scan_settings import ScanSettings
+from app.services.video_render import RenderSettings
 
 Device = Literal['auto', 'cpu', 'cuda', 'tensorrt']
 PROVIDERS = dict(cpu='CPUExecutionProvider', cuda='CUDAExecutionProvider', tensorrt='TensorrtExecutionProvider')
 
 class VideoSettings(ScanSettings):
     device: Device = 'auto'
+    # Optional tagged-video output, frozen at Start (services/video_render.py).
+    render: RenderSettings | None = None
 
 class DeviceError(ValueError):
     pass
@@ -87,6 +90,58 @@ def detect(image, device: str, timings: dict):
             return _detect_locked(app, image, device, timings, begin)
         finally:
             _in_flight -= 1
+
+def detect_tiled(image, device: str, timings: dict, before_call=None):
+    """Event Photo crowd scan (global pass + overlapping 640 px tiles) on this
+    video device, for the tagged-video render only. It reuses the supported
+    collect_candidates() geometry/dedupe unchanged; the detector it is handed
+    is a thin wrapper that takes the shared engine lock for ONE detector call
+    at a time, so a live request can get in between tiles instead of waiting
+    for a whole frame. `before_call` runs before every lock acquisition."""
+    from app.face_recognition import engine
+    from app.services.event_photo_detection_service import collect_candidates
+    global _in_flight
+    app = session(device)
+
+    def locked(work):
+        global _in_flight
+        if before_call is not None:
+            before_call()
+        begin = time.perf_counter()
+        with engine.inference_lock:
+            _in_flight += 1
+            try:
+                entered = time.perf_counter()
+                for model in (app.det_model, app.models['recognition']):
+                    if model.session.get_providers()[0] != PROVIDERS[device]:
+                        raise DeviceError('Selected model provider changed; processing stopped instead of silently switching devices.')
+                result = work()
+                finished = time.perf_counter()
+            finally:
+                _in_flight -= 1
+        timings['inference_wait_seconds'] = timings.get('inference_wait_seconds', 0) + entered - begin
+        timings['inference_seconds'] = timings.get('inference_seconds', 0) + finished - entered
+        return result
+
+    class _OneCallAtATime:
+        def detect(self, crop, max_num=0, metric='default'):
+            return locked(lambda: app.det_model.detect(crop, max_num=max_num, metric=metric))
+
+    stats: dict = {}
+    candidates = collect_candidates(image, _OneCallAtATime(), stats)
+    timings['tiled_detector_calls'] = timings.get('tiled_detector_calls', 0) + 1 + stats.get('tiles', 0)
+    faces = []
+
+    def embed(chunk):
+        for candidate in chunk:
+            face = engine.Face(bbox=candidate.bbox.astype(np.float32), kps=candidate.kps, det_score=candidate.score)
+            # Align from the original frame using the remapped landmarks, as Event Photo does.
+            app.models['recognition'].get(image, face)
+            faces.append(engine.DetectedFace(face.normed_embedding.astype(np.float32), tuple(candidate.bbox.tolist()), float(candidate.score)))
+
+    for start in range(0, len(candidates), 8):
+        locked(lambda chunk=candidates[start:start + 8]: embed(chunk))
+    return faces
 
 def _detect_locked(app, image, device: str, timings: dict, begin: float):
     """Body of detect(); the caller already holds the shared engine lock."""

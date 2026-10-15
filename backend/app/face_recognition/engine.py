@@ -51,6 +51,12 @@ MODEL_NAME = "buffalo_l"
 inference_lock = threading.Lock()
 
 
+class InferenceBusy(RuntimeError):
+    """detect_faces(lock_timeout=...) could not get the shared inference lock
+    in time. Only callers that pass a timeout (the stateless /api/look) ever
+    see this; every existing caller waits for the lock exactly as before."""
+
+
 def get_face_app() -> FaceAnalysis:
     global _face_app
     if _face_app is None:
@@ -100,6 +106,12 @@ def get_face_app() -> FaceAnalysis:
     return _face_app
 
 
+def is_ready() -> bool:
+    """True once the shared model is loaded and warmed (startup does this
+    before serving). Read-only: never triggers the slow load itself."""
+    return _face_app is not None
+
+
 def get_active_provider() -> str:
     app = get_face_app()
     providers = app.models["recognition"].session.get_providers()
@@ -128,15 +140,23 @@ def resize_for_detection(image_bgr: np.ndarray, max_side: int = 960) -> tuple[np
     return resized, scale
 
 
-def detect_faces(image_bgr: np.ndarray, timings: dict | None = None) -> list[DetectedFace]:
+def detect_faces(image_bgr: np.ndarray, timings: dict | None = None,
+                 lock_timeout: float | None = None) -> list[DetectedFace]:
     """Re-implements FaceAnalysis.get() by hand (rather than calling it
     directly) so detection and embedding can be timed as separate stages —
     the alignment/crop step is a cheap numpy warp done inline inside the
     recognition model's .get(), so it's folded into the "embedding" number
-    rather than reported as its own stage."""
+    rather than reported as its own stage.
+
+    lock_timeout=None (every existing caller) waits for the shared lock as
+    before; a number makes the wait bounded and raises InferenceBusy instead."""
     app = get_face_app()
 
-    with inference_lock:
+    if lock_timeout is None:
+        inference_lock.acquire()
+    elif not inference_lock.acquire(timeout=lock_timeout):
+        raise InferenceBusy("Face inference is busy.")
+    try:
         t0 = time.perf_counter()
         bboxes, kpss = app.det_model.detect(image_bgr, max_num=0, metric="default")
         t_detect = time.perf_counter()
@@ -152,6 +172,8 @@ def detect_faces(image_bgr: np.ndarray, timings: dict | None = None) -> list[Det
         for face in faces:
             rec_model.get(image_bgr, face)
         t_embed = time.perf_counter()
+    finally:
+        inference_lock.release()
 
     if timings is not None:
         timings["detection_ms"] = (t_detect - t0) * 1000

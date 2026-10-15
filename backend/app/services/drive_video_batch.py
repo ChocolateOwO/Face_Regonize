@@ -77,7 +77,8 @@ def recover(state: dict) -> None:
         refresh_totals(state)
     video._write(state)
 
-def create(name: str, link: str, keys: list[str], account_id: str, settings: ScanSettings, device: str = "auto") -> dict:
+def create(name: str, link: str, keys: list[str], account_id: str, settings: ScanSettings, device: str = "auto",
+           render: dict | None = None) -> dict:
     label = name.strip()
     if not label or len(label) > 120 or any(ord(c) < 32 or ord(c) == 127 for c in label):
         raise drive.DriveVideoError("Give the batch a name of 1–120 characters without control characters.")
@@ -97,7 +98,7 @@ def create(name: str, link: str, keys: list[str], account_id: str, settings: Sca
                 source_file=copy.deepcopy(item), preview_version=1)
             state["videos"].append(source)
         video._write(state)
-        return video.start(state["id"], settings, device)
+        return video.start(state["id"], settings, device, render)
 
 def decorate_public(result: dict, state: dict, *, detail: bool) -> None:
     sources = [video.public(s, detail=detail) for s in state["videos"]]

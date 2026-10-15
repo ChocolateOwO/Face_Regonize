@@ -7,8 +7,7 @@ WHY IN MEMORY, NOT A DATABASE TABLE
     again (the same reasoning that keeps the ffmpeg preview stills off disk
     and the multi-camera recognition stats out of any table). Presence is
     inherently "what is true right now", not history, so it lives in a plain
-    dict guarded by a lock — the same pattern camera_recognition.py already
-    uses for its own per-camera stats.
+    dict guarded by a lock.
 
     A node's durable CONFIGURATION (its name, which activity it covers, which
     camera, its mode) is different: that is written rarely, by a person, and
