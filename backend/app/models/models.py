@@ -244,9 +244,17 @@ class PhotoBatch(SQLModel, table=True):
     drive_failed_photos: int = 0  # processed fine locally, but the Drive upload failed/could not be verified
     drive_error: Optional[str] = None  # most recent Drive upload failure, shown separately from processing failures
 
-    retention_days: int = 7  # 1-7, enforced at the API layer
+    retention_days: int = 7  # 1-7, enforced at the API layer; 0 when retention_policy is "never"
     retention_start_at: datetime = Field(default_factory=datetime.now)
-    delete_at: datetime = Field(default_factory=datetime.now)  # recomputed whenever retention_days changes
+    # The automatic-deletion deadline; recomputed whenever the retention
+    # choice changes. NULL = no deadline (retention_policy "never"). No
+    # default on purpose: a column default would silently replace an explicit
+    # NULL on insert and hand a Never batch a deadline of "now". Creation
+    # always sets it (photo_processing_service._create_batch_row).
+    delete_at: Optional[datetime] = None
+    # "days" | "never" (services/retention_policy.py). Never is its own
+    # persisted state: cleanup never deletes such a batch, whatever the dates.
+    retention_policy: str = Field(default="days")
 
     # Phase G4 — how long processing actually took, persisted so the figure
     # survives a page refresh and a backend restart (the live ETA is

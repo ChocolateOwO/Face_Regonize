@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { apiDelete, apiGet, apiPostJson, apiPutJson, fileUrl, ApiError } from "../api/client";
 import { Badge, Button, Card, EmptyState, PageHeader, Spinner , Pagination} from "../components/ui";
+import { RETENTION_CHOICES, RETENTION_NEVER, retentionChoiceOf, retentionLabel, retentionPayload } from "../retention";
 import PhotoBatchDownload from "../components/PhotoBatchDownload";
 import DriveDestinationPanel from "../components/DriveDestinationPanel";
 import BoxEditor from "../components/BoxEditor";
@@ -55,7 +56,8 @@ interface Batch {
   drive_error: string | null;
   retention_days: number;
   retention_start_at: string;
-  delete_at: string;
+  delete_at: string | null;  // null = retention "never"
+  retention_policy?: string;
   source_folder_url: string | null;
   processed_folder_url: string | null;
   media_folder_url: string | null;
@@ -686,7 +688,7 @@ export default function PhotoBatchDetail() {
       {showRetention && (
         <RetentionModal
           batchId={batch.id}
-          currentDays={batch.retention_days}
+          currentChoice={retentionChoiceOf(batch)}
           onClose={() => setShowRetention(false)}
           onChanged={() => {
             setShowRetention(false);
@@ -709,8 +711,9 @@ function Stat({ label, value, tone }: { label: string; value: number; tone?: "go
 }
 
 function RetentionPanel({ batch, onOpen }: { batch: Batch; onOpen: () => void }) {
-  const deleteAt = new Date(batch.delete_at);
-  const isActive = deleteAt.getTime() > Date.now();
+  const never = retentionChoiceOf(batch) === RETENTION_NEVER;
+  const deleteAt = batch.delete_at ? new Date(batch.delete_at) : null;
+  const isActive = never || (deleteAt !== null && deleteAt.getTime() > Date.now());
   return (
     <Card className="mb-4">
       <div className="flex items-center justify-between flex-wrap gap-3">
@@ -718,17 +721,17 @@ function RetentionPanel({ batch, onOpen }: { batch: Batch; onOpen: () => void })
           <h2 className="font-semibold text-gray-900 mb-2">Data Retention</h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-sm">
             <div>
-              <span className="text-gray-500">Retention period:</span> <strong>{batch.retention_days} Day{batch.retention_days === 1 ? "" : "s"}</strong>
+              <span className="text-gray-500">Retention period:</span> <strong>{retentionLabel(retentionChoiceOf(batch))}</strong>
             </div>
             <div>
               <span className="text-gray-500">Started:</span> {new Date(batch.retention_start_at).toLocaleString()}
             </div>
             <div>
-              <span className="text-gray-500">Scheduled deletion:</span> {deleteAt.toLocaleString()}
+              <span className="text-gray-500">Scheduled deletion:</span> {never || !deleteAt ? "None — kept until deleted manually" : deleteAt.toLocaleString()}
             </div>
             <div>
               <span className="text-gray-500">Status:</span>{" "}
-              <Badge tone={isActive ? "good" : "bad"}>{isActive ? "ACTIVE" : "EXPIRED"}</Badge>
+              <Badge tone={isActive ? "good" : "bad"}>{never ? "KEPT" : isActive ? "ACTIVE" : "EXPIRED"}</Badge>
             </div>
           </div>
           <p className="text-xs text-gray-400 mt-2">
@@ -745,17 +748,17 @@ function RetentionPanel({ batch, onOpen }: { batch: Batch; onOpen: () => void })
 
 function RetentionModal({
   batchId,
-  currentDays,
+  currentChoice,
   onClose,
   onChanged,
 }: {
   batchId: string;
-  currentDays: number;
+  currentChoice: string;
   onClose: () => void;
   onChanged: () => void;
 }) {
   const [password, setPassword] = useState("");
-  const [days, setDays] = useState(currentDays);
+  const [choice, setChoice] = useState(currentChoice);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -764,7 +767,7 @@ function RetentionModal({
     if (!password) return setError("Enter your admin password to confirm.");
     setLoading(true);
     try {
-      await apiPutJson(`/api/photo-batches/${batchId}/retention`, { password, retention_days: days });
+      await apiPutJson(`/api/photo-batches/${batchId}/retention`, { password, ...retentionPayload(choice) });
       onChanged();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not change retention.");
@@ -781,13 +784,16 @@ function RetentionModal({
         <div className="space-y-3">
           <div>
             <label className="block text-sm text-gray-600 mb-1">New retention period</label>
-            <select value={days} onChange={(e) => setDays(Number(e.target.value))} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
-              {[1, 2, 3, 4, 5, 6, 7].map((d) => (
-                <option key={d} value={d}>
-                  {d} Day{d === 1 ? "" : "s"}
+            <select aria-label="New retention period" value={choice} onChange={(e) => setChoice(e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
+              {RETENTION_CHOICES.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.label}
                 </option>
               ))}
             </select>
+            {currentChoice === RETENTION_NEVER && choice !== RETENTION_NEVER && (
+              <p className="text-xs text-amber-700 mt-1">The {retentionLabel(choice).toLowerCase()} period starts now; this batch will then be deleted automatically.</p>
+            )}
           </div>
           <div>
             <label className="block text-sm text-gray-600 mb-1">Admin password</label>

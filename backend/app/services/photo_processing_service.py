@@ -36,7 +36,7 @@ import mimetypes
 import json
 import shutil
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -59,6 +59,7 @@ from app.models.models import (
 )
 from app.services import storage_service
 from app.services import settings_cache
+from app.services import retention_policy
 from app.services import event_eta_service
 from app.services import photo_thumbnail_service
 from app.services.google_drive_folder_service import (
@@ -585,14 +586,17 @@ def _create_batch_row(
     mask_style: str = "blur",
     mask_png: bytes | None = None,
     mask_source: str | None = None,
+    retention: str = retention_policy.RETENTION_DAYS,
 ) -> PhotoBatch:
     """Shared by create_batch (Drive) and create_local_batch (Phase A2) —
     everything about a batch's row/directories/logo setup is source-agnostic;
     only the source_type value and drive_folder_id (empty for local uploads,
     since PhotoBatch.drive_folder_id is a plain non-nullable str with no
     Drive-specific meaning once source_type != "drive") differ."""
-    if not (1 <= retention_days <= 7):
-        raise ValueError("retention_days must be between 1 and 7")
+    # "days" needs 1-7; "never" has no deadline at all (retention_days 0,
+    # delete_at NULL) and is skipped by run_retention_cleanup for good.
+    retention, retention_days = retention_policy.resolve(retention, retention_days)
+    started = datetime.now()
 
     # Phase B: the ONE place workflow_version is decided, at creation —
     # never changed afterward. A batch already running keeps whichever
@@ -604,8 +608,9 @@ def _create_batch_row(
         drive_folder_id=drive_folder_id,
         storage_dir="",  # filled in below once we have the id
         retention_days=retention_days,
-        retention_start_at=datetime.now(),
-        delete_at=datetime.now() + timedelta(days=retention_days),
+        retention_start_at=started,
+        delete_at=retention_policy.deadline(retention, started, retention_days),
+        retention_policy=retention,
         created_by=user_id,
         source_type=source_type,
         workflow_version=workflow_version,
@@ -643,19 +648,21 @@ def _create_batch_row(
 
 
 def create_batch(session: Session, folder_url_or_id: str, retention_days: int, user_id: str, logo_png: bytes | None = None, logo_position: str = "bottom-right", logo_size: float = 0.15,
-                 *, mask_style: str = "blur", mask_png: bytes | None = None, mask_source: str | None = None) -> PhotoBatch:
+                 *, mask_style: str = "blur", mask_png: bytes | None = None, mask_source: str | None = None,
+                 retention: str = retention_policy.RETENTION_DAYS) -> PhotoBatch:
     folder_id = extract_folder_id(folder_url_or_id)
     label = get_folder_name(folder_id) or folder_id  # cosmetic — never fail a batch over the label
     return _create_batch_row(
         session, label=label, drive_folder_id=folder_id, retention_days=retention_days, user_id=user_id,
         source_type="drive",  # explicit — every batch created through this path is Drive-sourced (Phase A1)
         logo_png=logo_png, logo_position=logo_position, logo_size=logo_size,
-        mask_style=mask_style, mask_png=mask_png, mask_source=mask_source,
+        mask_style=mask_style, mask_png=mask_png, mask_source=mask_source, retention=retention,
     )
 
 
 def create_local_batch(session: Session, label: str, retention_days: int, user_id: str, logo_png: bytes | None = None, logo_position: str = "bottom-right", logo_size: float = 0.15,
-                       *, mask_style: str = "blur", mask_png: bytes | None = None, mask_source: str | None = None) -> PhotoBatch:
+                       *, mask_style: str = "blur", mask_png: bytes | None = None, mask_source: str | None = None,
+                       retention: str = retention_policy.RETENTION_DAYS) -> PhotoBatch:
     """Phase A2 — creates a batch row for local file-upload sourcing. The
     caller (the upload API route) streams the actual uploaded files into
     this batch's UPLOAD_STAGING/ directory AFTER this returns (it needs the
@@ -664,7 +671,7 @@ def create_local_batch(session: Session, label: str, retention_days: int, user_i
         session, label=label, drive_folder_id="", retention_days=retention_days, user_id=user_id,
         source_type="local",
         logo_png=logo_png, logo_position=logo_position, logo_size=logo_size,
-        mask_style=mask_style, mask_png=mask_png, mask_source=mask_source,
+        mask_style=mask_style, mask_png=mask_png, mask_source=mask_source, retention=retention,
     )
 
 
@@ -1664,11 +1671,25 @@ def _sync_batch_to_drive(batch_id: str) -> None:
         session.commit()
 
 
-def change_retention(session: Session, batch: PhotoBatch, new_retention_days: int) -> PhotoBatch:
-    if not (1 <= new_retention_days <= 7):
-        raise ValueError("retention_days must be between 1 and 7")
-    batch.retention_days = new_retention_days
-    batch.delete_at = batch.retention_start_at + timedelta(days=new_retention_days)
+def change_retention(session: Session, batch: PhotoBatch, new_retention_days: int | None,
+                     new_policy: str = retention_policy.RETENTION_DAYS) -> PhotoBatch:
+    """The ONE explicit way an existing batch's retention changes.
+
+    days -> days   the deadline is re-derived from the ORIGINAL start, exactly
+                   as before (shortening can expire a batch; that is the
+                   admin's explicit choice).
+    any  -> never  the deadline is removed; nothing deletes it automatically.
+    never -> days  the period starts NOW. A batch kept for months must not
+                   come back with a deadline that already passed and vanish on
+                   the next cleanup tick.
+    """
+    was_never = retention_policy.is_never(batch)
+    policy, days = retention_policy.resolve(new_policy, new_retention_days)
+    if policy == retention_policy.RETENTION_DAYS and was_never:
+        batch.retention_start_at = datetime.now()
+    batch.retention_policy = policy
+    batch.retention_days = days
+    batch.delete_at = retention_policy.deadline(policy, batch.retention_start_at, days)
     session.add(batch)
     session.commit()
     session.refresh(batch)
@@ -1730,12 +1751,21 @@ def run_retention_cleanup() -> int:
         # handles — fetching every expired batch and filtering in Python
         # keeps that ONE decision in ONE place instead of two diverging
         # WHERE-clause shapes.
-        expired = session.exec(select(PhotoBatch).where(PhotoBatch.delete_at <= now)).all()
+        # Never batches are excluded twice over: by policy AND by having no
+        # deadline (a NULL delete_at can never be <= now).
+        expired = session.exec(select(PhotoBatch).where(
+            PhotoBatch.retention_policy != retention_policy.RETENTION_NEVER,
+            PhotoBatch.delete_at.is_not(None),
+            PhotoBatch.delete_at <= now,
+        )).all()
         for batch in expired:
             # Re-check immediately before deleting: status could have
             # changed between the query above and now (e.g. a Drive upload
             # just started in a concurrent request).
             session.refresh(batch)
+            # ...and so could its retention: switched to Never a moment ago.
+            if retention_policy.is_never(batch):
+                continue
             if _is_protected(batch):
                 continue
             # The registry is authoritative over "is something actively

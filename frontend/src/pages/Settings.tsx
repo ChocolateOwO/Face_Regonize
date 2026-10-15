@@ -3,6 +3,7 @@ import { apiGet, apiPostJson, apiPutJson } from "../api/client";
 import { listCamerasWithPermission, type CameraDevice } from "../api/cameras";
 import { Button, Card, Input, PageHeader } from "../components/ui";
 import UpdatePanel from "../components/UpdatePanel";
+import { DEFAULT_RETENTION_CHOICE, RETENTION_CHOICES, RETENTION_NEVER } from "../retention";
 
 interface DataCounts {
   attendance_count: number;
@@ -186,6 +187,32 @@ export default function Settings() {
               <label className="block text-sm text-gray-600 mb-1">Event Location</label>
               <Input value={values.event_location} onChange={(e) => set("event_location", e.target.value)} />
             </div>
+          </div>
+        </Card>
+
+        <Card>
+          <h2 className="font-semibold text-gray-900 mb-3">Event Photo Retention</h2>
+          <div>
+            <label className="block text-sm text-gray-600 mb-1">Automatic deletion for new photo batches</label>
+            <select
+              aria-label="Automatic deletion for new photo batches"
+              value={values.photo_retention_default ?? DEFAULT_RETENTION_CHOICE}
+              onChange={(e) => set("photo_retention_default", e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            >
+              {RETENTION_CHOICES.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-gray-400 mt-1">
+              {(values.photo_retention_default ?? DEFAULT_RETENTION_CHOICE) === RETENTION_NEVER
+                ? "New batches are kept until deleted manually. "
+                : "New batches are deleted automatically after this period. "}
+              This is only the starting choice for batches created from now on. Existing batches keep their own
+              retention; change one from its page (Change Retention).
+            </p>
           </div>
         </Card>
 

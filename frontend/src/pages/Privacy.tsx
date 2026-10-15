@@ -8,7 +8,7 @@ import { Link } from "react-router-dom";
 // Source of truth for this text is docs/privacy_policy.md — keep the two in
 // sync when either changes.
 
-const UPDATED = "25 August 2026";
+const UPDATED = "12 October 2026";
 const CONTACT = "nicotinnee@gmail.com";
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -164,9 +164,14 @@ export default function Privacy() {
 
           <Section title="5. Data retention">
             <p>
-              Each set of processed event photographs is given a retention period of between one and seven days, chosen
-              by the organiser. When that period expires, the application automatically deletes its local copies of
-              those photographs and the associated processing records.
+              Each set of processed event photographs is given a retention setting chosen by the organiser: either a
+              period of between one and seven days, or "Never / ไม่ลบอัตโนมัติ" (no automatic deletion).
+            </p>
+            <p>
+              When a period of days expires, the application automatically deletes its local copies of those
+              photographs and the associated processing records. A set marked Never is not deleted automatically: its
+              local copies and records are kept until the organiser deletes that set manually, or changes it to a
+              period of days, which then starts from the moment of the change.
             </p>
             <p>
               Results already uploaded to Google Drive are not deleted automatically; they remain in the organiser's

@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { apiDelete, apiGet, apiPostFormWithProgress, apiPostJson, ApiError } from "../api/client";
 import { Badge, Button, Card, EmptyState, Input, PageHeader, Spinner } from "../components/ui";
 import PhotoBatchDownload from "../components/PhotoBatchDownload";
+import { DEFAULT_RETENTION_CHOICE, RETENTION_CHOICES, RETENTION_NEVER, isRetentionChoice, retentionPayload } from "../retention";
 
 interface Batch {
   id: string;
@@ -249,7 +250,9 @@ function NewBatchModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const [url, setUrl] = useState("");
   const [localLabel, setLocalLabel] = useState("");
   const [localFiles, setLocalFiles] = useState<File[]>([]);
-  const [retentionDays, setRetentionDays] = useState(7);
+  // Starts from the app-wide default (Settings); the admin can still pick
+  // any choice for this one batch.
+  const [retentionChoice, setRetentionChoice] = useState(DEFAULT_RETENTION_CHOICE);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [logo, setLogo] = useState<string | null>(null);
@@ -272,6 +275,9 @@ function NewBatchModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     apiGet("/api/photo-batches/mask-styles")
       .then((r) => setMaskChoices(Array.isArray(r?.styles) ? r.styles : []))
       .catch(() => setMaskChoices([]));  // blur and custom PNG still work without the catalog
+    apiGet("/api/settings")
+      .then((s) => { if (isRetentionChoice(s?.photo_retention_default)) setRetentionChoice(s.photo_retention_default); })
+      .catch(() => {});  // keep the built-in default
   }, []);
 
   function pickMask(file: File | undefined) {
@@ -333,14 +339,14 @@ function NewBatchModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     setLoading(true);
     try {
       if (sourceType === "drive") {
-        await apiPostJson("/api/photo-batches", { drive_folder_url: url.trim(), retention_days: retentionDays, logo_data_url: logo, logo_size: logoSize / 100, logo_position: logoPosition, mask_style: maskStyle, mask_data_url: maskStyle === "image" ? maskDataUrl : null });
+        await apiPostJson("/api/photo-batches", { drive_folder_url: url.trim(), ...retentionPayload(retentionChoice), logo_data_url: logo, logo_size: logoSize / 100, logo_position: logoPosition, mask_style: maskStyle, mask_data_url: maskStyle === "image" ? maskDataUrl : null });
         onCreated();
         return;
       }
 
       const form = new FormData();
       form.append("label", localLabel.trim());
-      form.append("retention_days", String(retentionDays));
+      for (const [key, value] of Object.entries(retentionPayload(retentionChoice))) form.append(key, String(value));
       form.append("logo_position", logoPosition);
       form.append("logo_size", String(logoSize / 100));
       if (logoFile) form.append("logo", logoFile);
@@ -502,17 +508,22 @@ function NewBatchModal({ onClose, onCreated }: { onClose: () => void; onCreated:
           <div>
             <label className="block text-sm text-gray-600 mb-1">Data retention period</label>
             <select
-              value={retentionDays}
-              onChange={(e) => setRetentionDays(Number(e.target.value))}
+              aria-label="Data retention period"
+              value={retentionChoice}
+              onChange={(e) => setRetentionChoice(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
             >
-              {[1, 2, 3, 4, 5, 6, 7].map((d) => (
-                <option key={d} value={d}>
-                  {d} Day{d === 1 ? "" : "s"}
+              {RETENTION_CHOICES.map((c) => (
+                <option key={c.value} value={c.value}>
+                  {c.label}
                 </option>
               ))}
             </select>
-            <p className="text-xs text-gray-400 mt-1">This app's processing records for the batch are automatically deleted after this period. Processed photos already placed in Google Drive are not affected.</p>
+            <p className="text-xs text-gray-400 mt-1">
+              {retentionChoice === RETENTION_NEVER
+                ? "This batch is kept until someone deletes it manually. Nothing is removed automatically."
+                : "This app's processing records for the batch are automatically deleted after this period. Processed photos already placed in Google Drive are not affected."}
+            </p>
           </div>
           {uploadPercent !== null && (
             <div className="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2">

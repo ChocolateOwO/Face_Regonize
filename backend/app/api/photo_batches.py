@@ -31,6 +31,7 @@ from app.services.photo_processing_service import (
     run_photo_batch, upload_staging_dir,
 )
 from app.services import event_eta_service
+from app.services import retention_policy
 from app.services import photo_thumbnail_service
 from app.services import batch_edit_lock
 from app.services import face_geometry_service
@@ -61,7 +62,10 @@ DEFAULT_PAGE_SIZE = 50
 
 class CreateBatchBody(BaseModel):
     drive_folder_url: str
-    retention_days: int = 7
+    # Explicit choice: retention_days 1-7, or retention_policy "never".
+    # Both omitted = the app-wide default (Settings: photo_retention_default).
+    retention_days: int | None = None
+    retention_policy: str | None = None
     logo_data_url: str | None = None
     logo_position: str = "bottom-right"
     logo_size: float = 0.15
@@ -82,7 +86,8 @@ def _resolve_mask(style: str | None, png: bytes | None) -> tuple[str, bytes | No
 
 class RetentionChangeBody(BaseModel):
     password: str
-    retention_days: int
+    retention_days: int | None = None
+    retention_policy: str = "days"  # "days" (with retention_days 1-7) | "never"
 
 
 class DriveDestinationValidateBody(BaseModel):
@@ -201,7 +206,8 @@ def _batch_out(b: PhotoBatch) -> dict:
         "drive_error": b.drive_error,
         "retention_days": b.retention_days,
         "retention_start_at": b.retention_start_at,
-        "delete_at": b.delete_at,
+        "delete_at": b.delete_at,  # null when retention_policy is "never"
+        "retention_policy": b.retention_policy,
         "created_at": b.created_at,
         "source_type": b.source_type,
         "source_folder_url": folder_link(b.drive_folder_id) if b.source_type == "drive" else None,
@@ -270,8 +276,10 @@ def create_photo_batch(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    if not (1 <= body.retention_days <= 7):
-        raise HTTPException(400, "retention_days must be between 1 and 7")
+    try:
+        retention, retention_days = retention_policy.resolve_request(session, body.retention_policy, body.retention_days)
+    except retention_policy.RetentionError as e:
+        raise HTTPException(400, str(e))
     # Drive connection is deliberately NOT required — processing and the web
     # preview work without it; only the Drive mirror is skipped.
     try:
@@ -304,7 +312,7 @@ def create_photo_batch(
         except ValueError as e:
             raise HTTPException(400, "Mask PNG data is invalid.") from e
     mask_style, mask_png, mask_source = _resolve_mask(body.mask_style, uploaded_mask)
-    batch = create_batch(session, body.drive_folder_url, body.retention_days, user.id, logo_png, body.logo_position, body.logo_size,
+    batch = create_batch(session, body.drive_folder_url, retention_days, user.id, logo_png, body.logo_position, body.logo_size, retention=retention,
                          mask_style=mask_style, mask_png=mask_png, mask_source=mask_source)
     background_tasks.add_task(run_photo_batch, batch.id)
     return _batch_out(batch)
@@ -442,7 +450,8 @@ _LOGO_POSITIONS = {"top-left", "top-center", "top-right", "bottom-left", "bottom
 def create_local_photo_batch(
     background_tasks: BackgroundTasks,
     label: str = Form(...),
-    retention_days: int = Form(7),
+    retention_days: int | None = Form(None),
+    retention_policy_choice: str | None = Form(None, alias="retention_policy"),
     logo_position: str = Form("bottom-right"),
     logo_size: float = Form(0.15),
     logo: UploadFile | None = File(None),
@@ -455,8 +464,10 @@ def create_local_photo_batch(
     """Phase A2 — local file/folder upload, the second PhotoSource alongside
     Drive. MUST be registered before /{batch_id} below (see hardware-info's
     comment above — same routing-order bug class)."""
-    if not (1 <= retention_days <= 7):
-        raise HTTPException(400, "retention_days must be between 1 and 7")
+    try:
+        retention, retention_days = retention_policy.resolve_request(session, retention_policy_choice, retention_days)
+    except retention_policy.RetentionError as e:
+        raise HTTPException(400, str(e))
     if not label.strip():
         raise HTTPException(400, "Batch label is required.")
     if logo_position not in _LOGO_POSITIONS:
@@ -487,7 +498,7 @@ def create_local_photo_batch(
         uploaded_mask = mask.file.read(mask_style_service.MAX_MASK_BYTES + 1)
     resolved_style, mask_png, mask_source = _resolve_mask(mask_style, uploaded_mask)
 
-    batch = create_local_batch(session, label.strip(), retention_days, user.id, logo_png, logo_position, logo_size,
+    batch = create_local_batch(session, label.strip(), retention_days, user.id, logo_png, logo_position, logo_size, retention=retention,
                                mask_style=resolved_style, mask_png=mask_png, mask_source=mask_source)
 
     staging = upload_staging_dir(batch.id)
@@ -889,7 +900,7 @@ def update_retention(
         raise HTTPException(404, "Photo batch not found")
 
     try:
-        batch = change_retention(session, batch, body.retention_days)
+        batch = change_retention(session, batch, body.retention_days, body.retention_policy)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _batch_out(batch)

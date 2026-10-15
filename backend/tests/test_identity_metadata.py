@@ -135,7 +135,7 @@ class MigrationShapeTests(DbCase):
         conn.commit()
         conn.close()
 
-        self.assertEqual(self.migrate(), ["010", "012"])
+        self.assertEqual(self.migrate(), ["010", "012", "013"])
         self.assert_identity_schema()
         row = self.conn().execute("SELECT id, person_id, source_candidate_id FROM eventidentitysample").fetchall()
         self.assertEqual(row, [("s1", "p1", None)], "an existing row is preserved, never rewritten")
@@ -143,12 +143,12 @@ class MigrationShapeTests(DbCase):
     def test_production_shape_with_008_and_no_007(self):
         self.core_schema(["001", "002", "003", "004", "005", "006", "008"])
         applied = self.migrate()
-        self.assertEqual(applied, ["007", "009", "010", "012"], "applied in the runner's order")
+        self.assertEqual(applied, ["007", "009", "010", "012", "013"], "applied in the runner's order")
         self.assert_identity_schema()
         cols = {r[1] for r in self.conn().execute("PRAGMA table_info(photobatchface)")}
         self.assertIn("detected_bbox", cols)
         registry = [r[0] for r in self.conn().execute("SELECT id FROM schemamigration ORDER BY id")]
-        self.assertEqual(registry, ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "012"])
+        self.assertEqual(registry, ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "012", "013"])
 
     def test_re_running_is_a_no_op(self):
         SQLModel.metadata.create_all(self.engine)

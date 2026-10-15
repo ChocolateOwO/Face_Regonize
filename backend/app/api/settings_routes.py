@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -12,7 +12,7 @@ from app.config import (
 )
 from app.database.db import get_session
 from app.models.models import Setting, User
-from app.services import settings_cache
+from app.services import retention_policy, settings_cache
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -35,6 +35,10 @@ DEFAULTS = {
     #            checked in as they are seen. Consent for this mode comes from
     #            the registration form, not the kiosk.
     "kiosk_mode": "tap",
+    # Event Photo retention pre-selected for NEW batches: "1".."7" days, or
+    # "never" (no automatic deletion). Existing batches are never changed by
+    # this - see services/retention_policy.py.
+    retention_policy.DEFAULT_SETTING_KEY: retention_policy.DEFAULT_SETTING_VALUE,
 }
 
 
@@ -62,6 +66,9 @@ def get_settings(session: Session = Depends(get_session), user: User = Depends(g
 
 @router.put("")
 def update_settings(body: SettingsUpdate, session: Session = Depends(get_session), user: User = Depends(get_current_user)):
+    chosen = body.values.get(retention_policy.DEFAULT_SETTING_KEY)
+    if chosen is not None and chosen not in retention_policy.SETTING_CHOICES:
+        raise HTTPException(400, "photo_retention_default must be 1-7 or 'never'.")
     for key, value in body.values.items():
         if key not in DEFAULTS:
             continue
