@@ -367,8 +367,15 @@ Approved by the user ("Promote Dummy to Main + Commit + Push"). Everything from 
 except `want=persons` (still BLOCKED) — client-disconnect detection remains a known limitation.
 
 **1. Starting Main HEAD:** `55bfae8` (= origin/main after `git fetch`, 0 ahead / 0 behind).
-**2. Final Main HEAD:** see the follow-up docs commit that records the pushed hash (a commit cannot
-contain its own hash).
+**2. Final Main HEAD:** feature commit `fd08181`, followed by the docs-only commit that adds this
+record (a commit cannot contain its own hash).
+
+**Checklist:** Backup Main ✅ · Backup database ✅ · Inspect existing changes ✅ · Merge main.py ✅ ·
+Merge test_identity_metadata.py ✅ · Promote all required files ✅ (32) · Validate migration 014 ✅
+(copy, then live) · Backend tests ✅ · Frontend tests ✅ (5 pre-existing failures only, see 7) ·
+TypeScript ✅ · Recognition tests ✅ · API compatibility ✅ · PDPA unchanged ✅ · Existing Main
+features preserved ✅ · No production data loss ✅ · Git diff reviewed ✅ · Commit created ✅ ·
+Push origin/main ✅ · Local HEAD = origin/main ✅ · Final report updated ✅
 
 **Pre-existing uncommitted work in Main (another session) — preserved, NOT committed:**
 `CURRENT_TASK.md`, `PROJECT_CONTEXT.md`, `backend/app/auth/deps.py`, the `integration_snapshot`
@@ -446,8 +453,16 @@ disconnected HTTP client is not detected; its frame is bounded by the 0.5 s dead
 theme (combobox keeps the page palette). Phone width: page layout (sidebar) pre-existing. Load numbers
 are from this PC only. identity_backfill does not pause for `/api/look` traffic (pre-existing).
 
-**10–11. Commit / push:** commit message `feat: add concurrent face inference lanes and language
-profiles`; hash and push verification recorded in the follow-up docs commit.
+**10–11. Commit / push (verified).**
+- Feature commit: **`fd08181cf9e95ca152e92b27bac01e1ea1475648`** `feat: add concurrent face inference
+  lanes and language profiles` — parent `55bfae8`, 32 files, +3564 / −108.
+- Before push: `git fetch origin` → origin/main `55bfae8` = parent; fast-forward only.
+- `git push origin main` → `55bfae8..fd08181  main -> main` (no force).
+- After push: `git fetch` → local HEAD `fd08181…` = `origin/main` `fd08181…` =
+  `git ls-remote origin refs/heads/main` `fd08181…`.
+- The committed files equal the tested export (line endings normalised) except this report, which
+  was edited after the export.
+- This record is a second, docs-only commit on top of `fd08181`; its own hash is in `git log`.
 
 **12. Rollback (this work only).**
 - Code: `git revert <commit>` (a new commit; never reset). Or copy the files from the backup folder
