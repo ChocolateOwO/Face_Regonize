@@ -768,7 +768,7 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                 # Same enrollment rule as Add Person and photo replacement, so
                 # a photo accepted in one place is accepted in all of them.
                 try:
-                    face = select_primary_enrollment_face(detect_faces(img))
+                    face = select_primary_enrollment_face(detect_faces(img, workload="import"))
                 except EnrollmentFaceError as e:
                     raise RuntimeError(f"PHOTO NOT ACCESSIBLE — {e.message}") from e
 

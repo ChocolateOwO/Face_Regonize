@@ -39,6 +39,11 @@ class Person(SQLModel, table=True):
     # How a voice/robot client should address this person (e.g. "พี่บอส").
     # Entered by an admin; NULL means "use the name". Never inferred.
     call_as: Optional[str] = None
+    # Title/position for a voice client ("Dr.", "อาจารย์", "CEO") and the
+    # language it should speak to this person (BCP 47 tag, e.g. "th", "en").
+    # Both admin-entered and optional; NULL = not set. Never inferred.
+    title: Optional[str] = None
+    language: Optional[str] = None
 
 
 class Upload(SQLModel, table=True):

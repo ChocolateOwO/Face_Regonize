@@ -14,11 +14,16 @@ from app.face_recognition.engine import bbox_to_str, detect_faces, get_active_pr
 from app.face_recognition.index import recognition_index
 from app.api.activities import get_current_activity_id
 from app.models.models import Activity, Attendance, FaceDetection, Upload, User
-from app.services import events_feed, settings_cache, storage_service
+from app.services import events_feed, live_scheduler, look_service, settings_cache, storage_service
 from app.services.person_address import call_as_for
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/recognition", tags=["recognition"])
+
+# A kiosk/camera-node frame waits this long at most for its fair turn (it
+# used to wait without limit). Only reached when the live queue is badly
+# overloaded; the station then gets 503 + Retry-After and scans again.
+STATION_TURN_TIMEOUT_S = 30.0
 
 
 def _start_of_today() -> datetime:
@@ -205,7 +210,18 @@ def run_recognition(
     t_resize = time.perf_counter()
 
     inner_timings: dict = {}
-    faces = detect_faces(working_img, timings=inner_timings)
+    # Live lane, fair turn per station: the kiosk page per account, a camera
+    # node per node id. A station still waits (it never had a timeout), but
+    # in fair order with /api/look cameras and never behind a background scan.
+    is_kiosk = feed_node_id == "kiosk"
+    source = f"kiosk:{user_id}" if is_kiosk else f"node:{feed_node_id}"
+    try:
+        with live_scheduler.live_turn(source=source, workload="kiosk" if is_kiosk else "camera_node",
+                                      timeout=STATION_TURN_TIMEOUT_S, drop=False):
+            faces = detect_faces(working_img, timings=inner_timings)
+    except live_scheduler.LiveBusy as exc:
+        raise HTTPException(503, f"Recognition is busy: {exc}",
+                            headers=look_service.retry_headers(exc.retry_after)) from exc
 
     threshold = settings_cache.get_threshold()
     if faces:

@@ -16,7 +16,8 @@ from app.services.index_sync import apply_index_change
 from app.services.import_service import bump_high_water_if_greater, next_auto_id_start
 from app.models.models import Attendance, ConsentRecord, FaceDetection, Person, User
 from app.services import storage_service
-from app.services.person_address import CallAsError, normalize_call_as
+from app.services.local_time import aware
+from app.services.person_address import CallAsError, normalize_call_as, normalize_language, normalize_title
 
 router = APIRouter(prefix="/api/people", tags=["people"])
 
@@ -39,6 +40,8 @@ def _person_out(session: Session, p: Person, summary: tuple[int, datetime | None
         "det_score": p.det_score,
         "is_demo": p.is_demo,
         "call_as": p.call_as,
+        "title": p.title,
+        "language": p.language,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
         "detection_count": detection_count,
@@ -121,7 +124,7 @@ def get_person(person_id: str, session: Session = Depends(get_session), user: Us
             "id": h.id,
             "upload_id": h.upload_id,
             "confidence": h.confidence,
-            "detected_at": h.detected_at,
+            "detected_at": aware(h.detected_at),  # stored local time + its offset
         }
         for h in history
     ]
@@ -150,7 +153,7 @@ def create_person(
     # Detection itself is unchanged and still returns every face; only the
     # choice of which one owns this enrollment photo happens here.
     try:
-        face = select_primary_enrollment_face(detect_faces(img))
+        face = select_primary_enrollment_face(detect_faces(img, workload="enrollment"))
     except EnrollmentFaceError as e:
         raise HTTPException(422, e.message) from e
 
@@ -208,7 +211,7 @@ def update_person(
         if img is None:
             raise HTTPException(400, "Could not decode the uploaded image.")
         try:
-            face = select_primary_enrollment_face(detect_faces(img))
+            face = select_primary_enrollment_face(detect_faces(img, workload="enrollment"))
         except EnrollmentFaceError as e:
             raise HTTPException(422, e.message) from e
         display_bytes, ext = storage_service.to_displayable_bytes(file_bytes)
@@ -239,6 +242,34 @@ def set_call_as(person_id: str, body: CallAsBody, session: Session = Depends(get
         raise HTTPException(404, "Person not found")
     try:
         p.call_as = normalize_call_as(body.call_as)
+    except CallAsError as e:
+        raise HTTPException(422, str(e)) from e
+    p.updated_at = datetime.now()
+    session.add(p)
+    session.commit()
+    session.refresh(p)
+    return _person_out(session, p)
+
+
+class VoiceProfileBody(BaseModel):
+    title: str | None = None
+    language: str | None = None
+
+
+@router.put("/{person_id}/voice-profile")
+def set_voice_profile(person_id: str, body: VoiceProfileBody, session: Session = Depends(get_session),
+                      user: User = Depends(require_admin)):
+    """Title/position and spoken language for a voice client. Like call-as,
+    its own endpoint so the full-form PUT can never wipe it. A field left out
+    of the body is unchanged; empty or null clears it. Never inferred."""
+    p = session.get(Person, person_id)
+    if not p:
+        raise HTTPException(404, "Person not found")
+    try:
+        if "title" in body.model_fields_set:
+            p.title = normalize_title(body.title)
+        if "language" in body.model_fields_set:
+            p.language = normalize_language(body.language)
     except CallAsError as e:
         raise HTTPException(422, str(e)) from e
     p.updated_at = datetime.now()

@@ -13,6 +13,7 @@ import {
 } from "../components/ui";
 import { useLiveEvents } from "../hooks/useLiveEvents";
 import CallAsEditor from "../components/CallAsEditor";
+import VoiceProfileEditor from "../components/VoiceProfileEditor";
 
 interface ConsentHistoryItem {
   choice: "consented" | "declined";
@@ -40,6 +41,8 @@ interface PersonDetailData {
   det_score: number;
   is_demo: boolean;
   call_as: string | null;
+  title: string | null;
+  language: string | null;
   created_at: string;
   updated_at: string;
   detection_count: number;
@@ -142,6 +145,12 @@ export default function PersonDetail() {
               <strong>Detection confidence at enrollment:</strong> {(data.det_score * 100).toFixed(0)}%
             </div>
             <CallAsEditor personId={data.id} value={data.call_as} onSaved={(callAs) => setData({ ...data, call_as: callAs })} />
+            <VoiceProfileEditor
+              personId={data.id}
+              title={data.title}
+              language={data.language}
+              onSaved={(title, language) => setData({ ...data, title, language })}
+            />
             <div className="pt-2 border-t border-gray-100 mt-2">
               <strong>Image Source:</strong> {data.image_source === "manual" ? "Manual Upload" : data.image_source === "google_drive" ? "Google Drive" : "URL"}
               {data.original_image_url && (

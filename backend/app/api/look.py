@@ -28,7 +28,8 @@ _SOURCE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 @router.post("/look")
 def look(
     photo: UploadFile = File(..., description="JPEG frame, at most 2 MiB."),
-    source: str | None = Form(None, description="Caller's camera label, e.g. nong-cam-1. Logged only."),
+    source: str | None = Form(None, description="Caller's camera label, e.g. nong-cam-1. Each source gets a fair "
+                                                "turn on the live model; logged, never stored."),
     want: Literal["faces", "persons"] = Form("faces", description="'persons' is reserved and not implemented."),
     user: User = Depends(get_api_client),
 ):
@@ -37,12 +38,13 @@ def look(
     are [x1, y1, x2, y2] normalized to 0-1. Unknown faces carry no identity.
 
     400 not a readable JPEG · 401 bad token · 413 too large (bytes or pixels)
-    · 422 want=persons · 429 busy, drop this frame · 503 model unavailable."""
+    · 422 want=persons · 429 busy, drop this frame (Retry-After = estimated
+    whole seconds, X-Retry-After-Ms = the estimate) · 503 model unavailable."""
     if want == "persons":
         raise HTTPException(422, "want=persons is reserved for future body detection and is not available.")
     data = photo.file.read(look_service.MAX_PHOTO_BYTES + 1)
     try:
-        result = look_service.look(data)
+        result = look_service.look(data, source=source, user_id=getattr(user, "id", None))
     except look_service.LookError as exc:
         raise HTTPException(exc.status, exc.detail, headers=exc.headers) from exc
     if source:

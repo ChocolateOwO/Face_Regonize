@@ -47,7 +47,7 @@ def session(device: str):
                 if model.session.get_providers()[0] != provider:
                     raise RuntimeError('Model provider initialization fell back')
             # Exercise BOTH actual models, even when the synthetic image has no face.
-            with engine.inference_lock:
+            with engine.hold(engine.BACKGROUND, 'video'):
                 app.det_model.detect(np.zeros((320, 320, 3), np.uint8), max_num=0, metric='default')
                 app.models['recognition'].get_feat(np.zeros((112, 112, 3), np.uint8))
             _sessions[device] = app
@@ -84,7 +84,9 @@ def detect(image, device: str, timings: dict):
     global _in_flight
     app = session(device)
     begin = time.perf_counter()
-    with engine.inference_lock:
+    # Same shared lock as before; in shared mode it first steps aside for a
+    # waiting live caller (engine.hold).
+    with engine.hold(engine.BACKGROUND, 'video'):
         _in_flight += 1
         try:
             return _detect_locked(app, image, device, timings, begin)
@@ -108,7 +110,8 @@ def detect_tiled(image, device: str, timings: dict, before_call=None):
         if before_call is not None:
             before_call()
         begin = time.perf_counter()
-        with engine.inference_lock:
+        # before_call already stepped aside for live work when given.
+        with engine.hold(engine.BACKGROUND, 'video', yield_first=before_call is None):
             _in_flight += 1
             try:
                 entered = time.perf_counter()

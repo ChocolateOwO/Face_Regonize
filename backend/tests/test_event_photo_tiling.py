@@ -107,6 +107,8 @@ class TilingTests(unittest.TestCase):
         engine.get_face_app = lambda: SimpleNamespace(det_model=detector, models={'recognition': SimpleNamespace(get=recognize)})
         engine.DetectedFace = lambda embedding, bbox, det_score: SimpleNamespace(embedding=embedding, bbox=bbox, det_score=det_score)
         engine.inference_lock = threading.Lock()  # Phase G2 arbiter — detect_event_faces() now imports this too
+        engine.BACKGROUND = 'background'
+        engine.hold = lambda lane, workload: engine.inference_lock  # one call per hold (2026-10-20)
         common = ModuleType('insightface.app.common')
         common.Face = SimpleNamespace
         with patch.dict(sys.modules, {'app.face_recognition.engine': engine, 'insightface.app.common': common}):

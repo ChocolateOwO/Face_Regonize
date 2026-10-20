@@ -68,6 +68,8 @@ class LookCase(unittest.TestCase):
             (look_service, "recognition_index", index),
             (look_service.engine, "is_ready", lambda: True),
             (look_service.engine, "detect_faces", fake_detect),
+            # Addresses come from the database; keep this test off the dev DB.
+            (look_service, "address_for", lambda session, ids: {}),
             (storage_service, "STORAGE_PATH", storage),
             (storage_service, "EVENTS_DIR", storage / "events"),
             (storage_service, "THUMBNAILS_DIR", storage / "thumbnails"),
@@ -115,7 +117,9 @@ class ResponseTests(LookCase):
                              ("0001", "Ann", "Ann Alpha", "p0"))
             self.assertEqual((ben["name"], ben["confidence"], ben["face_score"]), ("Ben Beta", 1.0, 0.7))
             self.assertTrue(all(0.0 <= v <= 1.0 for f in out["faces"] for v in f["box"]))
-            self.assertEqual(self.detect_calls[-1]["lock_timeout"], look_service.LOCK_TIMEOUT_S)
+            # Bounded: what is left of LOCK_TIMEOUT_S after the fair-turn wait.
+            self.assertGreater(self.detect_calls[-1]["lock_timeout"], 0)
+            self.assertLessEqual(self.detect_calls[-1]["lock_timeout"], look_service.LOCK_TIMEOUT_S)
 
     def test_no_faces_is_200_with_empty_list(self):
         self.faces = []
@@ -155,7 +159,10 @@ class ErrorTests(LookCase):
         try:
             self.assertTrue(all(held))
             exc = self.status_of(jpeg(320, 240))
-            self.assertEqual((exc.status_code, exc.headers), (429, {"Retry-After": "0"}))
+            # 2026-10-20: Retry-After is an estimate in whole seconds, never 0.
+            self.assertEqual(exc.status_code, 429)
+            self.assertGreaterEqual(int(exc.headers["Retry-After"]), 1)
+            self.assertIn("X-Retry-After-Ms", exc.headers)
         finally:
             for _ in held:
                 look_service._admission.release()

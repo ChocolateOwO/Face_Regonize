@@ -95,26 +95,40 @@ def collect_candidates(image: np.ndarray, detector, stats: dict | None = None) -
     return kept
 
 
+EMBED_CHUNK = 8  # faces embedded per lock hold
+
+
 def detect_event_faces(image: np.ndarray, stats: dict | None = None):
     # Lazy imports keep geometry tests independent of model loading and app DB.
-    from app.face_recognition.engine import DetectedFace, get_face_app, inference_lock
+    from app.face_recognition.engine import BACKGROUND, DetectedFace, get_face_app, hold
     from insightface.app.common import Face
 
     started = time.perf_counter()
     app = get_face_app()
-    # Phase G2: the SAME lock engine.detect_faces() (kiosk/enrollment) uses —
-    # both are direct calls into the one shared FaceAnalysis session, so both
-    # must serialize against each other, not just against themselves.
-    with inference_lock:
-        candidates = collect_candidates(image, app.det_model, stats)
-        faces = []
-        for candidate in candidates:
-            face = Face(bbox=candidate.bbox.astype(np.float32), kps=candidate.kps,
-                        det_score=candidate.score)
-            # Align from the immutable original using remapped landmarks, not tiles.
-            app.models["recognition"].get(image, face)
-            faces.append(DetectedFace(face.normed_embedding.astype(np.float32),
-                                      tuple(candidate.bbox.tolist()), candidate.score))
+
+    # Phase G2: the SAME lock engine.detect_faces() (enrollment, and the
+    # kiosk in shared mode) uses — both are direct calls into the one
+    # FaceAnalysis session, so both must serialize against each other.
+    # 2026-10-20: held for ONE detector call (global pass or one tile) or one
+    # chunk of embeddings at a time, not for the whole photo, so a live
+    # caller sharing this session waits at most one call instead of a whole
+    # tiled scan. Same model, same calls, same order: results are unchanged.
+    class _OneCallAtATime:
+        def detect(self, crop, max_num=0, metric="default"):
+            with hold(BACKGROUND, "event_photo"):  # engine.inference_lock
+                return app.det_model.detect(crop, max_num=max_num, metric=metric)
+
+    candidates = collect_candidates(image, _OneCallAtATime(), stats)
+    faces = []
+    for start in range(0, len(candidates), EMBED_CHUNK):
+        with hold(BACKGROUND, "event_photo"):
+            for candidate in candidates[start:start + EMBED_CHUNK]:
+                face = Face(bbox=candidate.bbox.astype(np.float32), kps=candidate.kps,
+                            det_score=candidate.score)
+                # Align from the immutable original using remapped landmarks, not tiles.
+                app.models["recognition"].get(image, face)
+                faces.append(DetectedFace(face.normed_embedding.astype(np.float32),
+                                          tuple(candidate.bbox.tolist()), candidate.score))
     if stats is not None:
         stats["total_ms"] = (time.perf_counter() - started) * 1000
     return faces

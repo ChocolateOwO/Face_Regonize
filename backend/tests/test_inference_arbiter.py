@@ -75,7 +75,10 @@ class InferenceArbiterTests(unittest.TestCase):
 
         source = inspect.getsource(event_detect.detect_event_faces)
         self.assertIn("from app.face_recognition.engine import", source)
-        self.assertIn("inference_lock", source)
+        # 2026-10-20: one call per hold(BACKGROUND, ...), and that lane's lock
+        # IS engine.inference_lock (the lock the kiosk shares in shared mode).
+        self.assertIn("hold(BACKGROUND", source)
+        self.assertIs(engine.lock_for(engine.BACKGROUND), engine.inference_lock)
 
     def test_kiosk_and_event_calls_never_overlap_inside_the_shared_model(self):
         probe = _ConcurrencyProbe()

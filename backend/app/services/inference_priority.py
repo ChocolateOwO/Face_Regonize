@@ -5,8 +5,13 @@ Live callers that answer a person or a robot in real time (the stateless
 shared inference lock once per frame (the tagged-video render) asks before
 each acquisition and steps aside for a moment while a live caller is waiting.
 
-This is deliberately not a new lock and does not change the shared engine
-lock or Event Photo: a plain threading.Lock has no fairness, so a loop that
+Since 2026-10-20 every background acquisition of the shared lock asks here
+(engine.hold(BACKGROUND, ...): Event Photo, video, import, enrollment, ...),
+and live callers announce themselves only when they share that lock (shared
+mode, services/live_scheduler.live_turn). In dual mode the live lane has its
+own session and lock, so nothing waits here.
+
+This is deliberately not a new lock: a plain threading.Lock has no fairness, so a loop that
 re-acquires it immediately can starve a waiter; the short pause here is what
 lets the waiter in. The pause is bounded, so background work always makes
 progress.

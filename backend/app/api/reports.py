@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 from app.auth.deps import get_api_client, get_current_user
 from app.database.db import get_session
 from app.models.models import Activity, Attendance, FaceDetection, Person, Upload, User
+from app.services.local_time import aware
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
@@ -39,7 +40,7 @@ def dashboard(session: Session = Depends(get_session), user: User = Depends(get_
             # updated_at, which in an activity record would read as "when this
             # detection changed" rather than "when the photo changed".
             "person_image_version": person.updated_at if person else None,
-            "detected_at": d.detected_at,
+            "detected_at": aware(d.detected_at),  # stored local time + its offset
             "confidence": d.confidence,
             "event_image": upload.image_path if upload else None,
             "status": d.status,

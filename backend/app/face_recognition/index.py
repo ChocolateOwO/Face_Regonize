@@ -53,36 +53,44 @@ class RecognitionIndex:
                 self._matrix = np.zeros((0, 512), dtype=np.float32)
             self._version += 1
 
+    # Copy-on-write (2026-10-20): upsert/remove build NEW lists and a new
+    # matrix and swap them in under the lock. match_batch() takes references
+    # under the lock and then works outside it; when writers used to mutate
+    # those same lists in place, a delete landing mid-match could shift the ids
+    # against the matrix rows it had already read, naming the wrong person.
+    # Writes are rare (enrollment, import, delete); reads are every frame.
     def upsert(self, person) -> None:
         emb = np.frombuffer(person.embedding, dtype=np.float32).reshape(1, -1)
+        full_name = f"{person.first_name} {person.last_name}".strip()
         with self._lock:
-            if person.id in self._ids:
-                i = self._ids.index(person.id)
-                self._first_names[i] = person.first_name
-                self._full_names[i] = f"{person.first_name} {person.last_name}".strip()
-                self._participant_ids[i] = person.participant_id
-                self._matrix[i] = emb[0]
+            ids, firsts = list(self._ids), list(self._first_names)
+            fulls, participant_ids = list(self._full_names), list(self._participant_ids)
+            if person.id in ids:
+                i = ids.index(person.id)
+                firsts[i], fulls[i], participant_ids[i] = person.first_name, full_name, person.participant_id
+                matrix = self._matrix.copy()
+                matrix[i] = emb[0]
             else:
-                self._ids.append(person.id)
-                self._first_names.append(person.first_name)
-                self._full_names.append(f"{person.first_name} {person.last_name}".strip())
-                self._participant_ids.append(person.participant_id)
-                # np.frombuffer gives a READ-ONLY view over the immutable bytes,
-                # so adopting it directly as the matrix (the empty-index case)
-                # makes the whole matrix read-only and the in-place update above
-                # fails later. vstack already returns a fresh writable array, so
-                # only this branch needs a copy - one row, only when empty.
-                self._matrix = np.vstack([self._matrix, emb]) if self._matrix.shape[0] else emb.copy()
+                ids.append(person.id)
+                firsts.append(person.first_name)
+                fulls.append(full_name)
+                participant_ids.append(person.participant_id)
+                # vstack returns a fresh writable array; frombuffer's view is
+                # read-only, so the empty-index case needs its own copy.
+                matrix = np.vstack([self._matrix, emb]) if self._matrix.shape[0] else emb.copy()
+            self._ids, self._first_names, self._full_names, self._participant_ids = ids, firsts, fulls, participant_ids
+            self._matrix = matrix
             self._version += 1
 
     def remove(self, person_id: str) -> None:
         with self._lock:
             if person_id in self._ids:
                 i = self._ids.index(person_id)
-                del self._ids[i]
-                del self._first_names[i]
-                del self._participant_ids[i]
-                del self._full_names[i]
+                keep = lambda values: values[:i] + values[i + 1:]  # noqa: E731 — new list, never in place
+                self._ids = keep(self._ids)
+                self._first_names = keep(self._first_names)
+                self._participant_ids = keep(self._participant_ids)
+                self._full_names = keep(self._full_names)
                 self._matrix = np.delete(self._matrix, i, axis=0)
                 self._version += 1
 

@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 from app.auth.deps import get_api_client, get_current_user
 from app.database.db import get_session
 from app.models.models import FaceDetection, Person, Upload, User
+from app.services.local_time import aware, to_stored
 
 router = APIRouter(prefix="/api/history", tags=["history"])
 
@@ -58,9 +59,9 @@ def recognition_history(
     if person_id:
         stmt = stmt.where(FaceDetection.person_id == person_id)
     if date_from:
-        stmt = stmt.where(FaceDetection.detected_at >= datetime.fromisoformat(date_from))
+        stmt = stmt.where(FaceDetection.detected_at >= to_stored(datetime.fromisoformat(date_from)))
     if date_to:
-        stmt = stmt.where(FaceDetection.detected_at <= datetime.fromisoformat(date_to))
+        stmt = stmt.where(FaceDetection.detected_at <= to_stored(datetime.fromisoformat(date_to)))
     if q:
         like = f"%{q}%"
         full_name = Person.first_name.concat(" ").concat(Person.last_name)
@@ -93,7 +94,7 @@ def recognition_history(
             "participant_id": person.participant_id if person else None,
             "confidence": d.confidence,
             "status": d.status,
-            "detected_at": d.detected_at,
+            "detected_at": aware(d.detected_at),  # e.g. 2026-10-19T10:00:00.123456+07:00
             "seq": d.seq,
             "node_id": upload.source_node_id if upload else None,
             "source": (upload.source_kind if upload else None) or "unknown",
