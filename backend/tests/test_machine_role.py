@@ -29,6 +29,7 @@ from app.models.models import Setting, User
 ALLOWLIST = {
     ("GET", "/api/auth/me"),
     ("POST", "/api/look"),
+    ("POST", "/api/look/batch"),  # robot hub F6 (2026-11-05)
     ("POST", "/api/recognition/upload"),
     ("GET", "/api/history"),
     ("GET", "/api/reports/dashboard"),

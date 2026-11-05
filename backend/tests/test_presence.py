@@ -329,7 +329,7 @@ class CentralNodeTests(RouteCase):
         self.assertEqual([(p["participant_id"], p["call_as"], p["box"]) for p in got["people"]],
                          [("0001", "Khun Ann", [0.1, 0.1, 0.2, 0.3])])
         self.assertEqual(len(self.published), 1)                       # still exactly one matched event
-        self.assertEqual(set(self.published[0]), {"node_id", "participant_id", "name", "activity_id", "checkin", "at", "call_as"})
+        self.assertEqual(set(self.published[0]), {"node_id", "participant_id", "name", "activity_id", "checkin", "at", "call_as", "tags"})
         self.assertEqual([e["type"] for e in self.presence_events], ["presence"])
         self.assertEqual(self.present("CAM-01")["people"], [])
 

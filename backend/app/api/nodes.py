@@ -292,7 +292,7 @@ def node_event(
             "person_id": person.id, "participant_id": person.participant_id,
             "name": f"{person.first_name} {person.last_name}".strip() or person.first_name,
             "confidence": m.confidence, "checkin": "already" if already else "new",
-            "call_as": person.call_as,
+            "call_as": person.call_as, "tags": list(person.tags or []),
         })
 
     node_registry.touch(payload.node_id, faces_seen=len(payload.matches))
@@ -300,7 +300,7 @@ def node_event(
         events_feed.publish({
             "node_id": payload.node_id, "participant_id": s["participant_id"],
             "name": s["name"], "activity_id": activity_id, "checkin": s["checkin"],
-            "at": datetime.now().isoformat(), "call_as": s["call_as"],
+            "at": datetime.now().isoformat(), "call_as": s["call_as"], "tags": s["tags"],
         })
 
     return {"results": seen, "activity_id": activity_id}

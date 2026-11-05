@@ -56,7 +56,8 @@ class VoiceProfileContractTests(ContractCase):
         matched = next(f for f in look["faces"] if f["status"] == "matched")
         self.assertEqual((matched["title"], matched["language"], matched["call_as"]), ("ดร.", "en-US", "พี่แอน"))
         unknown = next(f for f in look["faces"] if f["status"] == "unknown")
-        self.assertEqual(set(unknown), {"box", "face_score", "status"})
+        self.assertEqual(set(unknown), {"box", "face_score", "status", "tags"})  # tags additive (robot hub F1)
+        self.assertEqual(unknown["tags"], [], "unknown faces carry no tags")
 
         status, out = self.call("PUT", path, station, json.dumps({"title": "", "language": None}).encode())
         self.assertEqual((out["title"], out["language"]), (None, None))

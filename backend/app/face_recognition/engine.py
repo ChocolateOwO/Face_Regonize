@@ -475,5 +475,47 @@ def detect_faces(image_bgr: np.ndarray, timings: dict | None = None,
     ]
 
 
+def detect_faces_batch(images: list[np.ndarray], timings: dict | None = None,
+                       lock_timeout: float | None = None) -> list[list[DetectedFace]]:
+    """detect_faces() for several frames under ONE lock hold (robot hub F6).
+
+    The installed SCRFD detector has a fixed batch size of 1, so frames are
+    detected one after another; every face from every frame is then aligned
+    exactly as ArcFaceONNX.get() does and embedded in ONE batched
+    recognition call (that model accepts any batch size)."""
+    from insightface.utils import face_align
+
+    ctx_lane, ctx_workload = _context.get()
+    app = _app_for(ctx_lane)
+    per_image: list[list[Face]] = []
+    with hold(ctx_lane, ctx_workload or ctx_lane, timeout=lock_timeout):
+        t0 = time.perf_counter()
+        for image in images:
+            bboxes, kpss = app.det_model.detect(image, max_num=0, metric="default")
+            per_image.append([Face(bbox=bboxes[i, 0:4], kps=kpss[i] if kpss is not None else None,
+                                   det_score=bboxes[i, 4]) for i in range(bboxes.shape[0])])
+        t_detect = time.perf_counter()
+        rec_model = app.models["recognition"]
+        aligned = [face_align.norm_crop(image, landmark=face.kps, image_size=rec_model.input_size[0])
+                   for image, faces in zip(images, per_image) for face in faces]
+        feats = rec_model.get_feat(aligned) if aligned else np.zeros((0, 512), np.float32)
+        t_embed = time.perf_counter()
+
+    if timings is not None:
+        timings["detection_ms"] = (t_detect - t0) * 1000
+        timings["embedding_ms"] = (t_embed - t_detect) * 1000
+    out, k = [], 0
+    for faces in per_image:
+        found = []
+        for face in faces:
+            emb = np.asarray(feats[k], dtype=np.float32).flatten()
+            k += 1
+            norm = float(np.linalg.norm(emb)) or 1.0
+            found.append(DetectedFace(embedding=(emb / norm).astype(np.float32),
+                                      bbox=tuple(face.bbox.tolist()), det_score=float(face.det_score)))
+        out.append(found)
+    return out
+
+
 def bbox_to_str(bbox: tuple[float, float, float, float]) -> str:
     return ",".join(f"{v:.1f}" for v in bbox)

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import event, insert
+from sqlalchemy import JSON, Column, event, insert, text
 from sqlmodel import Field, SQLModel
 
 
@@ -44,6 +44,11 @@ class Person(SQLModel, table=True):
     # Both admin-entered and optional; NULL = not set. Never inferred.
     title: Optional[str] = None
     language: Optional[str] = None
+    # Short lowercase labels ("vip", "staff") for clients such as the robot
+    # hub; JSON list, [] = none. Rules in services/person_tags.py. Assign a new
+    # list to change it (an in-place append is not detected by the ORM).
+    tags: list[str] = Field(default_factory=list,
+                            sa_column=Column(JSON, nullable=False, server_default=text("'[]'")))
 
 
 class Upload(SQLModel, table=True):
@@ -147,6 +152,9 @@ class ImportJob(SQLModel, table=True):
     imported_at: datetime = Field(default_factory=datetime.now)
     imported_by: Optional[str] = Field(default=None, foreign_key="user.id")
     current_stage: str = Field(default="")
+    # How a Tags column changes an EXISTING person's tags: "merge" adds to
+    # them, "replace" sets them. Ignored when the file has no Tags column.
+    tags_mode: str = Field(default="merge")
 
 
 class ImportRow(SQLModel, table=True):
@@ -164,6 +172,11 @@ class ImportRow(SQLModel, table=True):
     # None means the sheet had no usable answer, and no consent record is
     # invented for that person.
     consent: Optional[str] = None
+    # Valid tags from the file's Tags column; None = the file has no Tags
+    # column (existing tags are left alone). Invalid values, comma-separated,
+    # are reported in tag_errors and skipped.
+    tags: Optional[list[str]] = Field(default=None, sa_column=Column(JSON, nullable=True))
+    tag_errors: Optional[str] = None
 
 
 class ConsentRecord(SQLModel, table=True):

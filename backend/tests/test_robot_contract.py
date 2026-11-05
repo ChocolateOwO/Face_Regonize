@@ -227,7 +227,8 @@ class RobotReadContractTests(ContractCase):
         matched, unknown = out["faces"]
         self.assertEqual((matched["participant_id"], matched["first_name"], matched["name"], matched["call_as"]),
                          ("9001", "Ann", "Ann Alpha", "พี่แอน"))
-        self.assertEqual(set(unknown), {"box", "face_score", "status"})
+        self.assertEqual(set(unknown), {"box", "face_score", "status", "tags"})  # tags additive (robot hub F1)
+        self.assertEqual(unknown["tags"], [], "unknown faces carry no tags")
         self.assertTrue(all(0.0 <= v <= 1.0 for v in matched["box"]))
 
         status, out = self.call("GET", "/api/node/MOBILE-01/present?seconds=10", robot)
@@ -329,7 +330,7 @@ class FeedContractTests(ContractCase):
         self.assertEqual([(e["node_id"], e["participant_id"]) for e in ordinary.sent], [("MOBILE-01", "9001"), ("MOBILE-01", "9002")])
         for event in ordinary.sent:
             self.assertTrue(FEED_FIELDS <= set(event), event)
-            self.assertEqual(set(event) - FEED_FIELDS, {"call_as"})
+            self.assertEqual(set(event) - FEED_FIELDS, {"call_as", "tags"})  # both additive
             self.assertNotIn("type", event)
         self.assertEqual([e["call_as"] for e in ordinary.sent], ["พี่แอน", None])
         # The opt-in feed: first the unknown-person presence message, then the same matched events.

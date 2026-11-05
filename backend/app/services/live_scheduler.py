@@ -35,6 +35,11 @@ MAX_PENDING = 64
 # the one being served; a third is refused at once rather than queued stale.
 PER_SOURCE_DROP = 1
 WINDOW = 512  # recent requests kept for the wait/latency figures
+# Capacity hints (robot hub F5): a source counts as active when it asked for
+# a turn within ACTIVE_WINDOW_S; the recommendation leaves HEADROOM spare.
+ACTIVE_WINDOW_S = 10.0
+HEADROOM = 0.8
+MAX_TRACKED_SOURCES = 1024
 
 
 class LiveBusy(RuntimeError):
@@ -56,6 +61,7 @@ class Turn:
     queued_at: float = field(default_factory=time.perf_counter)
     granted_at: float | None = None
     state: str = "waiting"  # waiting | granted | expired | done
+    frames: int = 1  # frames inferred in this turn (a /api/look/batch turn has several)
 
     def remaining(self) -> float | None:
         """Seconds left before the caller's deadline (None = no deadline)."""
@@ -72,16 +78,21 @@ class LiveScheduler:
         self._holder: Turn | None = None
         self._pending = 0
         self._service_ms = 60.0  # EMA of one live turn, seeds the first estimate
+        self._frame_ms: float | None = None  # EMA of model time per frame, None until measured
+        self._seen: dict[str, float] = {}  # source -> last time it asked for a turn
         self._counts = {"granted": 0, "expired": 0, "rejected_full": 0, "rejected_source": 0, "cancelled": 0}
 
     # -- public -----------------------------------------------------------
-    def acquire(self, source: str, *, timeout: float | None, drop: bool, workload: str = "live") -> Turn:
+    def acquire(self, source: str, *, timeout: float | None, drop: bool, workload: str = "live",
+                frames: int = 1) -> Turn:
         """Wait for this source's turn. timeout=None waits without a deadline
         (but still in fair order). Raises LiveBusy instead of waiting when a
         drop-policy caller would exceed the bounds."""
         now = time.perf_counter()
-        turn = Turn(source=source, workload=workload, deadline=None if timeout is None else now + timeout, drop=drop)
+        turn = Turn(source=source, workload=workload, deadline=None if timeout is None else now + timeout, drop=drop,
+                    frames=max(int(frames), 1))
         with self._cond:
+            self._note_source_locked(source, now)
             if self._pending >= self.max_pending:
                 self._counts["rejected_full"] += 1
                 raise LiveBusy("Too many live requests are waiting.", self._estimate_locked(self._pending), "queue_full")
@@ -118,6 +129,8 @@ class LiveScheduler:
             if turn.granted_at is not None:
                 took = (time.perf_counter() - turn.granted_at) * 1000
                 self._service_ms = self._service_ms * 0.8 + took * 0.2
+                per_frame = took / turn.frames
+                self._frame_ms = per_frame if self._frame_ms is None else self._frame_ms * 0.9 + per_frame * 0.1
             if self._holder is turn:
                 self._holder = None
             self._grant_next_locked()
@@ -137,7 +150,40 @@ class LiveScheduler:
                 **self._counts,
             }
 
+    def capacity(self) -> dict:
+        """Throttling hints for clients (all in memory, no inference).
+
+        max_live_fps: frames per second the live model sustains at the
+        recently measured time per frame (None until a live frame has run).
+        recommended_fps_per_source: HEADROOM of that, shared by the sources
+        active in the last ACTIVE_WINDOW_S (at least one assumed)."""
+        with self._cond:
+            now = time.perf_counter()
+            active = sum(1 for t in self._seen.values() if now - t <= ACTIVE_WINDOW_S)
+            per_source = {s: len(q) for s, q in self._queues.items()}
+            frame_ms = self._frame_ms
+            holder = self._holder
+        max_fps = round(1000 / frame_ms, 1) if frame_ms else None
+        return {
+            "max_live_fps": max_fps,
+            "frame_ms": round(frame_ms, 1) if frame_ms else None,
+            "active_sources": active,
+            "active_window_s": ACTIVE_WINDOW_S,
+            "headroom": HEADROOM,
+            "recommended_fps_per_source": round(max_fps * HEADROOM / max(active, 1), 1) if max_fps else None,
+            "inflight_turn": 1 if holder is not None else 0,
+            "queue": sum(per_source.values()),
+            "queue_limit": self.max_pending,
+            "per_source_waiting_max": max(per_source.values(), default=0),
+            "per_source_waiting_limit": self.per_source_drop,
+        }
+
     # -- internals (caller holds self._cond) ----------------------------------
+    def _note_source_locked(self, source: str, now: float) -> None:
+        self._seen[source] = now
+        if len(self._seen) > MAX_TRACKED_SOURCES:  # bounded: forget the stalest
+            for stale in sorted(self._seen, key=self._seen.get)[: len(self._seen) - MAX_TRACKED_SOURCES]:
+                del self._seen[stale]
     def _estimate_locked(self, ahead: int) -> float:
         running = 1 if self._holder is not None else 0
         return (ahead + running) * self._service_ms / 1000
@@ -225,7 +271,7 @@ class LookStats:
 
 
 @contextmanager
-def live_turn(*, source: str, workload: str, timeout: float | None, drop: bool):
+def live_turn(*, source: str, workload: str, timeout: float | None, drop: bool, frames: int = 1):
     """Wait for this source's fair turn, then run the enclosed
     engine.detect_faces() call(s) on the LIVE lane:
 
@@ -241,7 +287,7 @@ def live_turn(*, source: str, workload: str, timeout: float | None, drop: bool):
 
     announce = nullcontext() if engine.is_dual() else inference_priority.interactive()
     with announce:
-        turn = scheduler.acquire(source, timeout=timeout, drop=drop, workload=workload)
+        turn = scheduler.acquire(source, timeout=timeout, drop=drop, workload=workload, frames=frames)
         try:
             with engine.use(engine.LIVE, workload):
                 yield turn

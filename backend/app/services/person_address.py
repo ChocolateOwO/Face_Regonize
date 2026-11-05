@@ -80,12 +80,13 @@ def call_as_for(session: Session, person_ids: Iterable[str | None]) -> dict[str,
 
 
 def address_for(session: Session, person_ids: Iterable[str | None]) -> dict[str, dict]:
-    """{person_id: {"call_as", "title", "language"}} (values may be None) for
-    the given ids. One indexed query."""
+    """{person_id: {"call_as", "title", "language", "tags"}} for the given ids
+    (call_as/title/language may be None; tags is a list). One indexed query."""
     ids = sorted({p for p in person_ids if p})
     if not ids:
         return {}
-    rows = session.exec(select(Person.id, Person.call_as, Person.title, Person.language)
+    rows = session.exec(select(Person.id, Person.call_as, Person.title, Person.language, Person.tags)
                         .where(Person.id.in_(ids))).all()
-    return {pid: {"call_as": call_as or None, "title": title or None, "language": language or None}
-            for pid, call_as, title, language in rows}
+    return {pid: {"call_as": call_as or None, "title": title or None, "language": language or None,
+                  "tags": list(tags or [])}
+            for pid, call_as, title, language, tags in rows}

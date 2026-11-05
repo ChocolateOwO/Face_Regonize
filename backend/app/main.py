@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from app.api import activities, admin, network as network_api, nodes as nodes_api, attendees, auth, export, files, history, identity_candidates, imports, pdpa, people, photo_batches, recognition, reports, settings_routes, system, update_routes, uploads
 from app.api import local_video_experiment, local_video_drive, scan_settings
 from app.api import look as look_api
+from app.services import look_service as look_service_limits
 from app.auth.security import hash_password
 from app.config import (
     ADMIN_PASSWORD,
@@ -46,6 +47,15 @@ app.add_middleware(
 )
 # Raw-body byte cap for POST /api/look only (must run before multipart parsing).
 app.add_middleware(look_api.LookBodyLimit)
+# The same cap for POST /api/look/batch, sized for MAX_BATCH frames.
+app.add_middleware(look_api.LookBodyLimit, limit=look_service_limits.MAX_BATCH_BODY_BYTES, path=look_api.LOOK_BATCH_PATH)
+
+
+@app.exception_handler(look_api.LookBusy)
+async def look_busy_handler(request: Request, exc: look_api.LookBusy):
+    """429 from /api/look(/batch): the usual detail and Retry-After headers,
+    plus which limit was hit, so a client can throttle itself."""
+    return JSONResponse(status_code=429, content=exc.body(), headers=exc.headers)
 
 
 # Paths still allowed to accept writes while an update is in progress —

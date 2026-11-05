@@ -14,6 +14,10 @@ Top-level fields (all additive except `status`, which is unchanged):
   background_queue   background calls waiting for the background lock
   look_avg_wait_ms   mean wait (turn + lock) of recent successful /api/look
                      calls, null before the first one
+  look_capacity      throttling hints: max_live_fps (frames/s the live model
+                     sustains at the measured time per frame), active_sources
+                     (in the last 10 s), recommended_fps_per_source (80% of
+                     max_live_fps shared by them), queue/inflight and limits
 
 `inference` holds the detail (reason for the mode, per-lane holders, live
 scheduler counters, /api/look latency percentiles over the last 512 calls,
@@ -23,7 +27,7 @@ names, people, images or embeddings.
 from __future__ import annotations
 
 from app.face_recognition import engine
-from app.services import inference_priority, live_scheduler
+from app.services import inference_priority, live_scheduler, look_service
 
 
 def snapshot() -> dict:
@@ -40,6 +44,13 @@ def snapshot() -> dict:
         "live_queue": live["queue"],
         "background_queue": eng["background_waiting"],
         "look_avg_wait_ms": look["avg_wait_ms"],
+        # Throttling hints for /api/look clients (robot hub F5). In memory only.
+        "look_capacity": {
+            **live_scheduler.scheduler.capacity(),
+            **look_service.inflight(),
+            "frame_deadline_ms": int(look_service.LOCK_TIMEOUT_S * 1000),
+            "max_batch": look_service.MAX_BATCH,
+        },
         "inference": {
             "mode_reason": eng["reason"],
             "live_provider": eng["live_provider"],

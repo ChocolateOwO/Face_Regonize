@@ -31,7 +31,7 @@ from app.face_recognition.engine import detect_faces
 from app.face_recognition.enrollment import EnrollmentFaceError, select_primary_enrollment_face
 from app.face_recognition.index import recognition_index
 from app.models.models import ConsentRecord, ImportJob, ImportRow, Person
-from app.services import storage_service
+from app.services import person_tags, storage_service
 from app.services.google_drive_service import GoogleDriveError, download_public_file, is_google_drive_url
 from app.services.index_sync import IndexResyncFailed, apply_index_change
 
@@ -172,6 +172,51 @@ def _cell_str(v) -> str:
 
 def _normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9ก-๙]+", " ", str(text).lower()).strip()
+
+
+# Optional Tags column (robot hub F2), found by its header only, like consent.
+TAG_HEADERS = {"tags", "tag"}
+TAGS_MODES = ("merge", "replace")
+
+
+def detect_tags_column(df: pd.DataFrame) -> str | None:
+    for column in df.columns:
+        if _normalize(column) in TAG_HEADERS:
+            return str(column)
+    return None
+
+
+def parse_tags_cell(value) -> tuple[list[str], list[str]]:
+    """(valid tags, invalid raw values) from one cell; values are separated
+    by commas or semicolons. A blank cell is ([], [])."""
+    return person_tags.sort_out(_cell_str(value).replace(";", ",").split(","))
+
+
+def attach_tags(rows: list[dict], df: pd.DataFrame, tags_column: str | None) -> None:
+    """Adds "tags" (list, or None when there is no Tags column) and
+    "invalid_tags" to every preview row, matched by row_number. Leaves the
+    preview builders themselves untouched."""
+    by_row: dict[int, tuple[list[str], list[str]]] = {}
+    if tags_column and tags_column in df.columns:
+        for i, row in df.iterrows():
+            valid, invalid = parse_tags_cell(row[tags_column])
+            if len(valid) > person_tags.MAX_TAGS:
+                invalid += valid[person_tags.MAX_TAGS:]
+                valid = valid[:person_tags.MAX_TAGS]
+            by_row[int(i) + 2] = (valid, invalid)
+    for r in rows:
+        valid, invalid = by_row.get(r["row_number"], ([], []))
+        r["tags"] = valid if tags_column else None
+        r["invalid_tags"] = invalid
+
+
+def _apply_row_tags(person: Person, row: ImportRow, mode: str) -> bool:
+    """Sheet tags onto an EXISTING person. No Tags column -> unchanged."""
+    if row.tags is None:
+        return False
+    new = list(row.tags)
+    person.tags = person_tags.merge(person.tags, new) if mode == "merge" else new[:person_tags.MAX_TAGS]
+    return True
 
 
 def normalize_name(name: str) -> str:
@@ -698,11 +743,12 @@ def _record_registration_consent(session: Session, person_id: str, consent: str 
     return "recorded" if latest_registration is None else "updated"
 
 
-def run_import_job(import_id: str, duplicate_strategy: str) -> None:
+def run_import_job(import_id: str, duplicate_strategy: str, tags_mode: str | None = None) -> None:
     with Session(engine) as session:
         job = session.get(ImportJob, import_id)
         if not job:
             return
+        tags_mode = tags_mode or job.tags_mode or "merge"
         job.status = "processing"
         session.add(job)
         session.commit()
@@ -730,6 +776,11 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                         select(Person).where(Person.participant_id == row.participant_id)
                     ).first()
                     if person:
+                        # Tags travel the same way as consent: an unchanged
+                        # participant still gets the sheet's tags.
+                        if _apply_row_tags(person, row, tags_mode):
+                            session.add(person)
+                            session.commit()
                         outcome = _record_registration_consent(session, person.id, row.consent)
                         # Say so in the results, otherwise a sync that DID change
                         # someone's consent looks identical to one that skipped
@@ -781,6 +832,9 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                     # this branch also used to drop consent on the floor, so an
                     # existing person whose form answer changed kept their old
                     # status whenever the admin chose "Skip".
+                    if _apply_row_tags(existing, row, tags_mode):
+                        session.add(existing)
+                        session.commit()
                     outcome = _record_registration_consent(session, existing.id, row.consent)
                     note = _consent_note(outcome, row.consent)
                     row.status = "skipped"
@@ -809,6 +863,7 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                     existing.embedding = face.embedding.tobytes()
                     existing.det_score = face.det_score
                     existing.updated_at = datetime.now()
+                    _apply_row_tags(existing, row, tags_mode)
                     session.add(existing)
                 else:
                     person = Person(
@@ -820,6 +875,7 @@ def run_import_job(import_id: str, duplicate_strategy: str) -> None:
                         original_image_url=row.image_url,
                         embedding=face.embedding.tobytes(),
                         det_score=face.det_score,
+                        tags=list(row.tags or []),
                     )
                     session.add(person)
 

@@ -110,7 +110,8 @@ class ResponseTests(LookCase):
             self.assertIsInstance(out["took_ms"], float)
             self.assertEqual([f["status"] for f in out["faces"]], ["unknown", "matched", "matched"])
             unknown, ann, ben = out["faces"]
-            self.assertEqual(set(unknown), {"box", "face_score", "status"})
+            self.assertEqual(set(unknown), {"box", "face_score", "status", "tags"})  # tags additive (robot hub F1)
+            self.assertEqual(unknown["tags"], [], "unknown faces carry no tags")
             self.assertEqual(unknown["box"], [0.5, 0.5, 0.9, 0.9])
             self.assertEqual(ann["box"][0], 0.0)  # clipped into the frame
             self.assertEqual((ann["participant_id"], ann["first_name"], ann["name"], ann["person_id"]),

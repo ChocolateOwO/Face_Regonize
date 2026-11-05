@@ -26,7 +26,10 @@ from app.services.import_service import (
     CONSENT_CHANGED_NOTES,
     CONSENT_NOTE_UNKNOWN,
     CONSENT_UNKNOWN,
+    attach_tags,
     detect_consent_column,
+    detect_tags_column,
+    TAGS_MODES,
     existing_normalized_names,
     existing_people_by_name,
     next_auto_id_start,
@@ -134,6 +137,9 @@ def preview_import(
         df, resolved_name_column, resolved_photo_column, start_id, existing_names,
         resolved_consent_column,
     )
+    # Optional Tags column (robot hub F2): header-detected, added per row.
+    resolved_tags_column = detect_tags_column(df)
+    attach_tags(preview_rows, df, resolved_tags_column)
 
     job = ImportJob(
         filename=filename,
@@ -156,6 +162,8 @@ def preview_import(
             status=row["status"],
             error_message=row["message"] or None,
             consent=row.get("consent"),
+            tags=row.get("tags"),
+            tag_errors=", ".join(row.get("invalid_tags") or []) or None,
         ))
     session.commit()
 
@@ -169,6 +177,8 @@ def preview_import(
         "name_column": resolved_name_column,
         "photo_column": resolved_photo_column,
         "consent_column": resolved_consent_column,
+        "tags_column": resolved_tags_column,
+        "invalid_tag_rows": sum(1 for r in preview_rows if r.get("invalid_tags")),
         "consented_count": sum(1 for r in preview_rows if r.get("consent") == "consented"),
         "declined_count": sum(1 for r in preview_rows if r.get("consent") == "declined"),
         "unknown_consent_count": sum(1 for r in preview_rows if r.get("consent") == CONSENT_UNKNOWN),
@@ -189,6 +199,8 @@ def preview_import(
                 # null = blank cell (stays pending); "unknown" = the cell had
                 # text nobody could interpret, which the UI flags as a warning.
                 "consent": r.get("consent"),
+                "tags": r.get("tags"),
+                "invalid_tags": r.get("invalid_tags", []),
             }
             for r in preview_rows
         ],
@@ -275,6 +287,8 @@ def preview_sheet_import(
         df, resolved_name_column, resolved_photo_column, start_id, existing_people,
         resolved_consent_column,
     )
+    resolved_tags_column = detect_tags_column(df)
+    attach_tags(preview_rows, df, resolved_tags_column)
 
     # Remember the link so "Sync now" does not need it pasted again.
     setting = session.get(Setting, "import_sheet_url")
@@ -305,6 +319,8 @@ def preview_sheet_import(
             status=row["status"],
             error_message=row["message"] or None,
             consent=row.get("consent"),
+            tags=row.get("tags"),
+            tag_errors=", ".join(row.get("invalid_tags") or []) or None,
         ))
     session.commit()
 
@@ -318,6 +334,8 @@ def preview_sheet_import(
         "name_column": resolved_name_column,
         "photo_column": resolved_photo_column,
         "consent_column": resolved_consent_column,
+        "tags_column": resolved_tags_column,
+        "invalid_tag_rows": sum(1 for r in preview_rows if r.get("invalid_tags")),
         "consented_count": sum(1 for r in preview_rows if r.get("consent") == "consented"),
         "declined_count": sum(1 for r in preview_rows if r.get("consent") == "declined"),
         "no_consent_answer_count": sum(1 for r in preview_rows if r.get("consent") is None),
@@ -341,6 +359,8 @@ def preview_sheet_import(
                 # null = blank cell (stays pending); "unknown" = the cell had
                 # text nobody could interpret, which the UI flags as a warning.
                 "consent": r.get("consent"),
+                "tags": r.get("tags"),
+                "invalid_tags": r.get("invalid_tags", []),
             }
             for r in preview_rows
         ],
@@ -359,6 +379,7 @@ def confirm_import(
     import_id: str,
     background_tasks: BackgroundTasks,
     duplicate_strategy: str = Form("skip"),
+    tags_mode: str = Form("merge", description="Tags column vs an existing person's tags: merge (add) or replace."),
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
@@ -367,12 +388,15 @@ def confirm_import(
         raise HTTPException(404, "Import job not found")
     if job.status != "pending":
         raise HTTPException(409, f"Import job already {job.status}")
+    if tags_mode not in TAGS_MODES:
+        raise HTTPException(422, "tags_mode must be 'merge' or 'replace'.")
 
     job.duplicate_strategy = duplicate_strategy
+    job.tags_mode = tags_mode
     session.add(job)
     session.commit()
 
-    background_tasks.add_task(run_import_job, import_id, duplicate_strategy)
+    background_tasks.add_task(run_import_job, import_id, duplicate_strategy, tags_mode)
     return {"import_id": import_id, "status": "processing"}
 
 

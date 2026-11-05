@@ -99,6 +99,7 @@ def recognition_history(
             "node_id": upload.source_node_id if upload else None,
             "source": (upload.source_kind if upload else None) or "unknown",
             "call_as": person.call_as if person else None,
+            "tags": list(person.tags or []) if person else [],
         })
     response = {"items": out, "total": total, "page": page, "page_size": page_size, "latest_seq": latest_seq}
     if after_seq is not None:

@@ -200,7 +200,7 @@ class DefaultBehaviourTests(PersistCase):
         self.assertEqual([(e["node_id"], e["participant_id"], e["checkin"]) for e in self.published],
                          [("kiosk", "0001", "new")])
         # The six original keys plus the additive call_as (Phase 4).
-        self.assertEqual(set(self.published[0]), {"node_id", "participant_id", "name", "activity_id", "checkin", "at", "call_as"})
+        self.assertEqual(set(self.published[0]), {"node_id", "participant_id", "name", "activity_id", "checkin", "at", "call_as", "tags"})
 
         self.published.clear()
         out, _ = self.upload()

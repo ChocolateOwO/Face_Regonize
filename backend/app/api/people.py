@@ -4,7 +4,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import func, or_
+from sqlalchemy import String, cast, func, or_
 from sqlmodel import Session, select
 
 from app.auth.deps import get_current_user, require_admin
@@ -15,7 +15,7 @@ from app.face_recognition.index import recognition_index
 from app.services.index_sync import apply_index_change
 from app.services.import_service import bump_high_water_if_greater, next_auto_id_start
 from app.models.models import Attendance, ConsentRecord, FaceDetection, Person, User
-from app.services import storage_service
+from app.services import person_tags, storage_service
 from app.services.local_time import aware
 from app.services.person_address import CallAsError, normalize_call_as, normalize_language, normalize_title
 
@@ -42,6 +42,7 @@ def _person_out(session: Session, p: Person, summary: tuple[int, datetime | None
         "call_as": p.call_as,
         "title": p.title,
         "language": p.language,
+        "tags": list(p.tags or []),
         "created_at": p.created_at,
         "updated_at": p.updated_at,
         "detection_count": detection_count,
@@ -57,16 +58,27 @@ def _normalize_page(page: int, page_size: int) -> tuple[int, int]:
 
 
 @router.get("")
-def list_people(q: str | None = None, page: int | None = None, page_size: int = 50,
+def list_people(q: str | None = None, page: int | None = None, page_size: int = 50, tag: str | None = None,
                 session: Session = Depends(get_session), user: User = Depends(get_current_user)):
     """Phase I1 — with `page`, a real SQL page in the Uploads envelope
     {items,total,page,page_size}: search, count, offset and limit all run in
     the database, and detection summaries are computed for that page only.
     Without `page` the bare list is returned exactly as before, so any caller
-    not yet migrated keeps working."""
+    not yet migrated keeps working. `tag` (optional) keeps only people who
+    have that tag."""
+    wanted_tag = None
+    if tag is not None:
+        valid, _invalid = person_tags.sort_out([tag])
+        if not valid:
+            raise HTTPException(422, "tag is not a valid tag.")
+        wanted_tag = valid[0]
     if page is not None:
         page, page_size = _normalize_page(page, page_size)
         stmt = select(Person)
+        if wanted_tag:
+            # Tags are stored as a JSON list of normalised strings, which never
+            # contain a quote, so the quoted value matches exactly one element.
+            stmt = stmt.where(cast(Person.tags, String).like(f'%"{wanted_tag}"%'))
         if q:
             like = f"%{q.strip().lower()}%"
             stmt = stmt.where(or_(
@@ -88,6 +100,8 @@ def list_people(q: str | None = None, page: int | None = None, page_size: int = 
 
     stmt = select(Person)
     people = session.exec(stmt).all()
+    if wanted_tag:
+        people = [p for p in people if wanted_tag in (p.tags or [])]
     if q:
         ql = q.lower()
         people = [
@@ -138,12 +152,14 @@ def create_person(
     last_name: str = Form(""),
     email: str | None = Form(None),
     photo: UploadFile = File(...),
+    tags: str | None = Form(None, description='Optional: JSON list or comma/semicolon-separated, e.g. "vip,staff".'),
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
     existing = session.exec(select(Person).where(Person.participant_id == participant_id)).first()
     if existing:
         raise HTTPException(409, f"Participant ID '{participant_id}' already exists.")
+    tag_list = _parse_tags(tags) if isinstance(tags, str) else []
 
     file_bytes = photo.file.read()
     img = storage_service.decode_image(file_bytes)
@@ -171,6 +187,7 @@ def create_person(
         image_source="manual",
         embedding=face.embedding.tobytes(),
         det_score=face.det_score,
+        tags=tag_list,
     )
     session.add(person)
     session.commit()
@@ -193,12 +210,15 @@ def update_person(
     last_name: str = Form(""),
     email: str | None = Form(None),
     photo: UploadFile | None = File(None),
+    tags: str | None = Form(None, description="Optional; left out = tags unchanged, empty = no tags."),
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
     p = session.get(Person, person_id)
     if not p:
         raise HTTPException(404, "Person not found")
+    if isinstance(tags, str):  # unlike the other fields, an omitted tags field keeps the current tags
+        p.tags = _parse_tags(tags)
 
     p.first_name = first_name
     p.last_name = last_name
@@ -225,6 +245,13 @@ def update_person(
     session.refresh(p)
     apply_index_change(session, lambda: recognition_index.upsert(p), what="update participant")
     return _person_out(session, p)
+
+
+def _parse_tags(text: str) -> list[str]:
+    try:
+        return person_tags.normalize(person_tags.split_text(text))
+    except person_tags.TagError as e:
+        raise HTTPException(422, str(e)) from e
 
 
 class CallAsBody(BaseModel):

@@ -14,7 +14,7 @@ from app.face_recognition.engine import bbox_to_str, detect_faces, get_active_pr
 from app.face_recognition.index import recognition_index
 from app.api.activities import get_current_activity_id
 from app.models.models import Activity, Attendance, FaceDetection, Upload, User
-from app.services import events_feed, live_scheduler, look_service, settings_cache, storage_service
+from app.services import events_feed, live_scheduler, look_service, person_tags, settings_cache, storage_service
 from app.services.person_address import call_as_for
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,7 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
         session.commit()
         session.refresh(upload)
         addresses = call_as_for(session, (m[0] for m in matches))
+        tags = person_tags.tags_for(session, (m[0] for m in matches))
 
         for face, (person_id, _first, full_name, participant_id, score), bbox in zip(faces, matches, scaled_bboxes):
             status = "matched" if person_id else "unknown"
@@ -152,6 +153,7 @@ def _persist_recognition(file_bytes: bytes, filename: str, user_id: str, thresho
                     "checkin": checkin,
                     "at": datetime.now().isoformat(),
                     "call_as": addresses.get(person_id),
+                    "tags": tags.get(person_id, []),
                 })
     t_db = time.perf_counter()
     logger.info(
@@ -223,7 +225,8 @@ def run_recognition(
         raise HTTPException(503, f"Recognition is busy: {exc}",
                             headers=look_service.retry_headers(exc.retry_after)) from exc
 
-    threshold = settings_cache.get_threshold()
+    # Per-source override (robot hub F8): a camera node's node_id, or "kiosk".
+    threshold = settings_cache.get_threshold_for(feed_node_id)
     if faces:
         embeddings = np.stack([f.embedding for f in faces])
         matches = recognition_index.match_batch(embeddings, threshold)

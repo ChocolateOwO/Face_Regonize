@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -39,6 +41,9 @@ DEFAULTS = {
     # "never" (no automatic deletion). Existing batches are never changed by
     # this - see services/retention_policy.py.
     retention_policy.DEFAULT_SETTING_KEY: retention_policy.DEFAULT_SETTING_VALUE,
+    # Per-source match threshold overrides, a JSON object {source: 0.2-0.8},
+    # e.g. {"far-cctv-1": 0.40}. Sources not listed use face_match_threshold.
+    settings_cache.THRESHOLD_OVERRIDES_KEY: "{}",
 }
 
 
@@ -69,6 +74,13 @@ def update_settings(body: SettingsUpdate, session: Session = Depends(get_session
     chosen = body.values.get(retention_policy.DEFAULT_SETTING_KEY)
     if chosen is not None and chosen not in retention_policy.SETTING_CHOICES:
         raise HTTPException(400, "photo_retention_default must be 1-7 or 'never'.")
+    overrides = None
+    if settings_cache.THRESHOLD_OVERRIDES_KEY in body.values:
+        try:
+            overrides = settings_cache.parse_threshold_overrides(body.values[settings_cache.THRESHOLD_OVERRIDES_KEY])
+        except settings_cache.OverrideError as e:
+            raise HTTPException(400, str(e)) from e
+        body.values[settings_cache.THRESHOLD_OVERRIDES_KEY] = json.dumps(overrides, sort_keys=True)
     for key, value in body.values.items():
         if key not in DEFAULTS:
             continue
@@ -87,6 +99,8 @@ def update_settings(body: SettingsUpdate, session: Session = Depends(get_session
         settings_cache.set_threshold(float(body.values["face_match_threshold"]))
     if "debug_mode" in body.values:
         settings_cache.set_debug_mode(body.values["debug_mode"].lower() == "true")
+    if overrides is not None:
+        settings_cache.set_threshold_overrides(overrides)
 
     stored = {s.key: s.value for s in session.exec(select(Setting)).all()}
     merged = {**DEFAULTS, **stored}

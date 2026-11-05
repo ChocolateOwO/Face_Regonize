@@ -17,8 +17,9 @@ Everything below is either new or an additive field.
 - **Unchanged:** every existing path, parameter and field; the matched event's fields; `/api/look` (still stateless — it never feeds presence).
 - **Measured:** `/api/look` stays fast while a tagged-video render runs (numbers below).
 - **Still not available:** `want=persons` and a check-in option on `/api/look` (see "Deferred").
-- **2026-10-20 (Dummy, not yet in Main):** separate live/background inference with fair turns per `source`, a real `Retry-After`, a detailed `/api/health`, `title`/`language`, and `detected_at` with `+07:00`. See the sections below.
-- **Not done yet:** the robot's machine account on the real system. It is created when the hub is ready to receive the password.
+- **2026-10-20 (in Main since e8d4a22):** separate live/background inference with fair turns per `source`, a real `Retry-After`, a detailed `/api/health`, `title`/`language`, and `detected_at` with `+07:00`. See the sections below.
+- **2026-11-05 (Dummy, awaiting the owner's approval):** person `tags` (in `/api/look`, the events feed, history and `/api/people`; importable from a Tags column), `POST /api/look/batch`, `look_capacity` throttling hints in `/api/health`, a structured 429 body, and per-camera match thresholds. All additive.
+- **Not done yet:** the robot's machine account on the real system. It is created when the hub is ready to receive the password. The hub still logs in as admin today; switch it to the machine account (below).
 
 ## Authentication: machine account
 
@@ -28,7 +29,9 @@ An admin creates the robot's account on the Reconize PC. Run this from `backend/
 python scripts/manage_machine_user.py create --username robot-hub
 ```
 
-The password is printed once; reset it with `reset`. Log in as before with
+The password is printed once; reset it with `reset`. The owner creates the
+account on the Reconize PC and passes the password to the hub team out of band
+(never in a chat, ticket or repository). Log in as before with
 `POST /api/auth/login` `{username, password}` → `access_token`. The token lasts
 480 minutes, so renew it before then.
 
@@ -40,6 +43,7 @@ A machine account can call only these:
 | GET | `/api/auth/me` | `role` is `"machine"` |
 | GET | `/api/health` | no token needed |
 | POST | `/api/look` | new, see below |
+| POST | `/api/look/batch` | 2026-11-05, see below |
 | POST | `/api/recognition/upload?persist=false` | `persist=true`, or the parameter omitted, returns **403** for a machine |
 | GET | `/api/history` | read only |
 | GET | `/api/reports/dashboard` | |
@@ -72,14 +76,18 @@ Multipart form fields:
   camera that sends often cannot starve a quiet one. Without it, all requests
   from one account share one turn. Logged, never stored or shown in health.
 - `want`: `faces` (default). `persons` is reserved and returns 422.
+- The `source` label is also the key for a per-camera match threshold (below).
 
 ```json
-{"image":{"w":640,"h":480},"took_ms":72.6,"kept":false,
+{"image":{"w":640,"h":480},"took_ms":72.6,"kept":false,"threshold_used":0.45,
  "faces":[{"box":[0.31,0.22,0.52,0.61],"face_score":0.83,"status":"matched",
            "person_id":"…","participant_id":"9002","first_name":"Ann","name":"Ann Alpha",
-           "call_as":"พี่แอน","confidence":0.94},
-          {"box":[0.6,0.3,0.7,0.45],"face_score":0.66,"status":"unknown"}]}
+           "call_as":"พี่แอน","title":null,"language":"th","tags":["vip","staff"],"confidence":0.94},
+          {"box":[0.6,0.3,0.7,0.45],"face_score":0.66,"status":"unknown","tags":[]}]}
 ```
+
+- `tags` (2026-11-05, additive): the matched person's tags, `[]` when they have none; an unknown face always has `"tags": []`.
+- `threshold_used` (2026-11-05, additive): the match threshold applied to this frame — the per-camera override for this `source` if one is set, else the global value.
 
 - `box` is `[x1, y1, x2, y2]` normalized to 0–1.
 - Faces are sorted by box area, largest (usually the closest) first. No faces gives `faces: []` with status 200.
@@ -96,6 +104,46 @@ Multipart form fields:
 | 422 | `want=persons` |
 | 429 | Busy: **drop this frame** and send the next one. `Retry-After` is the estimated wait in whole seconds (at least 1); `X-Retry-After-Ms` is the estimate itself in milliseconds. A frame waits at most 0.5 s for its turn; one camera may have one frame waiting besides the one being answered |
 | 503 | Model not loaded, model failure, or app update in progress |
+
+**429 body (2026-11-05, additive).** The `detail` text and both headers are
+unchanged; the JSON body also says which limit was hit:
+
+```json
+{"detail":"This source already has a frame waiting; drop this one. (live queue)",
+ "limit":"per_source","reason":"source_busy","retry_after_ms":120}
+```
+
+| `limit` | `reason` | Meaning | What the client should do |
+|---|---|---|---|
+| `per_source` | `source_busy` | This camera already has a frame waiting | Send at most one request at a time per camera |
+| `global_queue` | `queue_full` | Too many frames waiting from all cameras together | Lower the frame rate of all cameras |
+| `global_queue` | `inflight_full` | Too many frames being decoded at once | Same |
+| `timeout` | `turn_timeout` | No turn within 0.5 s | Lower the rate; see `look_capacity` |
+| `timeout` | `model_busy` | Shared mode only: background work held the model past 0.5 s | Retry after `retry_after_ms` |
+
+## `POST /api/look/batch` (2026-11-05)
+
+Several frames in one request, each from its own camera — fewer requests and
+one turn on the live model for all of them. `POST /api/look` is unchanged.
+
+Multipart form fields:
+- `photos`: 1–8 JPEG files (same limits per photo as `/api/look`; the whole body at most 8 × 2 MiB + 64 KiB).
+- `sources`: optional, one camera label per photo **in the same order**.
+
+```json
+{"took_ms":180.4,"kept":false,
+ "items":[
+  {"index":0,"source":"cam-1","status":200,"image":{"w":640,"h":480},"took_ms":180.4,"kept":false,
+   "threshold_used":0.45,"faces":[{"box":[…],"face_score":0.83,"status":"matched","participant_id":"9002",…,"tags":["vip"]}]},
+  {"index":1,"source":"cam-2","status":400,"detail":"Photo is not a JPEG."},
+  {"index":2,"source":"cam-3","status":429,"detail":"…","limit":"global_queue","reason":"inflight_full","retry_after_ms":200}]}
+```
+
+- Each item has the `/api/look` shape plus `index`, `source` and `status` (200, 400, 413 or 429). One bad or busy item never fails the others.
+- The whole request is **429** (with the body above) only when every item was refused as busy; **422** when it has 0 or more than 8 photos or a `sources` list of the wrong length; **503** when the model is not available.
+- The model work: each frame is detected separately (the installed face detector takes one image per call), then **all faces from all frames are embedded in one GPU batch**; the embeddings are identical to `/api/look`'s (cosine 1.0 measured).
+- Fairness: a batch is one turn for the calling account (source `batch:<account>`), so a batch of 8 holds the live model about as long as 8 single frames; kiosks and other cameras wait for at most one batch.
+- Nothing is saved, published or remembered.
 
 ### Live and background inference (2026-10-20)
 
@@ -133,6 +181,26 @@ lane**; Event Photo, video, import and enrollment use a **background lane**.
 - `live_queue` / `background_queue`: requests waiting for each lane.
 - `look_avg_wait_ms`: mean wait of recent `/api/look` calls (last 512), `null` before the first.
 - Only workload names and counters; never camera labels, people or images.
+- `look_capacity` (2026-11-05, additive), for clients that want to throttle
+  themselves instead of finding the limit by 429s:
+
+```json
+"look_capacity":{"max_live_fps":24.6,"frame_ms":40.6,"active_sources":6,"active_window_s":10.0,
+  "headroom":0.8,"recommended_fps_per_source":3.3,"inflight_turn":1,"queue":2,"queue_limit":64,
+  "per_source_waiting_max":1,"per_source_waiting_limit":1,"inflight":3,"inflight_limit":12,
+  "frame_deadline_ms":500,"max_batch":8}
+```
+
+  `max_live_fps` is how many frames per second the live model sustains at the
+  recently measured time per frame (`frame_ms`; `null` until the first live
+  frame). `active_sources` counts cameras (and kiosks/nodes) that asked in the
+  last 10 s. `recommended_fps_per_source` = 80% of `max_live_fps` shared by
+  them. **How to throttle:** read `/api/health` every few seconds; send each
+  camera at most `min(your_rate, recommended_fps_per_source)` frames per
+  second, one request in flight per camera; on a 429 drop the frame and wait
+  `retry_after_ms`. The figure is measured on the live model only — Event
+  Photo or video in shared mode, or a slow network, lowers what is really
+  achievable.
 - The server can be forced to one mode with the environment variable
   `RECONIZE_INFERENCE_MODE=shared` (or `dual`, which also allows two CPU
   copies). Default `auto`.
@@ -165,7 +233,8 @@ real `node_id`. The `"kiosk"` node_id now means only the kiosk page.
 
 The six existing fields are unchanged: `node_id`, `participant_id`, `name`,
 `activity_id`, `checkin`, `at`. Each message gains an additive `call_as`, which
-may be `null`.
+may be `null`, and (2026-11-05) an additive `tags` list, `[]` when the person
+has none.
 
 ## Live presence: who is at one camera right now
 
@@ -253,6 +322,7 @@ not as proof of where a person is.
 - `node_id`: `"kiosk"` for the kiosk, otherwise the CCTV or mobile node. It is `null` when unknown.
 - `source`: `kiosk`, `node_event` (CCTV local agent), `node_central` (mobile/central), or `unknown` (older rows).
 - `call_as`
+- `tags` (2026-11-05): the matched person's **current** tags (also on older rows), `[]` for an unknown face.
 
 The response adds `latest_seq`.
 
@@ -283,6 +353,57 @@ with `{title, language}` (admin only; a field left out is unchanged, empty clear
 - `language`: a language tag such as `th`, `en`, `zh`, `en-US` (stored in canonical case).
 - Both are `null` until an admin sets them. Never guessed from a name, a face or registration data.
 - Returned in `/api/look` matched faces and `/api/people`.
+
+## Person `tags` (2026-11-05)
+
+A list of short lowercase labels per person, e.g. `["vip","staff"]`; `[]` when
+none. A tag is 1–32 letters (any script), digits, `-`, `_` or `.` — no spaces;
+at most 20 per person. Input is trimmed, lowercased and de-duplicated
+(`" VIP; staff,vip "` → `["vip","staff"]`).
+
+- **Read:** `GET /api/people` and `GET /api/people/{id}` include `tags`;
+  `GET /api/people?tag=vip` (bare list or `&page=1`) keeps only people with that tag.
+- **Write (admin/staff, not the machine account):** the existing create and
+  update forms take an optional `tags` field — a JSON list (`["vip","staff"]`)
+  or comma/semicolon-separated text (`vip,staff`). On `PUT /api/people/{id}`
+  a left-out `tags` field keeps the current tags; an empty value clears them.
+  An invalid value is **422** and nothing changes.
+- **Recognition:** in `/api/look` and `/api/look/batch` faces, events-feed
+  messages and `/api/history` items (see above).
+- **Import:** an optional column headed `Tags` (or `Tag`) in an Excel/CSV
+  upload or the Google Sheet sync; values separated by commas or semicolons.
+  - New people get the column's tags.
+  - Existing people (Sheet sync only — a file upload never changes an existing
+    participant, exactly like PDPA consent) get them **merged** into their
+    tags by default; `POST /api/import/{id}/confirm` with `tags_mode=replace`
+    replaces them instead (a blank cell then clears).
+  - No `Tags` column = everyone's tags stay as they are.
+  - Invalid values are skipped and reported per row (preview `invalid_tags`,
+    import result `tag_errors`); the import itself never fails because of them.
+
+## Per-camera match threshold (2026-11-05)
+
+`face_match_threshold` (global, default 0.45) can be overridden per source,
+e.g. a lower value for a far CCTV camera whose faces are small. Admin only,
+through the settings API, as a JSON object in the string value:
+
+```
+PUT /api/settings
+{"values": {"face_match_threshold_overrides": "{\"far-cctv-1\": 0.40, \"MOBILE-01\": 0.42}"}}
+```
+
+- Key = the `/api/look` / batch `source` label (letters, digits, `.`, `_`, `-`),
+  a central camera node's `node_id`, or `kiosk`. Value 0.20–0.80 (the range of
+  the Settings slider). At most 100 entries. `"{}"` removes them all.
+- Anything not listed uses the global threshold. Invalid input is **400** and
+  the previous value stays.
+- Applied immediately (no restart). `/api/look` and the batch items report
+  the value used as `threshold_used`; the kiosk/central recognition response
+  already had `threshold_used`.
+- A lower threshold accepts weaker matches, so it also raises the chance of
+  naming the wrong person; change it only for a camera that needs it.
+- `GET /api/settings` (admin) returns the current object as a string; a
+  machine account does not see it.
 
 ## Timestamps with an offset (2026-10-20)
 

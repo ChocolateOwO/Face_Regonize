@@ -361,7 +361,7 @@ class ExposureTests(DbCase):
         self.assertEqual([(e["node_id"], e["call_as"]) for e in self.published],
                          [("kiosk", "พี่แอน"), ("MOBILE-01", "พี่แอน")])
         for e in self.published:
-            self.assertEqual(set(e), {"node_id", "participant_id", "name", "activity_id", "checkin", "at", "call_as"})
+            self.assertEqual(set(e), {"node_id", "participant_id", "name", "activity_id", "checkin", "at", "call_as", "tags"})
 
     def test_node_event_records_provenance(self):
         body = '{"node_id": "CAM-02", "camera_label": "C920", "matches": [{"participant_id": "0001", "confidence": 0.8}]}'
