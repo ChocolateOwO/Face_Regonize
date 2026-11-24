@@ -50,7 +50,15 @@ export default function Login() {
         <div className="text-xs text-gray-400 text-center mt-6">
           Demo login: <strong>admin</strong> / <strong>admin123</strong>
         </div>
-        <div className="text-xs text-center mt-3">
+        <div className="text-xs text-center mt-3 space-x-4">
+          <a
+            href="/help/index.html"
+            target="_blank"
+            rel="noreferrer"
+            className="text-indigo-600 font-medium hover:underline"
+          >
+            Help
+          </a>
           <Link to="/privacy" className="text-gray-400 hover:text-indigo-600 hover:underline">
             Privacy Policy
           </Link>

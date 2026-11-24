@@ -90,6 +90,15 @@ export default function Layout({ children }: { children: ReactNode }) {
         <div className="px-5 py-4 border-b border-gray-200">
           <div className="text-lg font-bold text-indigo-600">Reconize</div>
           <div className="text-xs text-gray-500">Event Management &amp; AI Recognition</div>
+          <a
+            href="/help/index.html"
+            target="_blank"
+            rel="noreferrer"
+            className="mt-2 inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100"
+          >
+            <span aria-hidden="true">❓</span>
+            Help
+          </a>
         </div>
         <UpdateBanner />
         <nav className="flex-1 py-3 px-2 space-y-1 overflow-y-auto">
