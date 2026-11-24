@@ -1,0 +1,156 @@
+{
+  "faces-open": {
+    "url": "/app/faces/",
+    "clip": ".tabbed",
+    "ready": "#openBtn"
+  },
+  "reconize-login": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "anonymous": true,
+    "url": "/login",
+    "ready": "input[type=password]",
+    "clip": "div:has(> form):has(input[type=password])",
+    "steps": [
+      {
+        "wait": "input[type=password]"
+      },
+      {
+        "eval": "Array.from(document.querySelectorAll('form ~ div')).find(el => el.textContent.includes('Demo login'))?.remove()"
+      }
+    ]
+  },
+  "reconize-dashboard": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/",
+    "ready": "h1:has-text(\"Dashboard\")"
+  },
+  "reconize-people": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/people",
+    "ready": "h1:has-text(\"People\")"
+  },
+  "reconize-recognition": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/recognition",
+    "ready": "button:visible"
+  },
+  "reconize-attendees": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/attendees",
+    "ready": "h1:has-text(\"Attendees\")"
+  },
+  "reconize-activities": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/activities",
+    "ready": "button:text-is(\"Open station\")"
+  },
+  "reconize-cctv": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/cctv",
+    "ready": "h1:has-text(\"camera node\")"
+  },
+  "reconize-connect": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/connect",
+    "ready": "main button:visible",
+    "steps": [
+      {
+        "wait": "main button[title=\"Click to copy\"]"
+      },
+      {
+        "eval": "for (const el of document.querySelectorAll('main button[title=\"Click to copy\"], main span.font-mono')) if (/^http/.test(el.textContent)) el.textContent = 'http://reconize.example'; for (const svg of document.querySelectorAll('main .rounded-xl > svg')) svg.style.filter = 'blur(8px)'"
+      }
+    ]
+  },
+  "reconize-import": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/import",
+    "ready": "h1:has-text(\"Import Participants\")"
+  },
+  "reconize-uploads": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/uploads",
+    "ready": "h1:has-text(\"Upload History\")"
+  },
+  "reconize-history": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/history",
+    "ready": "h1:has-text(\"Recognition History\")"
+  },
+  "reconize-reports": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/reports",
+    "ready": "h1:has-text(\"Reports\")"
+  },
+  "reconize-settings": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/settings",
+    "ready": "h1:has-text(\"Settings\")",
+    "viewport": {
+      "width": 1440,
+      "height": 1480
+    }
+  },
+  "reconize-pdpa": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/pdpa",
+    "ready": "h1:has-text(\"PDPA\")"
+  },
+  "reconize-event-photos": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/photo-batches",
+    "ready": "h1:has-text(\"Event Photos\")"
+  },
+  "reconize-video": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/local-video-experiment",
+    "ready": "h1:has-text(\"Local Video Experiment\")"
+  },
+  "reconize-privacy": {
+    "native": true,
+    "direct": true,
+    "fixed": true,
+    "url": "/privacy",
+    "ready": "h1:has-text(\"Privacy Policy\")",
+    "steps": [
+      {
+        "wait": "h1"
+      },
+      {
+        "eval": "for (const a of document.querySelectorAll('a[href^=mailto]')) a.textContent = '[contact hidden]'"
+      }
+    ]
+  }
+}

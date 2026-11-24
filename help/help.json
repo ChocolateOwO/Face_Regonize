@@ -1,0 +1,17 @@
+{
+  "title": {
+    "th": "Reconize",
+    "en": "Reconize",
+    "zh": "Reconize",
+    "ja": "Reconize"
+  },
+  "summary": {
+    "th": "ดูผลการรู้จำใบหน้าและตั้งค่าการตอบสนอง",
+    "en": "See recognition results and set responses",
+    "zh": "查看人脸识别结果并设置响应",
+    "ja": "顔認識の結果を確認し、反応を設定する"
+  },
+  "group": "use",
+  "order": 50,
+  "nativeVariant": "en-light"
+}
