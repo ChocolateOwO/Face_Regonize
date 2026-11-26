@@ -50,7 +50,7 @@ function env(responses){
   makeCanvas:()=>({width:0,height:0,getContext:()=>({drawImage:()=>{drawn++;}}),captureStream:()=>({getTracks:()=>tracks})}),
   now:()=>t,
   sleep:async(ms)=>{sleeps.push(ms);},
-  onState:(s,d)=>states.push(s),
+  onState:(s)=>states.push(s),
  };
  return {deps,calls,sleeps,states,tracks,get drawn(){return drawn;},tick:(ms)=>{t+=ms;}};
 }
