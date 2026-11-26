@@ -137,6 +137,13 @@ async def on_startup() -> None:
     initialize_video_experiments()
     init_db()
     seed_demo_admin()
+    # Never blocks startup; only says so when the public defaults are in use.
+    try:
+        from app.services import security_defaults
+        with Session(engine) as session:
+            security_defaults.warn_at_startup(session)
+    except Exception:  # noqa: BLE001
+        logger.debug("security default check skipped", exc_info=True)
 
     # Load the face model and every registered embedding into memory now,
     # not on the first recognition request — the app should come up already

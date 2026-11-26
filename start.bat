@@ -24,6 +24,16 @@ if not exist ".env" (
     exit /b 1
 )
 
+REM The public default JWT_SECRET is reported, not refused: development and
+REM test installs may use it on purpose. Real installs must not.
+"backend\.venv\Scripts\python.exe" scripts\init_env.py --check >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo WARNING: .env still uses the PUBLIC default JWT_SECRET - anyone could forge a sign-in.
+    echo          Before real use see README.md, "First Sign-in and Passwords".
+    echo.
+)
+
 echo Starting Reconize backend (http://127.0.0.1:8000)...
 start "Reconize Backend" cmd /k "cd backend && .venv\Scripts\python.exe -m uvicorn app.main:app --port 8000"
 
