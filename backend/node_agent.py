@@ -62,6 +62,11 @@ from fastapi.middleware.cors import CORSMiddleware
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.face_recognition.engine import detect_faces, get_face_app  # noqa: E402 — path insert must come first
+from app.services import hub_scheduler  # noqa: E402
+
+# A station's scans are live (someone is in front of the camera): this
+# process never waits for a Mice Hub GPU lease, even with MICE_HUB_GPU_LEASE=1.
+hub_scheduler.opt_out("Local Agent scans are live")
 from app.face_recognition.index import RecognitionIndex  # noqa: E402
 from app.services import storage_service  # noqa: E402
 

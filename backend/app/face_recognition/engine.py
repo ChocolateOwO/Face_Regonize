@@ -334,7 +334,24 @@ def hold(lane: str = BACKGROUND, workload: str = "background", timeout: float | 
 
     Background callers step aside first for a waiting live caller, but only
     when the live caller needs the same lock (shared mode). timeout=None
-    waits as before; a number raises InferenceBusy when it runs out."""
+    waits as before; a number raises InferenceBusy when it runs out.
+
+    With MICE_HUB_GPU_LEASE=1 a BACKGROUND call first asks the Mice Hub for
+    the shared GPU (services/hub_scheduler.py) - before, never while, holding
+    the local lock, and fail-open. Live calls never ask."""
+    if lane == BACKGROUND and workload != "warmup":
+        from app.services import hub_scheduler
+
+        with hub_scheduler.lease(workload):
+            with _hold_local(lane, workload, timeout, yield_first):
+                yield
+    else:
+        with _hold_local(lane, workload, timeout, yield_first):
+            yield
+
+
+@contextmanager
+def _hold_local(lane: str, workload: str, timeout: float | None, yield_first: bool):
     lock = lock_for(lane)
     if lane == BACKGROUND and yield_first and lock_for(LIVE) is lock:  # shared mode only
         from app.services import inference_priority

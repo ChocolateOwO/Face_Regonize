@@ -21,13 +21,13 @@ Top-level fields (all additive except `status`, which is unchanged):
 
 `inference` holds the detail (reason for the mode, per-lane holders, live
 scheduler counters, /api/look latency percentiles over the last 512 calls,
-background yield totals). Only counters and workload labels: no camera
+background yield totals, Mice Hub GPU lease counters). Only counters and workload labels: no camera
 names, people, images or embeddings.
 """
 from __future__ import annotations
 
 from app.face_recognition import engine
-from app.services import inference_priority, live_scheduler, look_service
+from app.services import hub_scheduler, inference_priority, live_scheduler, look_service
 
 
 def snapshot() -> dict:
@@ -62,5 +62,6 @@ def snapshot() -> dict:
             "live": live,
             "look": look,
             "priority": inference_priority.stats(),
+            "hub_gpu_lease": hub_scheduler.stats(),
         },
     }
