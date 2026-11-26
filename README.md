@@ -108,6 +108,25 @@ and make sure its `config\partners.json` entry `reconize.api` is
 shows `loggedIn: true` and `live: true`. Interfaces the Hub uses:
 `docs/robot-integration-api.md`.
 
+Optional Hub features, enabled in `.env` (both need a restart):
+
+- `MICE_HUB_URL=http://127.0.0.1:8642` (this PC only; anything else is
+  refused): CCTV stations list the Hub's cameras as "Hub · <name>". Pick one
+  instead of the local device when the Hub already holds that camera - Reconize
+  then reads the Hub's MJPEG stream (relayed by its own backend) and never
+  opens the camera itself. Preview, scanning (only while a Detection Session is
+  active), recording and the camera's identity work as for a local camera.
+- `MICE_HUB_GPU_LEASE=1` (with `MICE_HUB_URL`): background face work (Event
+  Photo, video, import, enrollment) asks the Hub's GPU scheduler before each
+  model call, so Voice and live work go first. Live recognition never waits for
+  the Hub, and no Hub answer means no waiting. Measured trade-off: speech bursts
+  finish ~1/3 faster under Event Photo load, background throughput drops ~40%
+  while speech is active (`docs/launch-readiness-2026-11-26.md`).
+- `RECONIZE_HYBRID_EMBED=1`: live frames with 3+ faces are embedded in fixed
+  batches of 8 on a second session (+~0.55 GB GPU memory). Faster for crowds,
+  slightly slower for robot-like frames on an RTX 4050 - off by default
+  (`docs/experiments/2026-11-26-hybrid-embedding.md`).
+
 ## Updates
 
 Settings → Application Updates checks this repository's **published GitHub
