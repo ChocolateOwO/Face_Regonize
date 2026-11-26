@@ -63,5 +63,6 @@ def snapshot() -> dict:
             "look": look,
             "priority": inference_priority.stats(),
             "hub_gpu_lease": hub_scheduler.stats(),
+            "hybrid_embed": eng.get("hybrid_embed"),
         },
     }

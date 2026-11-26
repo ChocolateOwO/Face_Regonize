@@ -296,6 +296,112 @@ def release_live_lane() -> None:
             _mode.update(mode="starting", reason="live lane released", live_provider=None, live_vram_mb=None)
 
 
+# Hybrid face embedding (OPT-IN: RECONIZE_HYBRID_EMBED=1; off by default).
+#
+# On onnxruntime 1.29 + CUDA every change of the recognition model's batch
+# size costs extra time (measured here 2026-11-25: 120-270 ms per switch on an
+# RTX 4050 Laptop), which is why embedding all faces of a frame in one
+# variable-size batch (F1) was rejected. The hybrid keeps every session at ONE
+# shape: the live lane's existing recognition session only ever sees batch 1
+# (frames with 1-2 faces, embedded one by one exactly as before), and a
+# SECOND recognition session on the same model file only ever sees batch 8
+# (frames with 3+ faces: aligned exactly as ArcFaceONNX.get() does, padded
+# with copies of the last face to 8, chunks of 8, padded rows discarded).
+# Only the LIVE lane uses it (/api/look, /api/look/batch, kiosk, stations);
+# background work keeps the per-face loop. CUDA only, built once at startup
+# when enough GPU memory is free, warmed at batch 1 and 8; any failure keeps
+# the per-face path. Results and the decision to keep it opt-in:
+# docs/experiments/2026-11-26-hybrid-embedding.md.
+HYBRID_BATCH = 8
+HYBRID_MIN_FACES = 3
+HYBRID_VRAM_NEED_MB = int(os.environ.get("RECONIZE_HYBRID_VRAM_NEED_MB", "512"))
+_hybrid: dict = {"enabled": False, "reason": "not initialised", "app": None, "session": None,
+                 "startup_ms": None, "vram_mb": None}
+
+
+def _build_rec8(app):
+    """A second ArcFace session on the same model file and provider as `app`'s."""
+    import onnxruntime
+    from insightface.model_zoo.arcface_onnx import ArcFaceONNX
+
+    rec = app.models["recognition"]
+    provider = rec.session.get_providers()[0]
+    session = onnxruntime.InferenceSession(rec.model_file, providers=[provider, "CPUExecutionProvider"])
+    if session.get_providers()[0] != provider:
+        raise RuntimeError(f"batch-8 session started on {session.get_providers()}, expected {provider}")
+    return ArcFaceONNX(model_file=rec.model_file, session=session)
+
+
+def init_hybrid(requested: str | None = None, *, builder=_build_rec8, free_vram=_free_vram_mb) -> dict:
+    """Decide once, after init_live_lane(). Never raises."""
+    with _init_lock:
+        if _hybrid["reason"] != "not initialised":
+            return hybrid_info()
+        flag = (requested if requested is not None else os.environ.get("RECONIZE_HYBRID_EMBED", "0")).strip().lower()
+
+        def off(reason: str) -> dict:
+            _hybrid.update(enabled=False, reason=reason, app=None, session=None)
+            logger.info("Hybrid embedding off: %s", reason)
+            return hybrid_info()
+
+        if flag not in ("1", "true", "yes", "on"):
+            return off("RECONIZE_HYBRID_EMBED is not set (default: per-face embedding)")
+        app = _app_for(LIVE)
+        if _provider_of(app) != "CUDAExecutionProvider":
+            return off(f"live provider is {_provider_of(app)}, not CUDA")
+        before = free_vram()
+        if before is not None and before < HYBRID_VRAM_NEED_MB + LIVE_VRAM_MARGIN_MB:
+            return off(f"not enough free GPU memory: {before} MB free, {HYBRID_VRAM_NEED_MB + LIVE_VRAM_MARGIN_MB} MB needed")
+        t0 = time.perf_counter()
+        try:
+            rec8 = builder(app)
+            with lock_for(LIVE):  # warm-up: batch 8 here, batch 1 was warmed by init_live_lane
+                rec8.get_feat([np.zeros((112, 112, 3), np.uint8)] * HYBRID_BATCH)
+                app.models["recognition"].get_feat(np.zeros((112, 112, 3), np.uint8))
+        except Exception as exc:  # noqa: BLE001 - keep the per-face path
+            gc.collect()
+            return off(f"batch-8 session failed: {exc}")
+        after = free_vram()
+        _hybrid.update(enabled=True, reason=f"batch-8 session for {HYBRID_MIN_FACES}+ faces on the live lane",
+                       app=app, session=rec8, startup_ms=round((time.perf_counter() - t0) * 1000, 1),
+                       vram_mb=max(before - after, 0) if before is not None and after is not None else None)
+        logger.info("Hybrid embedding on (%s ms, ~%s MB)", _hybrid["startup_ms"], _hybrid["vram_mb"])
+        return hybrid_info()
+
+
+def release_hybrid() -> None:
+    """Tests and shutdown."""
+    with _init_lock:
+        _hybrid.update(enabled=False, reason="not initialised", app=None, session=None, startup_ms=None, vram_mb=None)
+        gc.collect()
+
+
+def hybrid_info() -> dict:
+    return {k: _hybrid[k] for k in ("enabled", "reason", "startup_ms", "vram_mb")}
+
+
+def _hybrid_session(app, lane: str):
+    if lane == LIVE and _hybrid["enabled"] and _hybrid["app"] is app:
+        return _hybrid["session"]
+    return None
+
+
+def _embed_aligned(rec, rec8, aligned: list) -> np.ndarray:
+    """Raw (unnormalised) embeddings for aligned 112x112 faces. With rec8:
+    every call is exactly HYBRID_BATCH rows; otherwise one face per call on
+    the single-face session. Never a third batch size."""
+    if not aligned:
+        return np.zeros((0, 512), np.float32)
+    if rec8 is None or len(aligned) < HYBRID_MIN_FACES:
+        return np.stack([np.asarray(rec.get_feat(a)).reshape(-1) for a in aligned])
+    out = []
+    for i in range(0, len(aligned), HYBRID_BATCH):
+        chunk = aligned[i:i + HYBRID_BATCH]
+        padded = chunk + [chunk[-1]] * (HYBRID_BATCH - len(chunk))
+        out.append(np.asarray(rec8.get_feat(padded))[:len(chunk)])
+    return np.concatenate(out).reshape(len(aligned), -1)
+
+
 def is_dual() -> bool:
     return _live_app is not None
 
@@ -417,6 +523,7 @@ def status() -> dict:
             background_waiting=_background_waiting,
             typical_call_ms={k: round(v, 1) for k, v in _call_ms.items() if math.isfinite(v)},
         )
+    info["hybrid_embed"] = hybrid_info()
     return info
 
 
@@ -474,8 +581,16 @@ def detect_faces(image_bgr: np.ndarray, timings: dict | None = None,
             faces.append(Face(bbox=bbox, kps=kps, det_score=det_score))
 
         rec_model = app.models["recognition"]
-        for face in faces:
-            rec_model.get(image_bgr, face)
+        rec8 = _hybrid_session(app, lane)
+        if rec8 is None or len(faces) < HYBRID_MIN_FACES:
+            for face in faces:  # unchanged per-face path (batch 1)
+                rec_model.get(image_bgr, face)
+        else:
+            from insightface.utils import face_align
+
+            aligned = [face_align.norm_crop(image_bgr, landmark=f.kps, image_size=rec_model.input_size[0]) for f in faces]
+            for face, feat in zip(faces, _embed_aligned(rec_model, rec8, aligned)):
+                face.embedding = feat.flatten()
         t_embed = time.perf_counter()
 
     if timings is not None:
@@ -515,7 +630,11 @@ def detect_faces_batch(images: list[np.ndarray], timings: dict | None = None,
         rec_model = app.models["recognition"]
         aligned = [face_align.norm_crop(image, landmark=face.kps, image_size=rec_model.input_size[0])
                    for image, faces in zip(images, per_image) for face in faces]
-        feats = rec_model.get_feat(aligned) if aligned else np.zeros((0, 512), np.float32)
+        rec8 = _hybrid_session(app, ctx_lane)
+        if rec8 is not None:  # hybrid: batch 1 or batch 8 only, never a variable size
+            feats = _embed_aligned(rec_model, rec8, aligned)
+        else:
+            feats = rec_model.get_feat(aligned) if aligned else np.zeros((0, 512), np.float32)
         t_embed = time.perf_counter()
 
     if timings is not None:

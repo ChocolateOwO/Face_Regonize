@@ -28,7 +28,7 @@ from app.config import (
     UPDATE_CHECK_INTERVAL_MINUTES,
 )
 from app.database.db import engine, init_db
-from app.face_recognition.engine import get_face_app, init_live_lane
+from app.face_recognition.engine import get_face_app, init_hybrid, init_live_lane
 from app.face_recognition.index import recognition_index
 from app.models.models import Person, User
 from app.services import maintenance, settings_cache
@@ -157,6 +157,7 @@ async def on_startup() -> None:
     # Second, live-only session when the GPU can hold it (dual mode); else
     # shared mode with background work yielding to live callers. Never fails.
     init_live_lane()
+    init_hybrid()  # opt-in (RECONIZE_HYBRID_EMBED=1); off = unchanged per-face embedding
     model_ready_ms = (time.perf_counter() - t_model_start) * 1000
 
     with Session(engine) as session:
