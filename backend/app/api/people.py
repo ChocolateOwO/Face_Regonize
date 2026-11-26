@@ -30,6 +30,9 @@ def _person_out(session: Session, p: Person, summary: tuple[int, datetime | None
     detection_count, first_detected, last_detected = summary
     return {
         "id": p.id,
+        # The same stable id under the name /api/look and /api/history use
+        # (additive; "id" stays for existing clients).
+        "person_id": p.id,
         "participant_id": p.participant_id,
         "first_name": p.first_name,
         "last_name": p.last_name,
