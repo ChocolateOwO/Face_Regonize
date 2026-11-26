@@ -93,13 +93,18 @@ class EventActiveJobGateTests(unittest.TestCase):
         import ast
         import inspect
 
-        tree = ast.parse(inspect.getsource(update_service.preflight))
-        called = {
-            node.func.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        }
-        self.assertIn("refuse_if_event_work_in_flight", called)
+        def called(fn):
+            tree = ast.parse(inspect.getsource(fn))
+            return {
+                node.func.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+
+        # 2026-11-26: preflight() calls the all-work gate, which starts with
+        # this Event Photo gate (imports, recordings and video jobs follow).
+        self.assertIn("refuse_if_work_in_flight", called(update_service.preflight))
+        self.assertIn("refuse_if_event_work_in_flight", called(update_service.refuse_if_work_in_flight))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { apiGet, apiPostJson, API_BASE, ApiError } from "../api/client";
 import { Badge, Button, Card } from "./ui";
+import { updateStatusBadge } from "../updateStatus";
 
 interface UpdateStatus {
   current_version: string;
@@ -12,6 +13,8 @@ interface UpdateStatus {
   last_checked: string | null;
   github_configured: boolean;
   error: string;
+  no_published_release?: boolean;
+  check_failed?: boolean;
   maintenance_active: boolean;
   abandoned_update: boolean;
   abandoned_log_path: string;
@@ -24,6 +27,15 @@ interface Progress {
   to_version?: string;
   log_path?: string;
   database_restored?: boolean;
+  previous_version_healthy?: boolean;
+}
+
+// What /api/update/preflight proved before the admin confirms.
+interface Preflight {
+  target_tag: string;
+  target_version: string;
+  current_version: string;
+  checks: string[];
 }
 
 const IN_PROGRESS = ["preparing", "backing_up", "updating", "restarting", "verifying", "rolling_back"];
@@ -38,6 +50,7 @@ export default function UpdatePanel() {
   // failures in this window are expected, not a crash, and must not be
   // rendered as one.
   const [reconnecting, setReconnecting] = useState(false);
+  const [preflight, setPreflight] = useState<Preflight | null>(null);
   const pollRef = useRef<number | null>(null);
 
   function loadStatus() {
@@ -94,11 +107,32 @@ export default function UpdatePanel() {
     }
   }
 
+  // Step 1: prove the update can run (release verified, no active work,
+  // backups possible) and show the admin exactly what would happen.
+  async function review() {
+    setBusy(true);
+    setError("");
+    setPreflight(null);
+    try {
+      setPreflight(await apiPostJson("/api/update/preflight", {}));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not check whether the update can run.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Step 2: only after the admin confirms the named version.
   async function install() {
+    if (!preflight) return;
     setBusy(true);
     setError("");
     try {
-      await apiPostJson("/api/update/install", {});
+      await apiPostJson("/api/update/install", {
+        tag: preflight.target_tag,
+        confirm_version: preflight.target_version,
+      });
+      setPreflight(null);
       setProgress({ status: "preparing", stage: "Preparing update..." });
       startPolling();
     } catch (err) {
@@ -112,6 +146,7 @@ export default function UpdatePanel() {
 
   const running = progress && IN_PROGRESS.includes(progress.status);
   const finished = progress && !IN_PROGRESS.includes(progress.status);
+  const badge = updateStatusBadge(status);
 
   return (
     <Card>
@@ -138,11 +173,7 @@ export default function UpdatePanel() {
         ) : (
           <div className="flex items-center gap-2">
             <span className="text-gray-500">Update Status:</span>
-            {status.update_available ? (
-              <Badge tone="warn">● Update Available — v{status.latest_version}</Badge>
-            ) : (
-              <Badge tone="good">● Up to Date</Badge>
-            )}
+            {badge && <Badge tone={badge.tone}>{badge.label}</Badge>}
           </div>
         )}
 
@@ -189,13 +220,46 @@ export default function UpdatePanel() {
               <Button variant="secondary" onClick={() => setShowNotes((v) => !v)}>
                 What's New
               </Button>
-              <Button onClick={install} disabled={busy}>
-                Update Now
-              </Button>
-              <Button variant="secondary" onClick={() => setStatus({ ...status, update_available: false })}>
+              {!preflight && (
+                <Button onClick={review} disabled={busy}>
+                  {busy ? "Checking..." : "Update Now"}
+                </Button>
+              )}
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setPreflight(null);
+                  setStatus({ ...status, update_available: false });
+                }}
+              >
                 Later
               </Button>
             </div>
+            {preflight && (
+              <div className="mt-3 bg-white border border-indigo-200 rounded-lg p-3">
+                <div className="font-semibold text-gray-900 mb-1">
+                  Install v{preflight.target_version} (installed: v{preflight.current_version})?
+                </div>
+                <ul className="text-xs text-gray-600 list-disc pl-4 mb-2">
+                  {preflight.checks.map((c) => (
+                    <li key={c}>{c}</li>
+                  ))}
+                </ul>
+                <div className="text-xs text-gray-700 mb-3">
+                  The database and .env are backed up and verified first. Reconize then restarts and is
+                  unavailable for about 1–3 minutes; open pages and camera nodes reconnect afterwards. If the new
+                  version does not start, the previous version and its database are restored automatically.
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button onClick={install} disabled={busy}>
+                    Install v{preflight.target_version}
+                  </Button>
+                  <Button variant="secondary" onClick={() => setPreflight(null)} disabled={busy}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
             {showNotes && (
               <div className="mt-3 bg-white border border-indigo-100 rounded-lg p-3">
                 <div className="font-medium text-sm mb-1">{status.release_name || `v${status.latest_version}`}</div>
@@ -252,6 +316,12 @@ export default function UpdatePanel() {
                 : "The update did not complete."}
               {progress?.database_restored ? " The database backup was restored." : ""}
             </div>
+            {progress?.status === "rolled_back" && progress?.previous_version_healthy === false && (
+              <div className="text-sm text-red-800 mt-2">
+                The previous version did not come back on its own. Start Reconize again with start.bat (or the
+                Hub's Open button); if it still does not start, send the technical log below.
+              </div>
+            )}
             {progress?.error && (
               <pre className="text-xs text-red-600 mt-2 whitespace-pre-wrap font-sans">{progress.error}</pre>
             )}

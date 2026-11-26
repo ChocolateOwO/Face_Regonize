@@ -22,6 +22,9 @@ router = APIRouter(prefix="/api/update", tags=["update"])
 
 class InstallBody(BaseModel):
     tag: str | None = None
+    # The version the admin confirmed after reading the preflight result.
+    # /install refuses unless it equals the version preflight resolves.
+    confirm_version: str | None = None
 
 
 @router.get("/version")
@@ -74,9 +77,9 @@ def run_preflight(body: InstallBody, user: User = Depends(get_current_user)):
 @router.post("/install")
 def install(body: InstallBody, user: User = Depends(get_current_user)):
     """Never runs automatically — reachable only by an authenticated admin
-    explicitly asking for it."""
+    explicitly asking for it, naming the confirmed version."""
     try:
-        return update_service.start_update(body.tag)
+        return update_service.start_update(body.tag, confirm_version=body.confirm_version)
     except update_service.UpdateError as e:
         raise HTTPException(400, str(e))
 
@@ -97,7 +100,10 @@ def rollback(session: Session = Depends(get_session), user: User = Depends(get_c
     if last.from_version == APP_VERSION:
         raise HTTPException(400, f"Already running {APP_VERSION}.")
     try:
-        return update_service.start_update(f"v{last.from_version}", allow_downgrade=True)
+        # The rollback request itself is the admin's explicit confirmation of
+        # this one version (the previously installed one).
+        return update_service.start_update(f"v{last.from_version}", allow_downgrade=True,
+                                           confirm_version=last.from_version)
     except update_service.UpdateError as e:
         raise HTTPException(400, str(e))
 

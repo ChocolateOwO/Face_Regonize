@@ -38,7 +38,11 @@ STATE_FILE = Path("update_state.json")
 LOG_FILE = Path("update.log")
 LOCK_FILE = Path("update.lock")
 
+# Where the backend listens. The backend records its own address in the config
+# (backend_host / backend_port) so the restarted version comes back exactly as
+# it was started; these are only the historical defaults.
 BACKEND_PORT = 8000
+BACKEND_HOST = "0.0.0.0"
 HEALTH_URL = f"http://127.0.0.1:{BACKEND_PORT}/api/health"
 STATUS_URL = f"http://127.0.0.1:{BACKEND_PORT}/api/update/status"
 
@@ -150,13 +154,15 @@ def npm(*args: str, timeout: int = 1800) -> subprocess.CompletedProcess:
 # Backend process control
 # ---------------------------------------------------------------------------
 
-def port_open(port: int = BACKEND_PORT, timeout: float = 1.0) -> bool:
+def port_open(port: int | None = None, timeout: float = 1.0) -> bool:
+    port = port or BACKEND_PORT
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
-def pids_on_port(port: int = BACKEND_PORT) -> list[int]:
+def pids_on_port(port: int | None = None) -> list[int]:
+    port = port or BACKEND_PORT
     try:
         out = subprocess.run(
             ["netstat", "-ano"], capture_output=True, text=True, timeout=30
@@ -165,9 +171,10 @@ def pids_on_port(port: int = BACKEND_PORT) -> list[int]:
         return []
     pids: set[int] = set()
     for line in out.splitlines():
-        if f":{port}" in line and "LISTENING" in line.upper():
-            parts = line.split()
-            if parts and parts[-1].isdigit():
+        parts = line.split()
+        # Match the LOCAL address column exactly: ":80" must not match ":8000".
+        if len(parts) >= 5 and parts[1].endswith(f":{port}") and "LISTENING" in line.upper():
+            if parts[-1].isdigit():
                 pids.add(int(parts[-1]))
     return sorted(pids)
 
@@ -213,7 +220,7 @@ def start_backend() -> None:
         "uvicorn",
         "app.main:app",
         "--host",
-        "0.0.0.0",
+        BACKEND_HOST,
         "--port",
         str(BACKEND_PORT),
     ]
@@ -229,12 +236,13 @@ def start_backend() -> None:
     )
 
 
-def wait_for_health(timeout: int = 180) -> bool:
+def wait_for_health(timeout: int | None = None) -> bool:
     """The model loads at startup, so first health can legitimately take a
     while. A migration failure shows up as this never succeeding."""
     import urllib.error
     import urllib.request
 
+    timeout = timeout or int(CONFIG.get("health_timeout") or 180)
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -395,6 +403,29 @@ def python_requirements_file() -> Path:
     return lock if lock.exists() else repo / "backend" / "requirements.txt"
 
 
+RUNTIME_PINS = {"gpu": "onnxruntime-gpu==1.29.0", "cpu": "onnxruntime==1.29.0"}
+
+
+def runtime_flavor() -> str:
+    """Which ONNX Runtime this install uses (setup-windows.ps1 -Mode gpu|cpu)."""
+    shown = run([CONFIG["python"], "-m", "pip", "show", "onnxruntime-gpu"], timeout=120)
+    return "gpu" if shown.returncode == 0 else "cpu"
+
+
+def install_python_requirements(req: Path, flavor: str) -> subprocess.CompletedProcess:
+    """Install the pinned set WITHOUT dependency resolution, then put back the
+    one ONNX Runtime flavour this install had. A plain `pip install -r` also
+    pulls InsightFace's unpinned CPU 'onnxruntime', which shares its module
+    folder with 'onnxruntime-gpu': the two overwrite each other and removing
+    either deletes both (setup-windows.ps1 has the same note)."""
+    result = run([CONFIG["python"], "-m", "pip", "install", "--no-deps", "-r", str(req)], timeout=1800)
+    if result.returncode != 0:
+        return result
+    run([CONFIG["python"], "-m", "pip", "uninstall", "-y", "onnxruntime", "onnxruntime-gpu"], timeout=600)
+    return run([CONFIG["python"], "-m", "pip", "install", "--no-deps", "--force-reinstall", RUNTIME_PINS[flavor]],
+               timeout=1800)
+
+
 def python_deps_changed(previous_sha: str, target_sha: str) -> bool:
     return manifest_changed(previous_sha, target_sha, "backend/requirements.txt") or manifest_changed(
         previous_sha, target_sha, "backend/requirements.lock.txt"
@@ -432,12 +463,21 @@ def do_update() -> None:
     expected = target_tag.lstrip("vV")
     if version_file != expected:
         raise RuntimeError(f"VERSION file says '{version_file}' but the release tag is '{target_tag}'")
-    log(f"integrity verified: HEAD={head[:12]} VERSION={version_file}")
+    # The release manifest (verified by the backend before this process was
+    # started) names the source tree; the checked-out tree must be that tree.
+    expected_tree = CONFIG.get("target_tree") or ""
+    if expected_tree:
+        tree = git("rev-parse", "HEAD^{tree}").stdout.strip()
+        if tree != expected_tree:
+            raise RuntimeError(f"source tree {tree[:12]} does not match the release manifest's {expected_tree[:12]}")
+    log(f"integrity verified: HEAD={head[:12]} VERSION={version_file}"
+        + (f" tree={expected_tree[:12]} (manifest)" if expected_tree else ""))
 
     if python_deps_changed(previous_sha, target_sha):
         req = python_requirements_file()
-        log(f"python dependencies changed; installing from {req.name}")
-        result = run([CONFIG["python"], "-m", "pip", "install", "-r", str(req)], timeout=1800)
+        flavor = CONFIG.setdefault("runtime_flavor", runtime_flavor())
+        log(f"python dependencies changed; installing from {req.name} (ONNX Runtime: {flavor})")
+        result = install_python_requirements(req, flavor)
         if result.returncode != 0:
             raise RuntimeError(f"pip install failed: {redact(result.stderr)[:400]}")
     else:
@@ -524,8 +564,9 @@ def rollback(reason: str, backup_path: str | None) -> None:
     try:
         if python_deps_changed(previous_sha, CONFIG["target_sha"]):
             req = python_requirements_file()
-            log(f"restoring python dependencies from {req.name}")
-            run([CONFIG["python"], "-m", "pip", "install", "-r", str(req)], timeout=1800)
+            flavor = CONFIG.get("runtime_flavor") or runtime_flavor()
+            log(f"restoring python dependencies from {req.name} (ONNX Runtime: {flavor})")
+            install_python_requirements(req, flavor)
         if manifest_changed(previous_sha, CONFIG["target_sha"], "frontend/package-lock.json"):
             npm("ci" if (repo / "frontend" / "package-lock.json").exists() else "install")
         npm("run", "build")
@@ -581,12 +622,16 @@ def record_history(status: str, error: str = "") -> None:
 
 
 def main() -> int:
-    global CONFIG, RUNTIME_DIR, STATE_FILE, LOG_FILE, LOCK_FILE
+    global CONFIG, RUNTIME_DIR, STATE_FILE, LOG_FILE, LOCK_FILE, BACKEND_PORT, BACKEND_HOST, HEALTH_URL, STATUS_URL
 
     if len(sys.argv) < 2:
         print("usage: updater.py <config.json>")
         return 2
     CONFIG = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    BACKEND_PORT = int(CONFIG.get("backend_port") or BACKEND_PORT)
+    BACKEND_HOST = str(CONFIG.get("backend_host") or BACKEND_HOST)
+    HEALTH_URL = f"http://127.0.0.1:{BACKEND_PORT}/api/health"
+    STATUS_URL = f"http://127.0.0.1:{BACKEND_PORT}/api/update/status"
     RUNTIME_DIR = Path(CONFIG["runtime_dir"])
     STATE_FILE = RUNTIME_DIR / "update_state.json"
     LOG_FILE = RUNTIME_DIR / "update.log"

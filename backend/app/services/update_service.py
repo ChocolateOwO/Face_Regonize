@@ -18,6 +18,7 @@ unauthenticated rate limit — nothing in the required path depends on it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -154,6 +155,12 @@ def check_for_update(force: bool = False) -> dict:
         "last_checked": None,
         "github_configured": is_configured(),
         "error": "",
+        # True only when GitHub answered that the repository has no published
+        # release: a neutral state, not "Up to Date" (nothing was compared).
+        "no_published_release": False,
+        # True when the check itself failed (network, rate limit, refused,
+        # HTTP error, unexpected answer): "check failed", never "Up to Date".
+        "check_failed": False,
     }
 
     if not is_configured():
@@ -172,6 +179,13 @@ def check_for_update(force: bool = False) -> dict:
                     cached.get("latest_version") and is_newer(cached["latest_version"], APP_VERSION)
                 )
                 cached["github_configured"] = True
+                # A cache written before this flag existed: a no-release answer
+                # has no latest version and carries the no-release message.
+                cached["no_published_release"] = bool(cached.get("no_published_release")) or (
+                    not cached.get("latest_version")
+                    and str(cached.get("error", "")).startswith("No published release")
+                )
+                cached["check_failed"] = bool(cached.get("check_failed"))
                 cached["last_checked"] = _get_setting(session, _LAST_CHECK_KEY)
                 return cached
             except ValueError:
@@ -180,8 +194,7 @@ def check_for_update(force: bool = False) -> dict:
     try:
         resp = _api(f"/repos/{GITHUB_REPO}/releases/latest")
     except requests.RequestException as e:
-        result["error"] = redact(f"Could not reach GitHub: {e}")
-        return result
+        return _failed(result, redact(f"Could not reach GitHub: {e}"))
 
     if resp.status_code == 404:
         # Either no published release yet, or the repo name is wrong. Neither
@@ -190,32 +203,48 @@ def check_for_update(force: bool = False) -> dict:
             f"No published release found for '{GITHUB_REPO}'. "
             "Check GITHUB_REPO, and that the repository is public and has a published release."
         )
+        result["no_published_release"] = True
         _remember(result)
         return result
     if resp.status_code == 403 and "rate limit" in resp.text.lower():
         # Anonymous API access is 60 requests/hour per IP. Being unable to
         # check is a temporary, non-destructive condition, never a failure.
-        result["error"] = (
+        return _failed(result, (
             "GitHub's API rate limit was reached. The application is unaffected; "
             "the next check will run automatically later."
-        )
-        return result
+        ))
     if resp.status_code in (401, 403):
-        result["error"] = (
+        return _failed(result, (
             "GitHub refused the request. If the repository is private, this build expects a public one."
-        )
-        return result
+        ))
     if resp.status_code != 200:
-        result["error"] = redact(f"Could not check for updates — GitHub returned HTTP {resp.status_code}.")
-        return result
+        return _failed(result, redact(f"Could not check for updates — GitHub returned HTTP {resp.status_code}."))
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or not str(data.get("tag_name") or "").strip():
+        return _failed(result, "Could not check for updates — GitHub returned an unexpected answer.")
     tag = str(data.get("tag_name", ""))
     result["latest_version"] = tag.lstrip("vV")
     result["release_notes"] = data.get("body") or ""
     result["release_url"] = data.get("html_url") or ""
     result["release_name"] = data.get("name") or tag
     result["update_available"] = bool(tag) and is_newer(tag, APP_VERSION)
+    _remember(result)
+    return result
+
+
+def _failed(result: dict, message: str) -> dict:
+    """A check that could not get an answer from GitHub. It is remembered like
+    any other result, so a cached earlier success can never be shown as
+    "Up to Date" after it: until a later check succeeds, the status is
+    "check failed" with this message, and nothing is offered for install."""
+    result["error"] = message
+    result["check_failed"] = True
+    result["latest_version"] = None
+    result["update_available"] = False
     _remember(result)
     return result
 
@@ -470,6 +499,146 @@ def refuse_if_event_work_in_flight() -> None:
         )
 
 
+def refuse_if_work_in_flight() -> None:
+    """Every kind of long-running work an update restart would cut off.
+
+    Event Photo (above), plus participant imports, camera-node recordings and
+    the video jobs (local, Google Drive and tagged-video renders all live in
+    one job store). Each refusal names the work so the admin knows what to
+    wait for."""
+    refuse_if_event_work_in_flight()
+
+    from app.models.models import ImportJob, NodeRecording
+
+    with Session(engine) as session:
+        # Only "processing" is a running import: every preview creates a
+        # "pending" job, and a preview nobody confirmed stays pending forever.
+        importing = session.exec(select(ImportJob).where(ImportJob.status == "processing")).first()
+        recording = session.exec(select(NodeRecording).where(NodeRecording.status == "recording")).first()
+    if importing:
+        raise UpdateError("A participant import is still running. Wait for it to finish before updating.")
+    if recording:
+        raise UpdateError(
+            f"Camera '{recording.node_name or recording.node_id}' is still recording. "
+            "Stop the recording before updating."
+        )
+
+    from app.services import local_video_experiment as video_jobs
+
+    try:
+        jobs = video_jobs.list_jobs()
+    except Exception as e:  # noqa: BLE001 — unreadable job store: refuse rather than guess
+        raise UpdateError(f"Could not read the video job list to check for running work ({e}).")
+    busy_jobs = [j for j in jobs if j.get("status") in video_jobs.ACTIVE]
+    if busy_jobs:
+        names = ", ".join(str(j.get("label") or j.get("filename") or j.get("id")) for j in busy_jobs[:5])
+        raise UpdateError(f"Video processing is still running ({names}). Wait for it to finish or cancel it before updating.")
+
+
+# --------------------------------------------------------------------------
+# Release manifest asset (integrity of what is about to be installed)
+# --------------------------------------------------------------------------
+
+MANIFEST_ASSET = "release-manifest.json"
+MANIFEST_SUM_ASSET = "release-manifest.json.sha256"
+MANIFEST_MAX_BYTES = 64 * 1024
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _download(url: str, limit: int = MANIFEST_MAX_BYTES) -> bytes:
+    """Fetch one small release asset. Anonymous, size-capped, never executed."""
+    headers = {"Accept": "application/octet-stream"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    with requests.get(url, headers=headers, timeout=30, stream=True) as resp:
+        if resp.status_code != 200:
+            raise UpdateError(redact(f"Could not download release asset (HTTP {resp.status_code})."))
+        data = b""
+        for chunk in resp.iter_content(8192):
+            data += chunk
+            if len(data) > limit:
+                raise UpdateError("Release asset is larger than expected; refusing it.")
+        return data
+
+
+def verify_release_manifest(tag: str, sha: str) -> dict:
+    """Prove the release's manifest asset is intact and describes exactly the
+    commit the tag points at. Raises UpdateError on any doubt; nothing is
+    installed from an unverified release.
+
+    Checksum source: GitHub's own SHA-256 digest of the uploaded asset when the
+    API reports one, otherwise the release's release-manifest.json.sha256
+    asset. This detects corruption and a manifest that does not match the tag;
+    it is not a signature (anyone who can publish a release can publish both)."""
+    resp = _api(f"/repos/{GITHUB_REPO}/releases/tags/{tag}")
+    if resp.status_code != 200:
+        raise UpdateError(redact(f"Release '{tag}' not found on GitHub (HTTP {resp.status_code})."))
+    release = resp.json()
+    if release.get("draft"):
+        raise UpdateError(f"Release '{tag}' is a draft and cannot be installed.")
+    assets = {str(a.get("name")): a for a in release.get("assets") or []}
+    asset = assets.get(MANIFEST_ASSET)
+    if not asset:
+        raise UpdateError(
+            f"Release '{tag}' has no {MANIFEST_ASSET} asset, so its integrity cannot be checked. "
+            "Publish the release with tools/release/make_release_manifest.py (see docs/RELEASING.md)."
+        )
+    data = _download(str(asset.get("browser_download_url") or ""))
+    actual = hashlib.sha256(data).hexdigest()
+
+    digest = str(asset.get("digest") or "")
+    if digest.lower().startswith("sha256:"):
+        expected, source = digest.split(":", 1)[1].strip().lower(), "GitHub asset digest"
+    elif MANIFEST_SUM_ASSET in assets:
+        text = _download(str(assets[MANIFEST_SUM_ASSET].get("browser_download_url") or ""), limit=1024)
+        expected, source = (text.decode("utf-8", "replace").split() or [""])[0].strip().lower(), MANIFEST_SUM_ASSET
+    else:
+        raise UpdateError(f"Release '{tag}' publishes no checksum for {MANIFEST_ASSET}; refusing to install it.")
+    if actual != expected:
+        raise UpdateError(
+            f"Release '{tag}' failed its integrity check: {MANIFEST_ASSET} does not match its {source} "
+            "(corrupt or altered download). Nothing was changed."
+        )
+
+    try:
+        manifest = json.loads(data.decode("utf-8"))
+    except ValueError:
+        raise UpdateError(f"{MANIFEST_ASSET} of release '{tag}' is not valid JSON. Nothing was changed.")
+    version = tag.lstrip("vV")
+    problems = []
+    if manifest.get("schema") != 1 or manifest.get("app") != "Reconize":
+        problems.append("not a Reconize release manifest (schema/app)")
+    if manifest.get("tag") != tag or str(manifest.get("version")) != version:
+        problems.append(f"names {manifest.get('tag')} / {manifest.get('version')}, expected {tag} / {version}")
+    if manifest.get("commit") != sha:
+        problems.append(f"commit {str(manifest.get('commit'))[:12]} differs from the tag's {sha[:12]}")
+    if not _HEX40.match(str(manifest.get("tree") or "")):
+        problems.append("missing source tree hash")
+    if problems:
+        raise UpdateError(f"Release '{tag}' manifest does not match the release: " + "; ".join(problems) + ".")
+    manifest["sha256"] = actual
+    return manifest
+
+
+def _listen_address() -> tuple[str, int]:
+    """(host, port) this backend is listening on, read from netstat for our own
+    pid, so the updater restarts it exactly as it was started (local-only
+    start.bat vs network mode, 8000 vs another port). Falls back to the
+    updater's historical default."""
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    pid = str(os.getpid())
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[-1] == pid and "LISTEN" in parts[-2].upper():
+            host, _, port = parts[1].rpartition(":")
+            if port.isdigit():
+                return host or "0.0.0.0", int(port)
+    return "0.0.0.0", 8000
+
+
 def preflight(target_tag: str | None = None, allow_downgrade: bool = False) -> dict:
     """Every check that must pass before anything is touched. Raises
     UpdateError with an admin-readable reason on the first failure."""
@@ -511,6 +680,9 @@ def preflight(target_tag: str | None = None, allow_downgrade: bool = False) -> d
     sha = resolve_tag_sha(tag)
     checks.append(f"target resolves to {sha[:12]}")
 
+    manifest = verify_release_manifest(tag, sha)
+    checks.append(f"release manifest verified (sha256 {manifest['sha256'][:12]}, tree {manifest['tree'][:12]})")
+
     status = git("status", "--porcelain", timeout=60)
     if status.returncode != 0:
         raise UpdateError(redact(f"git status failed: {status.stderr.strip()}"))
@@ -523,8 +695,8 @@ def preflight(target_tag: str | None = None, allow_downgrade: bool = False) -> d
         )
     checks.append("working tree clean")
 
-    refuse_if_event_work_in_flight()
-    checks.append("no photo batch in progress")
+    refuse_if_work_in_flight()
+    checks.append("no photo batch, import, recording or video job in progress")
 
     try:
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -547,19 +719,32 @@ def preflight(target_tag: str | None = None, allow_downgrade: bool = False) -> d
         raise UpdateError(f"Database not found at {DATABASE_PATH}.")
     checks.append("database present")
 
-    return {"ok": True, "target_tag": tag, "target_sha": sha, "target_version": target_version, "checks": checks}
+    return {"ok": True, "target_tag": tag, "target_sha": sha, "target_version": target_version,
+            "target_tree": manifest["tree"], "manifest_sha256": manifest["sha256"],
+            "current_version": APP_VERSION, "checks": checks}
 
 
 # --------------------------------------------------------------------------
 # Initiation
 # --------------------------------------------------------------------------
 
-def start_update(target_tag: str | None = None, allow_downgrade: bool = False) -> dict:
+def start_update(target_tag: str | None = None, allow_downgrade: bool = False,
+                 confirm_version: str | None = None) -> dict:
     """Runs preflight, then hands the work to a detached updater process.
     Returns as soon as that process is launched — the backend must not be
-    holding anything open when the updater stops it."""
+    holding anything open when the updater stops it.
+
+    confirm_version must name the version preflight resolved: the admin
+    confirms WHICH version is installed, so a stray or replayed request (or a
+    newer release published between the admin's look and the click) never
+    installs something nobody confirmed."""
     result = preflight(target_tag, allow_downgrade=allow_downgrade)
     tag, sha, version = result["target_tag"], result["target_sha"], result["target_version"]
+    if (confirm_version or "").strip().lstrip("vV") != version:
+        raise UpdateError(
+            f"Confirm the version to install: this would install {version}"
+            + (f", but {confirm_version} was confirmed." if confirm_version else ", and nothing was confirmed.")
+        )
 
     UPDATER_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -573,13 +758,13 @@ def start_update(target_tag: str | None = None, allow_downgrade: bool = False) -
     # files in the repo, so an updater executing from tools/updater/ could be
     # replaced underneath itself mid-run.
     try:
-        return _spawn_updater(tag, sha, version)
+        return _spawn_updater(tag, sha, version, result["target_tree"])
     except Exception:
         release_lock()  # never leave a lock behind for a launch that never happened
         raise
 
 
-def _spawn_updater(tag: str, sha: str, version: str) -> dict:
+def _spawn_updater(tag: str, sha: str, version: str, tree: str = "") -> dict:
     source = PROJECT_ROOT / "tools" / "updater" / "updater.py"
     if not source.exists():
         raise UpdateError(f"Updater source is missing at {source}.")
@@ -587,18 +772,26 @@ def _spawn_updater(tag: str, sha: str, version: str) -> dict:
     shutil.copy2(source, runtime_copy)
 
     previous_sha = git("rev-parse", "HEAD", timeout=30).stdout.strip()
+    host, port = _listen_address()
 
     payload = {
-        "repo_root": str(PROJECT_ROOT),
+        "target_tree": tree,
+        "backend_host": host,
+        "backend_port": port,
+        "repo_root": str(PROJECT_ROOT.resolve()),
         "python": sys.executable,
         "target_tag": tag,
         "target_sha": sha,
         "target_version": version,
         "from_version": APP_VERSION,
         "previous_sha": previous_sha,
-        "database_path": str(DATABASE_PATH),
-        "backup_dir": str(BACKUP_DIR),
-        "runtime_dir": str(UPDATER_RUNTIME_DIR),
+        # ABSOLUTE, resolved here exactly as this server resolves them: .env's
+        # DATABASE_URL is usually relative (./database/app.db, i.e. relative to
+        # backend/), and the updater runs from its own runtime folder, where a
+        # relative path would name a different (missing) database.
+        "database_path": str(DATABASE_PATH.resolve()),
+        "backup_dir": str(BACKUP_DIR.resolve()),
+        "runtime_dir": str(UPDATER_RUNTIME_DIR.resolve()),
         "github_repo": GITHUB_REPO,
     }
     config_file = UPDATER_RUNTIME_DIR / "update_config.json"

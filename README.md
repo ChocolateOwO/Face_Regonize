@@ -14,7 +14,7 @@ storage/    Uploaded/downloaded images (people/, events/, thumbnails/)
 ```
 
 Face detection and embedding run locally via [InsightFace](https://github.com/deepinsight/insightface)
-(buffalo_l model, ONNX Runtime, CPU). One reference photo per participant is
+(buffalo_l model, ONNX Runtime, NVIDIA GPU or CPU). One reference photo per participant is
 enough — there is no per-person training step. Recognition compares embeddings
 with cosine similarity against a configurable threshold (Settings page).
 
@@ -25,47 +25,49 @@ PDPA, Event Photos, Drive integration, multi-camera CCTV, Local Agent stations,
 recording, live feed and reports. No participant data, photos, recordings,
 model cache or credentials are included in Git.
 
-- Windows 10/11, Python **3.13 x64**, Node **20.19+** or **22.12+** (tested: Node 25.2.1)
-- Microsoft Visual C++ Runtime, current Chrome or Edge
-- ~500MB free disk for the InsightFace model (downloaded automatically on first run)
+| Needed | Version | Install (Windows) |
+|---|---|---|
+| Windows 10/11 x64 | | |
+| Git | any recent | `winget install --id Git.Git -e` |
+| Python | **3.13 x64** (with the `py` launcher) | `winget install --id Python.Python.3.13 -e` |
+| Node.js | **20.19+ or 22.12+** (tested 25.2.1, see `.node-version`) | `winget install --id OpenJS.NodeJS -e` |
+| Browser | current Chrome or Edge | |
+| Internet | first setup and first start (packages, ~300 MB face model) | |
+| Optional: NVIDIA GPU | a driver where `nvidia-smi` works | NVIDIA driver; CUDA libraries come from pip |
 
-## Installation
+Disk: about 6 GB for the GPU setup (CUDA wheels), about 2 GB for CPU, plus your
+photos. Recognition quality is identical on CPU; it is only slower.
 
-```bash
-# Windows backend: NVIDIA GPU path, or use -Mode cpu
-powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Mode gpu
+## Installation (fresh PC)
 
-# Frontend
-cd ../frontend
-npm ci
+```powershell
+git clone https://github.com/ChocolateOwO/Face_Regonize.git Reconize
+cd Reconize
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1            # NVIDIA GPU
+#   or: powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -Mode cpu
 ```
 
-Copy `.env.example` to `.env`. Before real use set a strong `ADMIN_PASSWORD`
-and `JWT_SECRET`; do this before first backend start because initial admin is
-created once. Paths in `.env` are resolved from repository root; launcher
-scripts start backend from `backend/`, so omit path overrides unless needed.
+The setup script checks the prerequisites (and prints the install command for
+any that is missing), creates `backend\.venv` from the pinned
+`backend\requirements.lock.txt`, checks that InsightFace really runs (CUDA in
+GPU mode), creates `.env` with a **new random signing secret and admin
+password** (printed once — write it down), and runs `npm ci`. It never
+overwrites an existing `.env`; run it again any time, finished steps are kept.
 
-GPU setup needs compatible NVIDIA hardware/driver. Setup installs exact CUDA
-runtime Python wheels and proves an actual InsightFace session uses CUDA; it
-does not install drivers. CPU mode keeps identical recognition quality but is
-slower. `buffalo_l` downloads on first model use into `~/.insightface/models/`;
-internet, ~500 MB free space and writable cache are required.
+`.env` (not in Git) is the only place for this PC's settings; see
+`.env.example`. `python scripts\init_env.py --check` reports whether the
+public defaults are still in use.
 
 ## Running the Application
 
-Two processes, in two terminals:
+Double-click `start.bat` (or `Start Reconize.vbs`): it starts the backend on
+http://127.0.0.1:8000 and the page on **http://localhost:5173**, and refuses
+with a clear message if setup has not been run. `start-network.bat` serves the
+built app on one port for other PCs on the network.
 
-```bash
-# Terminal 1 — backend API (http://127.0.0.1:8000)
-cd backend
-.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
-
-# Terminal 2 — frontend dev server (http://localhost:5173)
-cd frontend
-npm run dev
-```
-
-Open **http://localhost:5173** in Chrome or Edge.
+The first start downloads the face model into `%USERPROFILE%\.insightface`
+and creates an empty database in `backend\database\app.db` (`DATABASE_URL` in
+`.env` is relative to `backend\`; run the `backend\scripts` tools from `backend\`).
 
 No demo face photos are distributed. Add own test participant images.
 
@@ -74,15 +76,50 @@ No demo face photos are distributed. Add own test participant images.
 Run `npm run build` in `frontend/`, then start only the backend — it serves
 the built frontend from `frontend/dist/` automatically at `http://127.0.0.1:8000/`.
 
-## Demo Login
+## First Sign-in and Passwords
 
-```
-Username: admin
-Password: admin123
+Sign in as `admin` with the password the setup script printed. To change it
+later (the `.env` value is only used for the very first start):
+
+```powershell
+cd backend
+.venv\Scripts\python.exe scripts\set_admin_password.py              # asks twice
+.venv\Scripts\python.exe scripts\set_admin_password.py --generate   # prints a new one once
 ```
 
-Change these via `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env` before first
-run (the account is created once on startup if it doesn't exist).
+An install made before this setup script may still use the public defaults
+(`admin` / `admin123` and the default `JWT_SECRET`): change both before real
+use. Changing `JWT_SECRET` signs everybody out once.
+
+## Connecting the Mice Hub
+
+The Hub (robot) signs in with its own least-privilege **machine account**,
+never the admin. On the Reconize PC:
+
+```powershell
+cd backend
+.venv\Scripts\python.exe scripts\manage_machine_user.py create --username robot-hub   # prints the password once
+```
+
+On the Hub, put that login in `main_python\faces_login.json` (git-ignored):
+`{"reconize": {"username": "robot-hub", "password": "<printed password>"}}`,
+and make sure its `config\partners.json` entry `reconize.api` is
+`http://127.0.0.1:8000`. Check: the Hub watcher's http://127.0.0.1:8769/health
+shows `loggedIn: true` and `live: true`. Interfaces the Hub uses:
+`docs/robot-integration-api.md`.
+
+## Updates
+
+Settings → Application Updates checks this repository's **published GitHub
+Releases** (`GITHUB_REPO` in `.env`, filled in by setup). Installing needs an
+admin to review and confirm the exact version. Before anything changes, the
+update verifies the release's `release-manifest.json` checksum and commit,
+refuses while work is running (Event Photo, imports, recordings, video jobs)
+or the checkout has uncommitted changes, and backs up and verifies the
+database and `.env`. After the restart it checks health and version; on
+failure it restores the previous version and database automatically.
+Database, storage, `.env` and the face model are never replaced. Publishing a
+release: `docs/RELEASING.md`.
 
 ## How to Add a Person
 

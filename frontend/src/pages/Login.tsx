@@ -47,10 +47,8 @@ export default function Login() {
             {loading ? "Signing in..." : "Login"}
           </Button>
         </form>
-        <div className="text-xs text-gray-400 text-center mt-6">
-          Demo login: <strong>admin</strong> / <strong>admin123</strong>
-        </div>
-        <div className="text-xs text-center mt-3 space-x-4">
+        {/* No credentials are shown here: setup gives each install its own admin password. */}
+        <div className="text-xs text-center mt-6 space-x-4">
           <a
             href="/help/index.html"
             target="_blank"
