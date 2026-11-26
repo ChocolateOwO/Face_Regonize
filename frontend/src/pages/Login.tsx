@@ -1,12 +1,14 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { Button, Input } from "../components/ui";
 import { ApiError } from "../api/client";
+import { applyLanguage, helpUrl } from "../language";
 
 export default function Login() {
   const { login } = useAuth();
   const navigate = useNavigate();
+  const language = applyLanguage(useLocation().search);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -50,7 +52,7 @@ export default function Login() {
         {/* No credentials are shown here: setup gives each install its own admin password. */}
         <div className="text-xs text-center mt-6 space-x-4">
           <a
-            href="/help/index.html"
+            href={helpUrl(language)}
             target="_blank"
             rel="noreferrer"
             className="text-indigo-600 font-medium hover:underline"

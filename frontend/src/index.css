@@ -33,3 +33,15 @@ body {
 .complete-backdrop {
   animation: complete-backdrop-in 200ms ease-out;
 }
+
+/* Phones and narrow windows (below 768 px, where the sidebar becomes a
+   drawer): a table wider than the screen scrolls sideways inside its own
+   box instead of being cut off or widening the whole page. */
+@media (max-width: 767px) {
+  main table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}

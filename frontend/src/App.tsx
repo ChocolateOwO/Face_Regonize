@@ -23,6 +23,7 @@ import PhotoBatches from "./pages/PhotoBatches";
 import LocalVideoExperiment from "./pages/LocalVideoExperiment";
 import PhotoBatchDetail from "./pages/PhotoBatchDetail";
 import Privacy from "./pages/Privacy";
+import NotFound from "./pages/NotFound";
 
 function LoginRoute() {
   const { username } = useAuth();
@@ -68,6 +69,7 @@ function AppRoutes() {
                 <Route path="/photo-batches" element={<PhotoBatches />} />
                 <Route path="/local-video-experiment" element={<LocalVideoExperiment />} />
                 <Route path="/photo-batches/:id" element={<PhotoBatchDetail />} />
+                <Route path="*" element={<NotFound />} />
               </Routes>
             </Layout>
           </ProtectedRoute>

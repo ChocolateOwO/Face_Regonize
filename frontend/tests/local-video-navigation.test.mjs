@@ -42,6 +42,7 @@ function harness(response, pathname = "/") {
     };
     if (name === "../auth/AuthContext") return { useAuth: () => ({ username, logout: () => {} }) };
     if (name === "../api/client") return { apiGet: path => { requests.push(path); return response; } };
+    if (name === "../language") return { applyLanguage: () => "en", helpUrl: () => "/help/index.html" };
     throw new Error(name);
   }, exports);
   const render = () => {
