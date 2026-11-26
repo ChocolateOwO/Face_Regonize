@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from app.api import activities, admin, network as network_api, nodes as nodes_api, attendees, auth, export, files, history, identity_candidates, imports, pdpa, people, photo_batches, recognition, reports, settings_routes, system, update_routes, uploads
 from app.api import local_video_experiment, local_video_drive, scan_settings
+from app.api import hub_cameras as hub_cameras_api
 from app.api import look as look_api
 from app.services import look_service as look_service_limits
 from app.auth.security import hash_password
@@ -212,6 +213,7 @@ app.include_router(look_api.router)
 app.include_router(photo_batches.router)
 app.include_router(photo_batches.cleanup_router)
 app.include_router(update_routes.router)
+app.include_router(hub_cameras_api.router)  # Mice Hub camera relay (MICE_HUB_URL)
 app.include_router(identity_candidates.router)  # Phase F1 — backfill controls, counts only
 app.include_router(local_video_drive.router)
 app.include_router(local_video_experiment.router)

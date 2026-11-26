@@ -10,6 +10,7 @@ import {
 } from "../api/cameras";
 import { Badge, Button, Card, Input, PageHeader } from "../components/ui";
 import { reportObservation, type AgentScan } from "../nodeObservation";
+import { hubDevOf, isHubDevice, listHubCameras, openHubCamera, type HubStreamHandle } from "../hubStream";
 
 /**
  * A camera station. Two genuinely different shapes live on this one page:
@@ -420,6 +421,10 @@ interface CameraInstanceInternal {
   // state) changes, instead of recreating every card's click handlers (and
   // therefore re-rendering every card) on every recognition tick.
   cardCallbacks: { onStartRecording: () => void; onStopRecording: () => void; onOpenDetail: () => void } | null;
+  // A Mice Hub camera (deviceId "hub:<dev>"): the Hub holds the physical
+  // camera and this is its relayed MJPEG as a MediaStream (hubStream.ts).
+  // null for a local camera.
+  hub: HubStreamHandle | null;
 }
 interface CameraCard {
   cameraId: string; // stable identity — also the React key and the backend node_id (§18)
@@ -633,9 +638,10 @@ function MultiCameraStation({
   useEffect(() => {
     let cancelled = false;
     async function init() {
-      const devices = await listCameras().catch(() => [] as CameraDevice[]);
+      const devices = await listAllCameras().catch(() => [] as CameraDevice[]);
       if (cancelled) return;
-      const granted = devices.length > 0 && devices.some((d) => d.label && !BLANK_LABEL_RE.test(d.label));
+      const local = devices.filter((d) => !isHubDevice(d.deviceId));
+      const granted = local.length > 0 && local.some((d) => d.label && !BLANK_LABEL_RE.test(d.label));
       setPermissionGranted(granted);
       setCheckingPermission(false);
       mergeAndRestore(devices, granted);
@@ -652,7 +658,7 @@ function MultiCameraStation({
   // that becomes available again auto-restores exactly like on mount.
   useEffect(() => {
     function onDeviceChange() {
-      listCameras().then((devices) => {
+      listAllCameras().then((devices) => {
         const availableIds = new Set(devices.map((d) => d.deviceId));
         setAvailableDeviceIds(availableIds);
         for (const sel of selectionsRef.current) {
@@ -677,6 +683,20 @@ function MultiCameraStation({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Local cameras (browser) + the Mice Hub's cameras (when MICE_HUB_URL is
+  // set). A Hub camera is listed like any other and keeps its own stable
+  // cameraId; it never needs browser camera permission.
+  async function listAllCameras(withPermission = false): Promise<CameraDevice[]> {
+    const [local, hub] = await Promise.all([
+      (withPermission ? listCamerasWithPermission() : listCameras()).catch((err) => {
+        if (withPermission) throw err;
+        return [] as CameraDevice[];
+      }),
+      listHubCameras(apiGet),
+    ]);
+    return [...local, ...hub];
+  }
 
   function updateCard(cameraId: string, patch: Partial<CameraCard>) {
     setCards((prev) => prev.map((c) => (c.cameraId === cameraId ? { ...c, ...patch } : c)));
@@ -704,10 +724,10 @@ function MultiCameraStation({
     setSelections(merged);
     saveSelections(config.node_id, merged);
 
-    if (!granted) return; // §10 — do not attempt to open anything until access is actually granted
-
+    // §10 — a local camera is not opened until access is actually granted.
+    // A Hub camera needs no browser permission (the Hub holds the camera).
     for (const sel of merged) {
-      if (sel.enabled && sel.cameraId && availableIds.has(sel.deviceId)) {
+      if (sel.enabled && sel.cameraId && availableIds.has(sel.deviceId) && (granted || isHubDevice(sel.deviceId))) {
         startCameraForSelection(sel);
       }
     }
@@ -715,7 +735,7 @@ function MultiCameraStation({
 
   async function handleEnableAccess() {
     try {
-      const devices = await listCamerasWithPermission();
+      const devices = await listAllCameras(true);
       setPermissionGranted(true);
       mergeAndRestore(devices, true);
     } catch {
@@ -777,7 +797,7 @@ function MultiCameraStation({
         videoEl: null, heartbeatTimer: null, faceStaleTimer: null, videoRefCallback: null,
         getUserMediaCalls: 0, srcObjectAssignments: 0,
         recorder: null, recordingChunks: [], recordingId: null, recordingStartedAt: null, recordingTimer: null,
-        cardCallbacks: null,
+        cardCallbacks: null, hub: null,
       });
     }
     const internal = instancesRef.current.get(cameraId)!;
@@ -793,26 +813,42 @@ function MultiCameraStation({
           }],
     );
 
-    const blocked = cameraUnavailableReason();
+    const fromHub = isHubDevice(sel.deviceId);
+    const blocked = fromHub ? null : cameraUnavailableReason();
     if (blocked) {
       updateCard(cameraId, { status: "error", error: blocked });
       return;
     }
     try {
-      // One getUserMedia call per physical camera, period — nothing in this
-      // task's recording or activity-gating additions calls this again.
-      // Counted so the flicker fix is verifiable rather than asserted (§4).
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { deviceId: { exact: sel.deviceId }, ...CAMERA_CONSTRAINTS },
-      });
+      let stream: MediaStream;
+      if (fromHub) {
+        // The Hub already holds this camera: read its relayed stream instead
+        // of opening the device here (never a getUserMedia call for it).
+        const hub = await openHubCamera(hubDevOf(sel.deviceId), {
+          onState: (state, detail) => {
+            if (instancesRef.current.get(cameraId) !== internal) return;
+            if (state === "live") updateCard(cameraId, { status: "on", error: "" });
+            else if (state === "reconnecting") updateCard(cameraId, { status: "error", error: `Hub camera reconnecting: ${detail}` });
+          },
+        });
+        internal.hub = hub;
+        stream = hub.stream;
+      } else {
+        // One getUserMedia call per physical camera, period — nothing in this
+        // task's recording or activity-gating additions calls this again.
+        // Counted so the flicker fix is verifiable rather than asserted (§4).
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { deviceId: { exact: sel.deviceId }, ...CAMERA_CONSTRAINTS },
+        });
+        internal.getUserMediaCalls++;
+        console.debug(`[CCTV] ${cameraId} getUserMedia call #${internal.getUserMediaCalls}`);
+      }
       internal.stream = stream;
-      internal.getUserMediaCalls++;
-      console.debug(`[CCTV] ${cameraId} getUserMedia call #${internal.getUserMediaCalls}`);
       if (internal.videoEl && internal.videoEl.srcObject !== stream) {
         internal.videoEl.srcObject = stream;
         internal.srcObjectAssignments++;
       }
-      listCameras().then((d) => setAvailableDeviceIds(new Set(d.map((x) => x.deviceId)))).catch(() => {});
+      listAllCameras().then((d) => setAvailableDeviceIds(new Set(d.map((x) => x.deviceId)))).catch(() => {});
 
       stream.getVideoTracks()[0]?.addEventListener("ended", () => {
         internal.active = false;
@@ -875,6 +911,8 @@ function MultiCameraStation({
       internal.stream.getTracks().forEach((t) => t.stop());
       internal.stream = null;
     }
+    internal.hub?.stop(); // a Hub camera: also closes its relayed stream
+    internal.hub = null;
     if (internal.videoEl) internal.videoEl.srcObject = null;
     instancesRef.current.delete(cameraId);
     setCards((prev) => prev.filter((c) => c.cameraId !== cameraId));
@@ -913,6 +951,9 @@ function MultiCameraStation({
     // "recognition secretly still running" while the UI claims DETECTION OFF.
     if (detectionStateRef.current !== "active") return;
     if (agentStatusRef.current !== "ready") return; // never silently fall back to Central
+    // A Hub camera that is reconnecting shows its last picture; scanning that
+    // frozen frame again would only repeat the last result.
+    if (internal.hub && !internal.hub.fresh()) return;
     const video = internal.videoEl;
     if (!video || video.videoWidth === 0) return;
     const canvas = document.createElement("canvas");
